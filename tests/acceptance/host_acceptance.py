@@ -1017,7 +1017,7 @@ def machine_checks(R, host, bodies, capture):
                 and ant["debug"]["source"] == "anthropic_headers", json.dumps(ant)[:400])
         R.check("machine view: config-derived endpoints are held by the launch home ('global')",
                 held(pv["custom:gpu-box"][0]) == [("global", True)] and held(pv["ollama"][0]) == [("global", True)])
-        R.check("machine view: card ids are unique and distinct from every profile-view id of the same accounts",
+        R.check("machine view: card ids are unique (one per merged account)",
                 len({c["account_id"] for c in mcards}) == 7)
     R.check("machine view /health: still one row per endpoint (gpu-box healthy, ollama degraded)",
             sorted(e["provider_id"] for e in mentries) == ["custom:gpu-box", "ollama"])
