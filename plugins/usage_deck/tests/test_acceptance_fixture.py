@@ -16,7 +16,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from plugins.usage_deck.discovery import FileInventorySource, discover
+from plugins.usage_deck.discovery import FileInventorySource, discover, discover_machine
 
 REPO = Path(__file__).resolve().parents[3]
 FIXTURE = REPO / "plugins" / "usage_deck" / "tests" / "fixtures" / "scratch_home"
@@ -42,14 +42,16 @@ def fixture_config(gpu="http://127.0.0.1:41001/v1", ollama="http://127.0.0.1:410
 
 class FixtureTests(unittest.TestCase):
     def test_fixture_files_are_committed_and_parse(self):
-        for rel in ("auth.json", "config.yaml.template", "profiles/work/auth.json", "profiles/work/config.yaml"):
+        for rel in ("auth.json", "config.yaml.template", "profiles/work/auth.json", "profiles/work/config.yaml",
+                    "profiles/verifier/auth.json"):
             self.assertTrue((FIXTURE / rel).is_file(), rel)
         json.loads((FIXTURE / "auth.json").read_text())
         json.loads((FIXTURE / "profiles" / "work" / "auth.json").read_text())
+        json.loads((FIXTURE / "profiles" / "verifier" / "auth.json").read_text())
 
     def test_every_seeded_secret_is_visibly_synthetic(self):
         found = set()
-        for rel in ("auth.json", "profiles/work/auth.json"):
+        for rel in ("auth.json", "profiles/work/auth.json", "profiles/verifier/auth.json"):
             harness.collect_seeded_secrets(json.loads((FIXTURE / rel).read_text()), found)
         found |= harness.config_secrets((FIXTURE / "config.yaml.template").read_text())
         self.assertGreaterEqual(len(found), 8)
@@ -82,12 +84,31 @@ class FixtureTests(unittest.TestCase):
         src = FileInventorySource(FIXTURE / "profiles" / "work", FIXTURE, config_loader=lambda: cfg,
                                   custom_provider_loader=lambda c: c["custom"], env_lookup=lambda n: None)
         items = {i.provider_id: i for i in discover(src)}
-        self.assertEqual(sorted(items), ["nous", "openai-codex", "openrouter"])
+        self.assertEqual(sorted(items), ["nous", "openai-codex", "openrouter"])  # verifier's rows are not read here
         root = {i.provider_id: i for i in discover(FileInventorySource(
             FIXTURE, FIXTURE, config_loader=lambda: cfg, custom_provider_loader=lambda c: c["custom"],
             env_lookup=lambda n: None))}
         self.assertNotEqual(items["openrouter"].account_id, root["openrouter"].account_id)  # work's own row
         self.assertEqual(items["nous"].account_id, root["nous"].account_id)                 # fell back to root
+
+    def test_machine_view_of_the_fixture_merges_codex_and_adds_verifier_only_anthropic(self):
+        """The fixture is also the machine-view scratch fixture the real-host harness drives."""
+        cfg = fixture_config()
+        src = FileInventorySource(FIXTURE, FIXTURE, config_loader=lambda: cfg,
+                                  custom_provider_loader=lambda c: c["custom"], env_lookup=lambda n: None)
+        items = discover_machine(src)
+        self.assertEqual(sorted(i.provider_id for i in items),
+                         ["anthropic", "custom:gpu-box", "nous", "ollama", "openai-codex", "openrouter", "openrouter"])
+        by = {}
+        for item in items:
+            by.setdefault(item.provider_id, []).append(item)
+        codex = by["openai-codex"][0]
+        self.assertEqual([(h.profile, h.is_global) for h in codex.holders], [("global", True), ("verifier", False)])
+        self.assertEqual(codex.row_ids, ("syn-codex-1", "syn-codex-verifier-1"))
+        self.assertEqual(sorted([(h.profile, h.is_global) for h in i.holders] for i in by["openrouter"]),
+                         [[("global", True)], [("work", False)]])
+        self.assertEqual([(h.profile, h.is_global) for h in by["anthropic"][0].holders], [("verifier", False)])
+        self.assertEqual([(h.profile, h.is_global) for h in by["custom:gpu-box"][0].holders], [("global", True)])
 
     def test_no_real_hostnames_or_userinfo_in_fixture(self):
         blob = "".join(p.read_text() for p in FIXTURE.rglob("*") if p.is_file())
@@ -110,7 +131,8 @@ class HarnessValidatorTests(unittest.TestCase):
                 "account_label": "Account 1", "kind": "cloud", "plan_name": None, "plan_source": "none",
                 "auth_status": "missing", "endpoint_id": None, "state": "opaque", "confidence": "opaque",
                 "reason": "unsupported", "meters": [], "checked_at": "2026-11-06T12:00:00Z", "stale": False,
-                "error": None, "debug": {"adapter": "a", "capabilities": [], "source": "s", "sanitized": True}}
+                "error": None, "debug": {"adapter": "a", "capabilities": [], "source": "s", "sanitized": True},
+                "holders": []}
         errs = []
         harness.validate_card(errs, "card", card)
         self.assertEqual(errs, [])
