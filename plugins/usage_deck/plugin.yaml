@@ -1,0 +1,4 @@
+name: usage-deck
+version: 0.1.0
+description: "UsageDeck: detected provider subscriptions, session usage analytics and self-hosted endpoint health on one dashboard screen, with an Exact / Estimated / Opaque / Self-hosted confidence badge on every number."
+author: "UsageDeck contributors"

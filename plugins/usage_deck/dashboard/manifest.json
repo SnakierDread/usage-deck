@@ -1,0 +1,14 @@
+{
+  "name": "usage-deck",
+  "label": "UsageDeck",
+  "description": "Single-screen view of detected provider subscriptions, session usage analytics, and self-hosted endpoint health, with a confidence badge on every number.",
+  "icon": "Activity",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/usage-deck",
+    "position": "after:models"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
