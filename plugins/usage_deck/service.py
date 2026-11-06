@@ -32,6 +32,8 @@ from .models.dto import (
     HealthStripEntry,
     SubscriptionCard,
     build_meta,
+    check_envelope,
+    check_wire,
     failure_envelope,
     fmt_ts,
     make_error,
@@ -160,7 +162,8 @@ class UsageDeckService:
         return build_meta(str(uuid.uuid4()), fmt_ts(self._clock()), errors)
 
     def _ok(self, data: dict, errors: List[dict]) -> Tuple[int, dict]:
-        return 200, sanitize(success_envelope(data, self._meta(errors)))
+        # Masking must never change the wire shape; if it would, fail via internal_error (500).
+        return 200, check_envelope(sanitize(success_envelope(data, self._meta(errors))))
 
     def _fail(self, status: int, error: DeckError) -> Tuple[int, dict]:
         return status, sanitize(failure_envelope(error, self._meta([])))
@@ -235,7 +238,7 @@ class UsageDeckService:
         result = SessionAnalyticsAdapter(ctx).get_usage(query.window)
         if result.error is not None or not result.series:
             return None
-        return sanitize(to_plain(result.series[0]))
+        return check_wire("series", sanitize(to_plain(result.series[0])))
 
     # -- deck snapshot (cards + health) ----------------------------------
     def _deck(self, query: Query) -> _Snapshot:
@@ -358,8 +361,8 @@ class UsageDeckService:
             error=error,
             debug=DebugInfo(adapter=adapter.adapter_name, capabilities=caps, source=adapter.source_label),
         )
-        card_dict = sanitize(to_plain(card), item.secrets)
-        health_dict = sanitize(to_plain(health), item.secrets) if health is not None else None
+        card_dict = check_wire("card", sanitize(to_plain(card), item.secrets))
+        health_dict = check_wire("health", sanitize(to_plain(health), item.secrets)) if health is not None else None
         return card_dict, health_dict
 
     def _error_card(self, item: InventoryItem, now: datetime, code: str) -> dict:
@@ -372,7 +375,7 @@ class UsageDeckService:
             error=make_error(code, item.provider_id, item.account_id),
             debug=DebugInfo(adapter="none", capabilities=(), source="none"),
         )
-        return sanitize(to_plain(card), item.secrets)
+        return check_wire("card", sanitize(to_plain(card), item.secrets))
 
     def _unknown_health(self, item: InventoryItem, now: datetime, code: str) -> dict:
         entry = HealthStripEntry(
@@ -382,4 +385,4 @@ class UsageDeckService:
             checked_at=fmt_ts(now), stale=False, reason="source_unavailable",
             error=make_error(code, item.provider_id, item.account_id),
         )
-        return sanitize(to_plain(entry), item.secrets)
+        return check_wire("health", sanitize(to_plain(entry), item.secrets))
