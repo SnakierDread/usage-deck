@@ -853,7 +853,7 @@ def by_provider(cards):
 
 
 def free_text_has(card, needle):
-    return [k for k in ("provider_label", "account_label", "plan_name") if card[k] and needle in card[k]]
+    return [k for k in ("provider_label", "account_label", "plan_name") if card.get(k) and needle in card[k]]
 
 
 # --------------------------------------------------------------------------- scenarios
@@ -1409,18 +1409,30 @@ def main(argv=None):
     real_before = snapshot_real()
     ctx = Context(args, workdir, R)
     wanted = set(args.only or ("isolation", "main", "empty", "malformed", "unknown"))
+
+    def guarded(label, fn, *a, **kw):
+        """A crash inside one scenario is a FAILED check, never a reason to skip the remaining scenarios."""
+        try:
+            fn(*a, **kw)
+        except Exception as exc:  # noqa: BLE001 - report, never hide
+            R.scenario = label
+            R.check(f"scenario aborted: {type(exc).__name__}", False, str(exc)[:500])
+
     try:
         if "isolation" in wanted:
-            scenario_isolation(ctx)
+            guarded("isolation", scenario_isolation, ctx)
         if "main" in wanted:
-            scenario_main(ctx)
+            guarded("main", scenario_main, ctx)
         if "empty" in wanted:
-            scenario_variant(ctx, "empty-home", variant_empty, checks_empty(R))
+            guarded("empty-home", scenario_variant, ctx, "empty-home", variant_empty, checks_empty(R))
         if "malformed" in wanted:
-            scenario_variant(ctx, "malformed-auth-json", variant_malformed_json, checks_malformed(R))
-            scenario_variant(ctx, "malformed-auth-shape", variant_malformed_shape, checks_malformed(R))
+            guarded("malformed-auth-json", scenario_variant, ctx, "malformed-auth-json", variant_malformed_json,
+                    checks_malformed(R))
+            guarded("malformed-auth-shape", scenario_variant, ctx, "malformed-auth-shape", variant_malformed_shape,
+                    checks_malformed(R))
         if "unknown" in wanted:
-            scenario_variant(ctx, "unknown-provider", variant_unknown_provider, checks_unknown(R), seed=True)
+            guarded("unknown-provider", scenario_variant, ctx, "unknown-provider", variant_unknown_provider,
+                    checks_unknown(R), seed=True)
     except Exception as exc:  # noqa: BLE001 - report, never hide
         R.scenario = "harness"
         R.check(f"harness aborted: {type(exc).__name__}", False, str(exc)[:500])
