@@ -1,16 +1,16 @@
 # UsageDeck MVP contract — v1
 
-Status: **design complete except integration namespace approval; implementation release blocked**.
+Status: **ratified; backend and frontend implementation released**.
 Owner: architect. Branch: `t_22e02c08`. Wire version: `1`.
 This document governs backend and frontend together. Examples below are contract examples, not live probe results. `docs/recon-providers.md` is evidence, not an API specification.
 
-## 0. Integration decision required before release
+## 0. Ratified integration decision
 
 The brief mandates `/api/usage-deck/*`. The installed Hermes dashboard unconditionally mounts a plugin router at `/api/plugins/<manifest.name>/*`; its isolated plugin host uses that namespace too. A plugin cannot remove this prefix. Evidence: `hermes_cli/web_server_dashboard.py:1239–1247`, forwarding at `:1019–1043`, at local Hermes revision `b200f5bc60e31588ba2cb60e288029c4a54ba5fa`. Adding `/api/usage-deck` inside the exported router would create an incorrect double prefix, not the requested routes.
 
-**Recommended decision for the owner/dispatch:** amend the route requirement to `/api/plugins/usage-deck/*`, retaining `plugins/usage_deck` as the source directory and `usage-deck` as manifest identity. It preserves the host authentication, consent and profile isolation gates without host modifications. Until approved, the exact required `/api/usage-deck/*` routes remain a contract blocker; neither worker may silently claim those routes work. If the owner instead insists on the original namespace, dispatch must supply an authenticated host-side alias that traverses the same plugin gates; do not implement a second server or bypass them.
+**Approved decision:** use `/api/plugins/usage-deck/*`, retaining `plugins/usage_deck` as the source directory and `usage-deck` as manifest identity. Approval was recorded by `dashboard` on design card `t_0ce0532d` on November 6, 2026: “I approve native /api/plugins/usage-deck”. This supersedes `/api/usage-deck/*` in the original brief and implementation card bodies. It preserves the host authentication, consent and profile isolation gates without host modifications. No top-level alias, second server or gate bypass is authorized or required.
 
-All route suffixes, DTOs and behaviors below are final and independent of that decision. `API_BASE` is one shared frontend constant, set to the owner-approved namespace (recommended value `/api/plugins/usage-deck`). No speculative alias, absolute origin, or credential in its URL.
+All route suffixes, DTOs and behaviors below are final. `API_BASE` is one shared frontend constant fixed to `/api/plugins/usage-deck`. No speculative alias, absolute origin, or credential in its URL.
 
 A second grounding correction is settled here, not left to workers: the CLI installs agent packages containing `plugin.yaml` plus `dashboard/manifest.json`, not a bare root dashboard manifest. Preserve the requested root files as canonical sources and produce a deterministic dashboard staging copy (§7). Evidence: `hermes_cli/plugins_cmd_inspect.py:57–87`; existing `plugins/kanban/dashboard/manifest.json:1–14`.
 
@@ -181,13 +181,13 @@ Additionally scrub all displayed strings and nested values for the exact nonempt
 
 ## 3. API Routes and envelopes
 
-Required logical endpoints pending §0 approval:
+Required physical endpoints (approved in §0):
 
-- GET `/api/usage-deck/subscriptions`
-- GET `/api/usage-deck/usage?window=7|30|90&provider=<id>`
-- GET `/api/usage-deck/health`
+- GET `/api/plugins/usage-deck/subscriptions`
+- GET `/api/plugins/usage-deck/usage?window=7|30|90&provider=<id>`
+- GET `/api/plugins/usage-deck/health`
 
-Physical host-compatible equivalents use `/api/plugins/usage-deck` and the same suffixes. Export a relative router (`/subscriptions`, `/usage`, `/health`) with **no prefix**. A test harness mounts it at its declared API_BASE; actual host namespace must be verified in integration QA, not merely a standalone TestClient.
+Export a relative router (`/subscriptions`, `/usage`, `/health`) with **no prefix**; the host supplies `/api/plugins/usage-deck`. A test harness mounts it at the same API_BASE; actual host namespace must be verified in integration QA, not merely a standalone TestClient. The old `/api/usage-deck/*` namespace is not exposed.
 
 Common optional query `profile` is passed through the host profile validation/scope mechanism. Omitted = dashboard active profile. All endpoints inherit the dashboard auth/consent/profile gate; no public bypass and no provider credentials in requests. Unknown query parameters and repeated single-value parameters => 400 invalid_query. Window defaults to 30; accept only the literal strings `7`, `30`, `90` (not 07, floats or arbitrary days). Provider absent means unfiltered; empty string or >256 characters/control characters => 400; percent-decode once through the host, match exact discovered provider ID. Unknown inventory provider => 404 provider_not_found (this does **not** mean a discovered provider with unknown adapter should fail).
 
@@ -279,7 +279,7 @@ Secret tests: seed unique sentinels in nested config/auth/HTTP/error strings; re
 
 Frontend fixtures: every terminal card state and loading transition; empty/nonempty inventory; partial failure; profile/window switch with out-of-order completion; null/zero/over-limit/unlimited progress behavior; badges per value; drawer text escaping; keyboard access; hidden-tab polling; chart attribution unavailable; health without metrics. Smoke-test all three zones in the real dashboard SDK, and install via `hermes plugins install ./plugins/usage_deck` only after staged packaging exists and owner-approved route namespace is settled. Live probes are read-only, opt-in through existing configured credentials; report nonresponsive endpoints honestly rather than assert fleet totals from old recon.
 
-Design ratification checklist: seven required sections present; recon preserved and corrections explicit; schemas and masks consistent; physical host integration verified; §0 namespace choice approved; docs committed on requested branch; commit ID handed to both implementation cards. No feature implementation or external design review is part of this card.
+Design ratification checklist: seven required sections present; recon preserved and corrections explicit; schemas and masks consistent; physical host mounting contract verified against source; §0 namespace choice approved; docs committed on requested branch; commit ID handed to both implementation cards. Runtime host installation and route smoke tests remain downstream implementation/QA obligations, not evidence claimed by this design card. No feature implementation or external design review is part of this card.
 
 ## Grounding references
 
