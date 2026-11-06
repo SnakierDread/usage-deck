@@ -1,10 +1,22 @@
 import json
 import unittest
 
-from plugins.usage_deck.discovery import FileInventorySource, InventoryUnavailable, discover, plan_from_token
+from plugins.usage_deck.discovery import (
+    FileInventorySource,
+    InventoryUnavailable,
+    discover,
+    plan_from_token,
+    provider_label_for,
+)
 from plugins.usage_deck.models import dto
 from plugins.usage_deck.models.identity import make_account_id, make_endpoint_id, normalize_endpoint, parse_endpoint
-from plugins.usage_deck.models.redaction import REDACTED, collect_secret_values, sanitize, scrub_string
+from plugins.usage_deck.models.redaction import (
+    REDACTED,
+    collect_secret_values,
+    contains_secret,
+    sanitize,
+    scrub_string,
+)
 
 from .helpers import (
     SENTINEL_KEY,
@@ -49,6 +61,29 @@ class RedactionTests(unittest.TestCase):
                        [SENTINEL_KEY, SENTINEL_TOKEN, SENTINEL_SECRET])
         self.assertEqual(scan_for(out, [SENTINEL_KEY, SENTINEL_TOKEN, SENTINEL_SECRET]), [])
         self.assertIn(REDACTED, out["label"])
+
+    def test_short_secrets_of_any_length_are_scrubbed(self):
+        # DESIGN.md §2.1: every nonempty private secret, however short (synthetic sentinels only).
+        for short in ("abc", "qx", "z"):
+            with self.subTest(secret=short):
+                secrets = collect_secret_values({"access_token": short})
+                self.assertEqual(secrets, frozenset({short}))
+                out = sanitize({"label": short, "msg": f"x {short} y", "list": [short], "n": {"v": short}}, secrets)
+                self.assertEqual(out["label"], REDACTED)
+                self.assertNotIn(short, out["msg"])
+                self.assertEqual(out["list"], [REDACTED])
+                self.assertEqual(out["n"]["v"], REDACTED)
+                self.assertTrue(contains_secret(short, secrets))
+                self.assertEqual(scrub_string(f"a{short}b", secrets), f"a{REDACTED}b")
+        self.assertEqual(collect_secret_values({"access_token": "", "api_key": ["", "qx"]}), frozenset({"qx"}))
+        self.assertEqual(scrub_string("plain text", [""]), "plain text")  # empty secret never matches
+
+    def test_short_secret_keeps_numeric_counts(self):
+        out = sanitize({"input_count": 7, "output_count": 70, "ratio": 0.7, "ok": True, "none": None, "label": "7"}, ["7"])
+        self.assertEqual((out["input_count"], out["output_count"], out["ratio"]), (7, 70, 0.7))
+        self.assertIs(out["ok"], True)
+        self.assertIsNone(out["none"])
+        self.assertEqual(out["label"], REDACTED)
 
     def test_patterns_and_urls(self):
         text = scrub_string("Authorization: Bearer abc.def-ghi and sk-abcdefghijkl and " + make_jwt({"a": 1})
@@ -245,6 +280,16 @@ class DiscoveryTests(unittest.TestCase):
         self.s.write_auth({"credential_pool": {"custom:" + SENTINEL_TOKEN: [{"id": "x1", "access_token": SENTINEL_TOKEN}]}})
         items = discover(self.source())
         self.assertEqual(items[0].provider_label, "Provider")
+
+    def test_short_secret_provider_names_and_row_ids_are_rejected(self):
+        # Labels equal to a short private secret fall back to the fixed "Provider"/"Account N" text.
+        self.s.write_auth({"credential_pool": {"custom:abc": [{"id": "abc", "access_token": "abc"}]}})
+        items = discover(self.source())
+        self.assertEqual(items[0].provider_label, "Provider")
+        self.assertEqual(items[0].account_label, "Account 1")
+        self.assertNotIn("abc", items[0].account_id)
+        self.assertEqual(provider_label_for("custom:qx", frozenset({"qx"})), "Provider")
+        self.assertEqual(provider_label_for("custom:lab", frozenset({"zq"})), "lab")
 
     def test_ids_never_derive_from_tokens(self):
         self.s.write_auth({"credential_pool": {"anthropic": [{"access_token": "tok-one-111111"}]}})

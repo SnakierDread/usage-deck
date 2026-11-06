@@ -131,6 +131,35 @@ class SubscriptionsTests(ServiceBase):
         status, body = self.call(svc, "usage")
         self.assertEqual(scan_for(body, ALL_SENTINELS), [])
 
+    def test_short_secrets_never_reach_responses_and_counts_survive(self):
+        short = "zq"  # synthetic 2-character private value; DESIGN.md §2.1 covers every nonempty secret
+        self.s.write_auth({"credential_pool": {
+            "openrouter": [{"id": "or1", "access_token": short}],
+            "nous": [{"id": short, "access_token": short}],
+            "custom:" + short: [{"id": "gp", "access_token": short}],
+        }})
+        self.custom = [{"name": "gpu", "base_url": GPU + "/v1", "api_key": short}]
+        self.transport.routes.update({
+            OPENROUTER_KEY_URL: json_response({"data": {"usage": 1.5, "limit": 5, "limit_remaining": 3.5,
+                                                         "label": short}}),
+            GPU + "/metrics": raw_response(METRICS, latency=2.0),
+            GPU + "/v1/models": json_response({"data": []}, latency=6.0),
+        })
+        svc = self.make()
+        for endpoint in ("subscriptions", "health", "usage"):
+            status, body = self.call(svc, endpoint)
+            self.assertEqual(status, 200, endpoint)
+            self.assertEqual(scan_for(body, (short,)), [], endpoint)
+        _, subs = self.call(svc, "subscriptions")
+        cards = subs["data"]["cards"]
+        self.assertEqual(len(cards), 4)
+        self.assertTrue(all(c["provider_label"] != short and c["account_label"].startswith("Account") for c in cards))
+        # Numeric values are not strings: safe counts survive scrubbing.
+        _, usage = self.call(svc, "usage")
+        counts = [p for p in usage["data"]["series"][0]["points"] if p["input_count"] is not None]
+        self.assertEqual([p["input_count"] for p in counts], [100, 0])
+        self.assertEqual([p["output_count"] for p in counts], [50, 0])
+
     def test_failure_isolation_and_partial_meta(self):
         self.seed_fleet()
         self.transport.routes[OPENROUTER_KEY_URL] = json_response({"error": SENTINEL_KEY}, status=401)
