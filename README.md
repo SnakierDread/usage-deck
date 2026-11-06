@@ -123,9 +123,32 @@ After a reinstall, run `hermes plugins list --plain --no-bundled` and re-enable 
 Run these from the repository root. They use the Python standard library, plus Node with React and jsdom taken from the Hermes checkout for the frontend tests (test-only, never plugin dependencies).
 
 ```sh
-python3 -m unittest discover -s plugins/usage_deck/tests -t .   # backend
+python -m unittest discover -s plugins/usage_deck/tests -t .     # backend
 tests/run_frontend.sh                                            # frontend + packaging
-python3 scripts/stage_dashboard.py --check --require-backend     # staged dashboard/ is in sync
+python scripts/stage_dashboard.py --check --require-backend      # staged dashboard/ is in sync
 ```
 
-`plugins/usage_deck/dashboard/` is generated. Never edit it by hand. After changing backend or frontend sources, rebuild it with `python3 scripts/stage_dashboard.py --require-backend` and commit the result. Commit messages use `feat:`, `fix:`, `test:` or `docs:` prefixes.
+`plugins/usage_deck/dashboard/` is generated. Never edit it by hand. After changing backend or frontend sources, rebuild it with `python scripts/stage_dashboard.py --require-backend` and commit the result. Commit messages use `feat:`, `fix:`, `test:` or `docs:` prefixes.
+
+### Actual-host acceptance (real Hermes dashboard, synthetic data)
+
+`plugins/usage_deck/tests/test_plugin_api.py` mounts the router on a standalone FastAPI app. The harness below
+instead drives the **real dashboard host** (DESIGN.md §3): it installs the *committed* plugin
+(`hermes plugins install file://<repo>#plugins/usage_deck`) into an isolated scratch Hermes home built from
+`plugins/usage_deck/tests/fixtures/scratch_home/` (3 synthetic cloud accounts + 2 self-hosted endpoints), starts
+`hermes dashboard`, and checks `/api/plugins/usage-deck/{subscriptions,usage,health}` through the host's own
+auth, plugin-consent and profile gates: exact schema, source-bound confidence labels, seeded-secret masking,
+unknown-provider / malformed-store / empty-home cases and config/auth immutability.
+
+```sh
+git status --short --untracked-files=no            # must be clean: the harness installs the committed HEAD
+python tests/acceptance/host_acceptance.py          # exit 0 only if every check passes; --keep keeps logs + report.json
+python tests/acceptance/host_acceptance.py --self-check   # offline: fixture + validators only
+```
+
+Needs the `hermes` CLI, `git` and `openssl` on `PATH` and a managed temp directory (`$HERMES_KANBAN_WORKSPACE`,
+`$TMPDIR` or `--workdir`). Everything runs in a clean child environment whose `HOME` and `HERMES_HOME` live inside that
+directory, so Hermes' ancestry-based global-root lookup can never reach the real `~/.hermes`. All HTTPS from the host
+is forced through a loopback CONNECT proxy that refuses everything except `openrouter.ai:443`, which a throw-away CA
+answers with an invented payload (the host's own update checks are refused and logged, not sent). Results
+describe the synthetic fixture only: they are not evidence about any live pool, subscription or browser rendering.
