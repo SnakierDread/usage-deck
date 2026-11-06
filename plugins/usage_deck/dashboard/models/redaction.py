@@ -35,10 +35,6 @@ SENSITIVE_FRAGMENTS = (
     "refresh",
 )
 
-# Exact secret values shorter than this are not scrubbed from free text, they
-# would garble ordinary strings (a 1-character "secret" matches everything).
-MIN_SECRET_LENGTH = 4
-
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]*)?")
 _PREFIX_RE = re.compile(r"\b(?:sk|pk|rk|ghp|gho|xox[abp])[-_][A-Za-z0-9_-]{8,}")
@@ -72,7 +68,7 @@ def scrub_string(value: str, secrets: Iterable[str] = ()) -> str:
     out = value
     # Longest first so a secret that contains another is replaced whole.
     for secret in sorted({s for s in secrets if isinstance(s, str)}, key=len, reverse=True):
-        if len(secret) >= MIN_SECRET_LENGTH and secret in out:
+        if secret and secret in out:  # DESIGN.md §2.1: every nonempty secret, any length
             out = out.replace(secret, REDACTED)
     out = _URL_RE.sub(_scrub_url, out)
     out = _BEARER_RE.sub(REDACTED, out)
@@ -138,7 +134,7 @@ def collect_secret_values(raw: Any, _depth: int = 0) -> frozenset:
     elif isinstance(raw, (list, tuple)):
         for item in raw:
             found |= collect_secret_values(item, _depth + 1)
-    return frozenset(s for s in found if len(s) >= MIN_SECRET_LENGTH)
+    return frozenset(s for s in found if s)
 
 
 def _collect_strings(value: Any, found: set, depth: int) -> None:
