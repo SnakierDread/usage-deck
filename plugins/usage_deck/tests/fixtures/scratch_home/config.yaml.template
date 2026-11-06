@@ -1,0 +1,21 @@
+# Synthetic scratch HERMES_HOME config (usage-deck acceptance fixture).
+#
+# Every value here is invented. The two @@...@@ placeholders are replaced by the acceptance
+# harness with the loopback URLs of its in-process fake endpoints; nothing in this file points
+# at a real service. Never copy real credentials into this directory.
+
+model:
+  provider: ollama                  # endpoint #1: primary provider, ollama-style, no credential
+  base_url: "@@OLLAMA_BASE_URL@@"
+  default: synthetic-model
+
+custom_providers:                   # endpoint #2: custom OpenAI-compatible endpoint (has /metrics)
+  - name: gpu-box
+    base_url: "@@GPU_BASE_URL@@"
+    api_key: "UDSYN-gpubox-apikey-5d1c8e3f7a20"
+    model: synthetic-model
+
+# Keep the host's Nous keepalive thread off: it may refresh OAuth and rewrite auth.json,
+# which would defeat the read-only/immutability check (and must never reach the network).
+nous:
+  keepalive_interval_seconds: 0

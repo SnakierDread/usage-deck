@@ -1,0 +1,4 @@
+# Secondary profile "work": its own openrouter pool shadows the root's openrouter pool
+# (profile-first, per provider); nous / openai-codex / endpoints still come from the root.
+nous:
+  keepalive_interval_seconds: 0
