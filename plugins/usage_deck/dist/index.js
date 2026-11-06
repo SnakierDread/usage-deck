@@ -544,9 +544,51 @@
       return h("li", { className: "ud-meter", "data-meter-id": str(m.id) || undefined }, parts);
     }
 
+    /**
+     * Modal "Show JSON" viewer (DESIGN.md §4 UI states): role=dialog, focus moves in on open,
+     * Tab/Shift+Tab are trapped inside, Escape closes from anywhere, and the owner restores
+     * focus to the opening button. Content is the already-sanitized card DTO as text only.
+     */
+    function JsonDialog(props) {
+      const dialogRef = useRef(null);
+      const closeRef = useRef(null);
+      const onCloseRef = useRef(props.onClose);
+      onCloseRef.current = props.onClose;
+
+      useEffect(function () {
+        if (closeRef.current && closeRef.current.focus) closeRef.current.focus();
+        const doc = (dialogRef.current && dialogRef.current.ownerDocument) || document;
+        function onDocKey(e) {
+          if (e.key === "Escape" || e.key === "Esc") { e.preventDefault(); onCloseRef.current(); }
+        }
+        doc.addEventListener("keydown", onDocKey);
+        return function () { doc.removeEventListener("keydown", onDocKey); };
+      }, []);
+
+      function trapTab(e) {
+        if (e.key !== "Tab" || !dialogRef.current) return;
+        const nodes = Array.prototype.slice.call(dialogRef.current.querySelectorAll("button, [tabindex='0']"));
+        if (nodes.length === 0) { e.preventDefault(); return; }
+        const first = nodes[0], last = nodes[nodes.length - 1];
+        const active = dialogRef.current.ownerDocument.activeElement;
+        const inside = nodes.indexOf(active) !== -1;
+        if (e.shiftKey && (active === first || !inside)) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && (active === last || !inside)) { e.preventDefault(); first.focus(); }
+      }
+
+      return h("div", {
+        id: props.id, className: "ud-drawer", role: "dialog", "aria-modal": "true",
+        "aria-label": props.label, tabIndex: -1, ref: dialogRef, onKeyDown: trapTab,
+      },
+        h("div", { className: "ud-drawer-head" },
+          h("strong", { className: "ud-small" }, props.label),
+          h("button", { type: "button", className: "ud-btn ud-btn-ghost", ref: closeRef, onClick: props.onClose }, "Close")),
+        h("pre", { className: "ud-drawer-json", tabIndex: 0 }, props.text));
+    }
+
     function SubscriptionCard(props) {
       const card = props.card;
-      const [open, setOpen] = useState(false);
+      const open = props.open === true;
       const toggleRef = useRef(null);
       const drawerId = "ud-drawer-" + sanitizeDomId(card.id || props.index);
       const view = cardView(card);
@@ -560,7 +602,7 @@
       const reasonText = has(REASON_TEXT, card.reason) ? REASON_TEXT[card.reason] : null;
 
       function closeDrawer() {
-        setOpen(false);
+        props.onOpenChange(false);
         if (toggleRef.current && toggleRef.current.focus) toggleRef.current.focus();
       }
 
@@ -613,18 +655,20 @@
           h("button", {
             type: "button", className: "ud-btn ud-btn-ghost", ref: toggleRef,
             "aria-expanded": open ? "true" : "false", "aria-controls": drawerId,
-            onClick: function () { setOpen(!open); },
+            onClick: function () { if (open) closeDrawer(); else props.onOpenChange(true); },
           }, open ? "Hide JSON" : "Show JSON")),
-        open ? h("pre", {
-          id: drawerId, className: "ud-drawer", tabIndex: 0, role: "region",
-          "aria-label": "Sanitized JSON for " + (str(card.provider_label) || "card"),
-          onKeyDown: function (e) { if (e.key === "Escape") { e.stopPropagation(); closeDrawer(); } },
-        }, JSON.stringify(card, null, 2)) : null);
+        open ? h(JsonDialog, {
+          id: drawerId, label: "Sanitized JSON for " + (str(card.provider_label) || "card"),
+          text: JSON.stringify(card, null, 2), onClose: closeDrawer,
+        }) : null);
     }
 
     function SubscriptionsZone(props) {
       const st = props.res.state;
       const reload = props.res.reload;
+      const [openId, setOpenId] = useState(null);
+      // A dialog never outlives the filter change that may hide its card.
+      useEffect(function () { setOpenId(null); }, [props.provider]);
       let content;
       if (st.status === "loading" && !st.data) {
         content = h("div", { className: "ud-grid", "aria-busy": "true" },
@@ -642,10 +686,23 @@
               h("p", { className: "ud-small" }, "UsageDeck reads this profile's existing Hermes configuration and credential pool; it never asks for keys. Add or configure a provider in the dashboard's Keys or Config pages and it will appear here."),
               h("button", { type: "button", className: "ud-btn", onClick: reload }, "Refresh")));
         } else {
+          // The page-level provider filter narrows this list too (not only the usage chart).
+          const shown = props.provider
+            ? data.cards.filter(function (c) { return str(c.provider_id) === props.provider; })
+            : data.cards;
           content = h("div", null, err,
+            props.provider
+              ? h("p", { className: "ud-muted ud-small", "data-filter-note": "true" },
+                "Showing " + shown.length + " of " + data.cards.length + " subscription cards (provider filter).")
+              : null,
             h("div", { className: "ud-grid", "aria-busy": st.refreshing ? "true" : undefined },
-              data.cards.map(function (c, i) {
-                return h(SubscriptionCard, { key: c.id || i, index: i, card: c, zoneStale: stale, busy: st.refreshing, onRetry: reload });
+              shown.map(function (c, i) {
+                const key = c.id || i;
+                return h(SubscriptionCard, {
+                  key: key, index: i, card: c, zoneStale: stale, busy: st.refreshing, onRetry: reload,
+                  open: openId === key,
+                  onOpenChange: function (o) { setOpenId(o ? key : null); },
+                });
               })));
         }
       }
@@ -914,7 +971,7 @@
               type: "button", className: "ud-btn", onClick: refreshAll, disabled: busy || undefined,
               title: "Re-requests all three zones. The server may answer from its 30-second cache, so values can be up to 30 seconds old.",
             }, busy ? "Refreshing…" : "Refresh"))),
-        h(SubscriptionsZone, { res: subs }),
+        h(SubscriptionsZone, { res: subs, provider: effProvider }),
         h(UsageZone, { res: usage, window: windowDays, onWindow: setWindowDays, provider: effProvider, onProvider: setProvider, providers: providers }),
         h(HealthZone, { res: health }),
         h("div", { className: "ud-sr", role: "status", "aria-live": "polite" },

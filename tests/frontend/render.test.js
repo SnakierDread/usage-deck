@@ -184,13 +184,83 @@ test("JSON drawer: aria-expanded, sanitized DTO text only, Escape restores focus
   assert.equal(toggle.getAttribute("aria-expanded"), "true");
   const drawer = m.$(".ud-drawer");
   assert.equal(drawer.id, toggle.getAttribute("aria-controls"));
-  assert.deepEqual(JSON.parse(drawer.textContent), evil);
+  assert.deepEqual(JSON.parse(m.$(".ud-drawer pre").textContent), evil);
   assert.equal(m.$$("img").length, 0);
-  drawer.focus();
-  await act(async () => { drawer.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
-  assert.equal(m.$(".ud-drawer"), null);
+  await m.unmount();
+});
+
+const key = (el, k, extra) => act(async () => {
+  el.dispatchEvent(new dom.window.KeyboardEvent("keydown", Object.assign({ key: k, bubbles: true, cancelable: true }, extra)));
+});
+
+test("JSON viewer is a modal dialog: focus moves in on open, Escape closes from anywhere, focus restored", async () => {
+  const m = await mount({ routes: routesFor({ subs: () => envelope({ cards: [F.readyOpenRouter, F.opaqueNous], inventory_state: "detected" }) }) });
+  const toggle = m.$$(".ud-card-foot .ud-btn")[1];
+  toggle.focus();
+  await m.click(toggle);
+  const dlg = m.$("[role=dialog]");
+  assert.ok(dlg, "role=dialog element exists");
+  assert.equal(dlg.tagName, "DIV", "not a bare <pre>");
+  assert.equal(dlg.getAttribute("aria-modal"), "true");
+  assert.match(dlg.getAttribute("aria-label"), /Sanitized JSON for Nous Portal/);
+  assert.equal(toggle.getAttribute("aria-controls"), dlg.id);
+  assert.ok(dlg.contains(document.activeElement), "focus moved into the dialog on open");
+  assert.equal(document.activeElement.textContent, "Close");
+  // Escape with focus anywhere (here: body, as after clicking outside) still closes.
+  document.activeElement.blur();
+  assert.equal(document.activeElement, document.body);
+  await key(document.body, "Escape");
+  assert.equal(m.$("[role=dialog]"), null);
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(document.activeElement, toggle, "focus restored to the opening button");
+  // Escape with focus inside the dialog, and the Close button, both close and restore too.
+  await m.click(toggle);
+  await key(document.activeElement, "Escape");
+  assert.equal(m.$("[role=dialog]"), null);
   assert.equal(document.activeElement, toggle);
+  await m.click(toggle);
+  await m.click(m.$("[role=dialog] button"));
+  assert.equal(m.$("[role=dialog]"), null);
+  assert.equal(document.activeElement, toggle);
+  await m.unmount();
+});
+
+test("JSON viewer traps Tab / Shift+Tab inside the dialog", async () => {
+  const m = await mount({ routes: routesFor({ subs: () => envelope({ cards: [F.readyOpenRouter], inventory_state: "detected" }) }) });
+  await m.click(m.$(".ud-card-foot .ud-btn"));
+  const dlg = m.$("[role=dialog]");
+  const closeBtn = dlg.querySelector("button");
+  const pre = dlg.querySelector("pre");
+  assert.equal(document.activeElement, closeBtn);
+  let ev;
+  // Tab on the last focusable wraps to the first; Shift+Tab on the first wraps to the last.
+  pre.focus();
+  await act(async () => { ev = new dom.window.KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true }); pre.dispatchEvent(ev); });
+  assert.ok(ev.defaultPrevented);
+  assert.equal(document.activeElement, closeBtn);
+  await act(async () => { ev = new dom.window.KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true }); closeBtn.dispatchEvent(ev); });
+  assert.ok(ev.defaultPrevented);
+  assert.equal(document.activeElement, pre);
+  // Tab from a middle position is left to the browser (no preventDefault).
+  closeBtn.focus();
+  await act(async () => { ev = new dom.window.KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true }); closeBtn.dispatchEvent(ev); });
+  assert.ok(!ev.defaultPrevented);
+  await m.unmount();
+});
+
+test("only one JSON dialog is open at a time and Escape listener is removed on close", async () => {
+  const m = await mount({ routes: routesFor({ subs: () => envelope({ cards: [F.readyOpenRouter, F.opaqueNous], inventory_state: "detected" }) }) });
+  const [t1, t2] = m.$$(".ud-card-foot .ud-btn");
+  await m.click(t1);
+  await m.click(t2);
+  assert.equal(m.$$("[role=dialog]").length, 1);
+  assert.equal(t1.getAttribute("aria-expanded"), "false");
+  assert.equal(t2.getAttribute("aria-expanded"), "true");
+  await key(document.body, "Escape");
+  assert.equal(m.$$("[role=dialog]").length, 0);
+  t1.focus();
+  await key(document.body, "Escape"); // no dialog: must not steal focus
+  assert.equal(document.activeElement, t1);
   await m.unmount();
 });
 
@@ -274,6 +344,50 @@ test("provider filter requests ?provider= and shows attribution-unavailable hone
   assert.match(z.textContent, /Provider attribution unavailable from session analytics\./);
   assert.equal(z.querySelectorAll("figure.ud-chart").length, 0, "no profile totals cloned onto the provider");
   assert.equal(z.querySelectorAll("polyline, circle").length, 0);
+  await m.unmount();
+});
+
+test("provider filter narrows the rendered subscription cards (DOM count), and clearing restores all", async () => {
+  const cards = [
+    F.readyOpenRouter,
+    F.opaqueNous,
+    F.errorAnthropic,
+    Object.assign({}, F.opaqueNous, { id: "acct_an2", account_id: "acct_an2", provider_id: "anthropic", provider_label: "Anthropic", account_label: "Account 2" }),
+    F.selfHosted,
+    Object.assign({}, F.opaqueNous, { id: "acct_or2", account_id: "acct_or2", provider_id: "openrouter", provider_label: "OpenRouter", account_label: "Account 2" }),
+  ];
+  const m = await mount({ routes: routesFor({ subs: () => envelope({ cards, inventory_state: "detected" }) }) });
+  const count = () => m.$$("[data-zone=subscriptions] .ud-card").length;
+  const ids = () => m.$$("[data-zone=subscriptions] .ud-card").map((c) => c.dataset.cardId);
+  const pick = async (v) => act(async () => {
+    const sel = m.$("select[aria-label='Provider filter']");
+    Object.getOwnPropertyDescriptor(dom.window.HTMLSelectElement.prototype, "value").set.call(sel, v);
+    sel.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+  });
+  assert.equal(count(), 6);
+  await pick("anthropic");
+  assert.equal(count(), 2, "only the Anthropic cards remain in the DOM");
+  assert.deepEqual(ids(), ["acct_an", "acct_an2"]);
+  assert.match(m.$("[data-zone=subscriptions] [data-filter-note]").textContent, /Showing 2 of 6/);
+  await pick("ollama");
+  assert.deepEqual(ids(), ["acct_ol"]);
+  await pick("");
+  assert.equal(count(), 6);
+  assert.equal(m.$("[data-filter-note]"), null);
+  await m.unmount();
+});
+
+test("changing the provider filter closes an open JSON dialog instead of leaving it dangling", async () => {
+  const m = await mount({ routes: routesFor({ subs: () => envelope({ cards: [F.readyOpenRouter, F.errorAnthropic], inventory_state: "detected" }) }) });
+  await m.click(m.$$(".ud-card-foot .ud-btn")[0]);
+  assert.ok(m.$("[role=dialog]"));
+  await act(async () => {
+    const sel = m.$("select[aria-label='Provider filter']");
+    Object.getOwnPropertyDescriptor(dom.window.HTMLSelectElement.prototype, "value").set.call(sel, "anthropic");
+    sel.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+  });
+  assert.equal(m.$("[role=dialog]"), null);
+  assert.equal(m.$$("[data-zone=subscriptions] .ud-card").length, 1);
   await m.unmount();
 });
 
