@@ -104,7 +104,7 @@ class FixtureTests(unittest.TestCase):
             by.setdefault(item.provider_id, []).append(item)
         codex = by["openai-codex"][0]
         self.assertEqual([(h.profile, h.is_global) for h in codex.holders], [("global", True), ("verifier", False)])
-        self.assertEqual(codex.row_ids, ("syn-codex-1", "syn-codex-verifier-1"))
+        self.assertEqual(codex.credential_refs, ((True, "global", "syn-codex-1"), (False, "verifier", "syn-codex-verifier-1")))
         self.assertEqual(sorted([(h.profile, h.is_global) for h in i.holders] for i in by["openrouter"]),
                          [[("global", True)], [("work", False)]])
         self.assertEqual([(h.profile, h.is_global) for h in by["anthropic"][0].holders], [("verifier", False)])

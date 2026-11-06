@@ -106,7 +106,8 @@ class SelfHostedAdapter(BaseAdapter):
             return self._snapshot
         ctx = self.ctx
         if ctx.endpoint_cache is not None and ctx.endpoint_id:
-            snap = ctx.endpoint_cache.get_or_compute(ctx.endpoint_id, self._compute)
+            # A machine-only (no live source) card must never poison, or reuse, a live card's result.
+            snap = ctx.endpoint_cache.get_or_compute(f"{ctx.endpoint_id}|{int(ctx.live_source)}", self._compute)
         else:
             snap = self._compute()
         self._snapshot = snap
@@ -115,7 +116,8 @@ class SelfHostedAdapter(BaseAdapter):
     def _compute(self) -> _Snapshot:
         ctx = self.ctx
         endpoint = ctx.endpoint
-        if endpoint is None or not endpoint.safe:
+        if endpoint is None or not endpoint.safe or not ctx.live_source:
+            # No safe endpoint, or machine-only inventory: no outbound request at all (DESIGN.md §12.5).
             return _Snapshot(False, _NOT_RUN, _NOT_RUN, None, "unknown", "opaque",
                              "source_unavailable", None, None)
 

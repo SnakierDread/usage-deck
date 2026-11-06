@@ -105,9 +105,9 @@ class AnthropicAdapter(OpaqueCloudAdapter):
 
     def _capture(self) -> Optional[Capture]:
         store = self.ctx.captures
-        if store is None or not self.ctx.row_ids:
+        if store is None or not self.ctx.credential_refs:
             return None
-        return store.latest("anthropic", self.ctx.row_ids)
+        return store.latest("anthropic", self.ctx.credential_refs, now=self.ctx.now())
 
     def _do_probe(self) -> ProbeResult:
         capture = self._capture()
@@ -137,6 +137,9 @@ class OpenRouterAdapter(BaseAdapter):
 
     def _do_usage(self, window: int) -> UsageResult:
         ctx = self.ctx
+        if not ctx.live_source:
+            # Machine-only inventory: another profile's credential is never used for an outbound request.
+            return UsageResult(reason="source_unavailable")
         if not ctx.credential:
             return UsageResult(reason="credentials_missing")
         headers = {

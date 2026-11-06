@@ -1,10 +1,14 @@
 {
   "synthetic": true,
-  "_note": "SYNTHETIC TEST FIXTURE. Every value below is invented to exercise the parser; none was captured from a real Anthropic response. Header names follow recon t_7dce2222 (public GitHub issues #12829/#55333). The reader refuses files flagged synthetic unless a test opts in, so this can never appear as a real observation.",
-  "schema_version": 1,
+  "_note": "SYNTHETIC TEST FIXTURE. Every value below is invented to exercise the parser; none was captured from a real Anthropic response. Header names follow recon t_7dce2222 (public GitHub issues #12829/#55333). The reader refuses files flagged synthetic unless a test opts in, so this can never appear as a real observation. Capture schema 2: every entry names the holder (auth store) that owns its row.",
+  "schema_version": 2,
   "captures": [
     {
       "provider": "anthropic",
+      "holder": {
+        "profile": "work",
+        "is_global": false
+      },
       "credential_id": "ant-syn-fresh",
       "observed_at": "2026-11-06T11:58:30Z",
       "headers": {
@@ -21,6 +25,10 @@
     },
     {
       "provider": "anthropic",
+      "holder": {
+        "profile": "work",
+        "is_global": false
+      },
       "credential_id": "ant-syn-session-rolled",
       "observed_at": "2026-11-06T09:00:00Z",
       "headers": {
@@ -32,6 +40,10 @@
     },
     {
       "provider": "anthropic",
+      "holder": {
+        "profile": "work",
+        "is_global": false
+      },
       "credential_id": "ant-syn-both-rolled",
       "observed_at": "2026-11-05T09:00:00Z",
       "headers": {
@@ -43,6 +55,10 @@
     },
     {
       "provider": "anthropic",
+      "holder": {
+        "profile": "work",
+        "is_global": false
+      },
       "credential_id": "ant-syn-over",
       "observed_at": "2026-11-06T11:59:00Z",
       "headers": {
@@ -53,10 +69,40 @@
     },
     {
       "provider": "anthropic",
+      "holder": {
+        "profile": "work",
+        "is_global": false
+      },
       "credential_id": "ant-syn-no-reset",
       "observed_at": "2026-11-06T11:00:00Z",
       "headers": {
         "anthropic-ratelimit-unified-5h-utilization": "0.2"
+      }
+    },
+    {
+      "provider": "anthropic",
+      "holder": {
+        "profile": "verifier",
+        "is_global": false
+      },
+      "credential_id": "ant-syn-fresh",
+      "observed_at": "2026-11-06T11:57:00Z",
+      "headers": {
+        "anthropic-ratelimit-unified-5h-reset": "1793977200",
+        "anthropic-ratelimit-unified-5h-utilization": "0.77"
+      }
+    },
+    {
+      "provider": "anthropic",
+      "holder": {
+        "profile": "global",
+        "is_global": true
+      },
+      "credential_id": "ant-syn-fresh",
+      "observed_at": "2026-11-06T11:56:00Z",
+      "headers": {
+        "anthropic-ratelimit-unified-5h-reset": "1793977200",
+        "anthropic-ratelimit-unified-5h-utilization": "0.55"
       }
     }
   ]
