@@ -120,6 +120,14 @@ class ScratchHome:
         target.write_text(data if isinstance(data, str) else json.dumps(data))
         return target
 
+    def write_profile(self, name, data):
+        """Write ``<root>/profiles/<name>/auth.json`` (another profile of the same machine)."""
+        directory = self.root / "profiles" / name
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / "auth.json"
+        target.write_text(data if isinstance(data, str) else json.dumps(data))
+        return target
+
     def cleanup(self):
         self._tmp.cleanup()
 
