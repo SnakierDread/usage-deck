@@ -9,6 +9,12 @@ cached, logged or serialized:
 * every string is scrubbed of exact private secret values (from the current
   context), credential-looking patterns (Bearer, JWT, ``sk-`` style prefixes)
   and URL userinfo/query/fragment;
+* the DTO wire schema is never altered by masking (DESIGN.md §2): the
+  contract's own field names and fixed-vocabulary values (enums, generated
+  ids, timestamps, fixed messages) are preserved verbatim, while raw private
+  mapping keys and all free text are still scrubbed. ``dto.check_wire`` /
+  ``dto.check_envelope`` then fail closed (``internal_error``) if a response
+  would still leave the schema;
 * non-JSON values (and NaN/Infinity) are rejected.
 """
 
@@ -16,7 +22,9 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Any, Iterable
+from typing import AbstractSet, Any, Iterable, Optional
+
+from .dto import WIRE_KEYS, preserves_wire_value
 
 REDACTED = "[REDACTED]"
 
@@ -82,13 +90,29 @@ def contains_secret(value: str, secrets: Iterable[str] = ()) -> bool:
     return scrub_string(value, secrets) != value
 
 
-def sanitize(value: Any, secrets: Iterable[str] = ()) -> Any:
-    """Return a deep, JSON-safe, redacted copy of ``value``."""
+def sanitize(value: Any, secrets: Iterable[str] = (), schema_keys: Optional[AbstractSet[str]] = None) -> Any:
+    """Return a deep, JSON-safe, redacted copy of ``value``.
+
+    Masking never changes the DTO wire shape (DESIGN.md §2):
+
+    * mapping keys listed in ``schema_keys`` (default: the contract's own
+      field names, ``dto.WIRE_KEYS``) are kept verbatim -- they are fixed
+      public identifiers, not private data. Any *other* key, including keys
+      that arrive in raw private mappings, is still scrubbed;
+    * a string value under a schema key that is contract vocabulary (enum
+      member, generated id, timestamp, fixed message; ``dto.WIRE_VALUE_RULES``)
+      is kept verbatim, so a short secret that happens to be a substring of
+      ``exact`` or ``2026-...`` cannot yield an invalid enum/format;
+    * every other string (labels, names, free text) is scrubbed of all
+      nonempty secrets, and values under sensitive field names are redacted.
+    """
     secret_set = frozenset(s for s in secrets if isinstance(s, str) and s)
-    return _walk(value, secret_set, 0)
+    keys = WIRE_KEYS if schema_keys is None else frozenset(schema_keys)
+    return _walk(value, secret_set, 0, keys, None, ())
 
 
-def _walk(value: Any, secrets: frozenset, depth: int) -> Any:
+def _walk(value: Any, secrets: frozenset, depth: int, schema_keys: frozenset,
+          key: Optional[str], siblings: Iterable[str]) -> Any:
     if depth > 32:
         raise RedactionError("structure too deep")
     if value is None or isinstance(value, bool):
@@ -100,19 +124,25 @@ def _walk(value: Any, secrets: frozenset, depth: int) -> Any:
             raise RedactionError("non-finite number")
         return value
     if isinstance(value, str):
+        if key is not None and key in schema_keys and preserves_wire_value(key, value, siblings):
+            return value
         return scrub_string(value, secrets)
     if isinstance(value, dict):
         out = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
+        names = tuple(value)
+        for name, item in value.items():
+            if not isinstance(name, str):
                 raise RedactionError("non-string key")
-            if is_sensitive_name(key):
-                out[key] = REDACTED
-            else:
-                out[scrub_string(key, secrets)] = _walk(item, secrets, depth + 1)
+            if is_sensitive_name(name):
+                out[name] = REDACTED
+                continue
+            out_name = name if name in schema_keys else scrub_string(name, secrets)
+            out[out_name] = _walk(item, secrets, depth + 1, schema_keys, name, names)
         return out
     if isinstance(value, (list, tuple)):
-        return [_walk(item, secrets, depth + 1) for item in value]
+        # list items inherit the parent key: ``capabilities`` entries are enum members and are
+        # judged by that key's rule; strings under any other key are free text and scrubbed.
+        return [_walk(item, secrets, depth + 1, schema_keys, key, ()) for item in value]
     raise RedactionError(f"non-JSON value of type {type(value).__name__}")
 
 
