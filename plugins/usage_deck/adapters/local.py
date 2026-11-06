@@ -41,6 +41,8 @@ class _Snapshot:
     reason: Optional[str]
     error_code: Optional[str]
     latency_ms: Optional[float]
+    credential_sent: bool = False  # the models/tags requests carried a bearer
+    unauthorized: bool = False  # a models/tags request answered 401
 
 
 _NOT_RUN = _Attempt(False, "")
@@ -118,6 +120,11 @@ class SelfHostedAdapter(BaseAdapter):
         if endpoint is None or not endpoint.safe:
             return _Snapshot(False, _NOT_RUN, _NOT_RUN, None, "unknown", "opaque",
                              "source_unavailable", None, None)
+        if ctx.credential_expected and not ctx.credential:
+            # key_env names an unset variable: nothing is sent (an anonymous probe would only
+            # produce a misleading 401); the honest state is "no credential".
+            return _Snapshot(True, _NOT_RUN, _NOT_RUN, None, "unknown", "opaque",
+                             "credentials_missing", None, None)
 
         metrics_attempt, metrics_values = self._attempt("/metrics", self._metrics_validator, ctx.health_credential)
         health_attempt = _Attempt(False, "")
@@ -130,28 +137,36 @@ class SelfHostedAdapter(BaseAdapter):
 
         all_attempts = [metrics_attempt] + tried
         m_ok, h_ok = metrics_attempt.ok, health_attempt.ok
-        error_code = None
+        credential_sent = bool(ctx.credential)
+        unauthorized = (not h_ok) and any(a.failure == "status" and a.status == 401 for a in tried)
+        # A 401 means "credential rejected" only if one was sent; anonymously it means none was.
+        anonymous_401 = unauthorized and not credential_sent
+        error_code = "auth_required" if unauthorized and credential_sent else None
         if m_ok and h_ok:
             status, confidence, reason = "healthy", "self_hosted", None
         elif h_ok:
             status, confidence, reason = "degraded", "opaque", "metrics_unavailable"
         elif m_ok:
-            status, confidence, reason = "degraded", "self_hosted", "source_unavailable"
+            status, confidence = "degraded", "self_hosted"
+            reason = "credentials_missing" if anonymous_401 else "source_unavailable"
         elif all(a.failure in ("connection", "timeout") for a in all_attempts):
             status, confidence, reason = "offline", "opaque", "source_unavailable"
             error_code = "timeout" if all(a.failure == "timeout" for a in all_attempts) else "upstream_unavailable"
+        elif anonymous_401:
+            status, confidence, reason = "unknown", "opaque", "credentials_missing"
         else:
             status, confidence, reason = "unknown", "opaque", "source_unavailable"
-            for attempt in tried + [metrics_attempt]:
-                if attempt.failure == "status" and attempt.status:
-                    failure = error_for_status(attempt.status, ctx.provider_id, ctx.account_id)
-                    error_code = failure.code if failure else None
-                    break
-            else:
-                error_code = "malformed_response"
+            if error_code is None:
+                for attempt in tried + [metrics_attempt]:
+                    if attempt.failure == "status" and attempt.status:
+                        failure = error_for_status(attempt.status, ctx.provider_id, ctx.account_id)
+                        error_code = failure.code if failure else None
+                        break
+                else:
+                    error_code = "malformed_response"
         latency = health_attempt.latency_ms if h_ok else (metrics_attempt.latency_ms if m_ok else None)
         snap = _Snapshot(True, metrics_attempt, health_attempt, metrics_values if m_ok else None,
-                         status, confidence, reason, error_code, latency)
+                         status, confidence, reason, error_code, latency, credential_sent, unauthorized)
         return snap
 
     # -- protocol --------------------------------------------------------
@@ -165,9 +180,14 @@ class SelfHostedAdapter(BaseAdapter):
         caps = self._capabilities(*(("metrics",) if snap.metrics.ok else ()))
         error = make_error(snap.error_code, self.ctx.provider_id, self.ctx.account_id) \
             if snap.status == "offline" else None
-        reason = None if snap.metrics.ok else ("source_unavailable" if snap.status == "offline"
-                                               else "metrics_unavailable")
+        reason = None if snap.metrics.ok else (
+            "source_unavailable" if snap.status == "offline"
+            else "credentials_missing" if snap.reason == "credentials_missing" else "metrics_unavailable")
         return self._probe_result(snap.metrics.ok, reachable, caps, reason=reason, error=error)
+
+    def credential_rejected(self) -> bool:
+        snap = self._check()
+        return bool(self.ctx.credential and snap.credential_sent and snap.unauthorized)
 
     def _do_usage(self, window: int) -> UsageResult:
         snap = self._check()
@@ -177,7 +197,8 @@ class SelfHostedAdapter(BaseAdapter):
             return UsageResult(confidence="opaque", reason="source_unavailable",
                                error=make_error(snap.error_code, self.ctx.provider_id, self.ctx.account_id))
         confidence = "self_hosted" if snap.metrics.ok else "opaque"
-        reason = "unsupported" if snap.metrics.ok else "metrics_unavailable"
+        reason = "unsupported" if snap.metrics.ok else (
+            "credentials_missing" if snap.reason == "credentials_missing" else "metrics_unavailable")
         return UsageResult(meters=(), series=(), confidence=confidence, reason=reason)
 
     def get_health(self) -> Optional[HealthStripEntry]:

@@ -36,6 +36,7 @@ _PLAN_CLAIM_KEYS = ("plan", "plan_type", "subscription_plan", "chatgpt_plan_type
 _PLAN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.+-]{0,31}$")
 _LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.:/@+-]{0,63}$")
 _CRED_FIELDS = ("access_token", "agent_key", "api_key")
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 MAX_AUTH_BYTES = 4 * 1024 * 1024
 
 
@@ -67,6 +68,9 @@ class InventoryItem:
     plan_source: str
     secrets: FrozenSet[str]
     health_credential: Optional[SecretValue] = None
+    # The entry points at an env var (``key_env``) that holds no value: a credential is
+    # expected but absent, so nothing may be probed anonymously on its behalf.
+    credential_expected: bool = False
 
     def __repr__(self) -> str:
         return f"InventoryItem({self.provider_id!r}, {self.account_id!r})"
@@ -271,6 +275,16 @@ class _Draft:
     secrets: FrozenSet[str]
     health_credential: Optional[str] = None
     from_pool: bool = False
+    key_env: Optional[str] = None
+
+
+def _key_env_of(entry: Dict[str, Any]) -> Optional[str]:
+    """Name of the env var a ``custom_providers`` entry points at (never its value)."""
+    for name in ("key_env", "api_key_env"):
+        value = entry.get(name)
+        if isinstance(value, str) and _ENV_NAME_RE.match(value.strip()):
+            return value.strip()
+    return None
 
 
 def _endpoint_from_entry(entry: Dict[str, Any]) -> Optional[Endpoint]:
@@ -322,9 +336,12 @@ def discover(source: Any) -> List[InventoryItem]:
             continue
         provider_id = name.strip() if name.strip().lower().startswith("custom:") else f"custom:{name.strip()}"
         secrets = collect_secret_values(entry)
+        key_env = _key_env_of(entry)
         existing = drafts_matching(provider_id)
         covered = False
         for draft in existing:
+            if key_env and draft.credential is None and draft.key_env is None:
+                draft.key_env = key_env
             if draft.endpoint is None:
                 draft.endpoint = endpoint
                 covered = True
@@ -335,7 +352,7 @@ def discover(source: Any) -> List[InventoryItem]:
         api_key = entry.get("api_key")
         credential = api_key.strip() if isinstance(api_key, str) and api_key.strip() else None
         drafts.append(_Draft(existing[0].provider_id if existing else provider_id, endpoint, None, 1,
-                             credential, secrets))
+                             credential, secrets, key_env=key_env))
 
     # Primary configured provider, even without credentials.
     primary = raw.primary
@@ -361,6 +378,9 @@ def discover(source: Any) -> List[InventoryItem]:
         secrets = set(draft.secrets)
         if credential is None and provider_id.lower() == "openrouter":
             credential = source.env_secret("OPENROUTER_API_KEY")
+        # Precedence: an inline credential (api_key/token) beats the key_env pointer.
+        if credential is None and draft.key_env:
+            credential = source.env_secret(draft.key_env)
         if credential:
             secrets.add(credential)
         kind = "self_hosted" if is_self_hosted_provider(provider_id) else "cloud"
@@ -387,6 +407,7 @@ def discover(source: Any) -> List[InventoryItem]:
             plan_name=plan,
             plan_source="unverified_claim" if plan else "none",
             secrets=frozen,
+            credential_expected=bool(draft.key_env) and credential is None,
         ))
     items.sort(key=lambda i: (i.provider_id, i.account_id))
     return items

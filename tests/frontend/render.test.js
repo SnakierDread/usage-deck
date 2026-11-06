@@ -501,3 +501,18 @@ test("manual Refresh re-requests all three zones and explains the cache", async 
   assert.deepEqual(added.sort(), [B + "/health", B + "/subscriptions", B + "/usage?window=30"].sort());
   await m.unmount();
 });
+
+test("card shows missing vs rejected credential state with a tooltip", async () => {
+  const missing = F.card({ id: "acct_m", account_id: "acct_m", auth_status: "missing" });
+  const rejected = F.card({ id: "acct_r", account_id: "acct_r", auth_status: "rejected" });
+  const m = await mount({ routes: routesFor({ subs: () => envelope({ cards: [missing, rejected], inventory_state: "detected" }) }) });
+  const mSpan = m.$("[data-card-id=acct_m] [data-auth-status]");
+  const rSpan = m.$("[data-card-id=acct_r] [data-auth-status]");
+  assert.equal(mSpan.dataset.authStatus, "missing");
+  assert.equal(mSpan.textContent, "No credential found");
+  assert.match(mSpan.getAttribute("title"), /none was sent/);
+  assert.equal(rSpan.dataset.authStatus, "rejected");
+  assert.equal(rSpan.textContent, "Credential rejected");
+  assert.match(rSpan.getAttribute("title"), /answered 401/);
+  await m.unmount();
+});

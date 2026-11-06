@@ -39,7 +39,7 @@ ENUMS = {
                "no_observations", "metrics_unavailable", "source_unavailable", None},
     "kind": {"cloud", "self_hosted"},
     "plan_source": {"unverified_claim", "provider", "none"},
-    "auth_status": {"available", "missing"},
+    "auth_status": {"available", "missing", "rejected"},
     "unit": {"usd", "count", "percent", "bytes"},
     "scope": {"api_credential", "provider_account", "endpoint", "profile", "provider", "account"},
     "source": {"openrouter_key", "session_analytics", "prometheus", "none"},

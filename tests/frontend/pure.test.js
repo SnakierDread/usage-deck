@@ -105,3 +105,17 @@ test("cardView: ready without a measured value is never a zero", () => {
   assert.equal(mod.cardView(F.card({ state: "weird" })), "error");
   assert.equal(mod.cardView(F.card({ state: "opaque", meters: [F.meter({ confidence: "opaque", source: "none" })] })), "unavailable");
 });
+
+test("authInfo keeps missing (never sent) and rejected (sent, 401) apart, each with a tooltip", () => {
+  const avail = mod.authInfo("available");
+  const miss = mod.authInfo("missing");
+  const rej = mod.authInfo("rejected");
+  assert.equal(avail.text, "Credential present (not validated)");
+  assert.equal(miss.text, "No credential found");
+  assert.equal(rej.text, "Credential rejected");
+  assert.match(miss.tip, /none was sent/);
+  assert.match(rej.tip, /was sent and the provider answered 401/);
+  assert.equal(new Set([avail.tip, miss.tip, rej.tip]).size, 3);
+  // unknown or hostile values fall back to the conservative "missing" label, never "rejected"
+  for (const bad of [undefined, null, "bogus", "constructor", "__proto__"]) assert.equal(mod.authInfo(bad).key, "missing");
+});
