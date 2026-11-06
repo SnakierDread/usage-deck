@@ -144,7 +144,15 @@ unknown-provider / malformed-store / empty-home cases and config/auth immutabili
 git status --short --untracked-files=no            # must be clean: the harness installs the committed HEAD
 python tests/acceptance/host_acceptance.py          # exit 0 only if every check passes; --keep keeps logs + report.json
 python tests/acceptance/host_acceptance.py --self-check   # offline: fixture + validators only
+python -m unittest discover -s tests/acceptance           # offline: interpreter-selection tests (stub launcher)
 ```
+
+Helper subprocesses that import Hermes modules (session seeding, the `hermes_constants` isolation probe) run on one
+`HERMES_PYTHON`, resolved once: `--hermes-python PATH`, then `$HERMES_PYTHON`, then auto-detected by asking the `hermes`
+launcher what it runs on (its activated venv interpreter), and only then `python3` on `PATH`. A bare `python3` lacks
+Hermes's dependency closure (`ModuleNotFoundError: ruamel`); the harness refuses to start if the chosen interpreter
+cannot import `hermes_constants`/`hermes_state`. Any other runner that imports Hermes (e.g. the core-seam test behind
+`USAGE_DECK_CORE_CHECKOUT`) should reuse `tests/acceptance/hermes_python.py` rather than `sys.executable`.
 
 Needs the `hermes` CLI, `git` and `openssl` on `PATH` and a managed temp directory (`$HERMES_KANBAN_WORKSPACE`,
 `$TMPDIR` or `--workdir`). Everything runs in a clean child environment whose `HOME` and `HERMES_HOME` live inside that
