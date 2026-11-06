@@ -2,9 +2,9 @@
  * UsageDeck — Hermes dashboard plugin (frontend).
  *
  * One screen, three independent zones:
- *   1. Subscriptions grid   GET /api/plugins/usage-deck/subscriptions
- *   2. Usage analytics      GET /api/plugins/usage-deck/usage?window=7|30|90[&provider=<id>]
- *   3. Self-hosted health   GET /api/plugins/usage-deck/health
+ *   1. Subscriptions grid   GET /api/plugins/usage-deck/subscriptions?view=machine|profile
+ *   2. Usage analytics      GET /api/plugins/usage-deck/usage?window=7|30|90[&provider=<id>]&view=...
+ *   3. Self-hosted health   GET /api/plugins/usage-deck/health?view=machine|profile
  *
  * Plain IIFE, no build step, no runtime dependencies (DESIGN.md §6): React, hooks and
  * fetchJSON come from window.__HERMES_PLUGIN_SDK__; charts are native SVG; every colour
@@ -29,6 +29,9 @@
   const API_BASE = "/api/plugins/usage-deck";
   const WINDOWS = [7, 30, 90];
   const DEFAULT_WINDOW = 30;
+  // Subscriptions/health scope (DESIGN.md §10): the whole machine (default) or the selected profile.
+  const VIEWS = ["machine", "profile"];
+  const DEFAULT_VIEW = "machine";
   const POLL_MS = 60000;
 
   const CONF_LABEL = {
@@ -43,13 +46,20 @@
     openrouter_key: "exact",
     session_analytics: "estimated",
     prometheus: "self_hosted",
+    anthropic_headers: "exact",
     none: "opaque",
   };
   const SOURCE_LABEL = {
     openrouter_key: "OpenRouter key endpoint",
     session_analytics: "Hermes session analytics",
     prometheus: "Endpoint metrics",
+    anthropic_headers: "Anthropic unified rate-limit headers captured from the last call",
     none: "No verified source",
+  };
+  // Provider-specific, recon-cited reasons an opaque card shows no meter (DESIGN.md §9). Fixed local copy.
+  const OPAQUE_NOTES = {
+    "openai-codex": "No Codex usage meter: recon t_7dce2222 found a ChatGPT-backend usage endpoint (chatgpt.com/wham/usage) by reading Hermes source only; no live response was verified, and sending Codex OAuth there is not permitted by DESIGN.md §1.3. Any plan shown is an unverified claim from the credential.",
+    anthropic: "No Anthropic session/weekly meter: no unified rate-limit headers are captured for this credential. Hermes does not record them today (recon t_7dce2222), so meters appear only after a call's headers have been captured. Nothing is estimated.",
   };
   const SCOPE_LABEL = {
     api_credential: "API credential",
@@ -320,7 +330,10 @@
       return c;
     });
     if (cards.length !== d.cards.length) throw malformed("card entries");
-    return { cards: cards, inventory_state: d.inventory_state === "empty" ? "empty" : "detected", meta: env.meta };
+    return {
+      cards: cards, inventory_state: d.inventory_state === "empty" ? "empty" : "detected",
+      view: d.view === "profile" ? "profile" : "machine", meta: env.meta,
+    };
   }
 
   function validateUsage(env, windowDays) {
@@ -339,6 +352,22 @@
   function validateHealth(env) {
     if (!Array.isArray(env.data.entries)) throw malformed("entries");
     return { entries: env.data.entries.filter(isObj), meta: env.meta };
+  }
+
+  /** Holder profile names of a machine-view card, in server order; never throws on odd data. */
+  function holderNames(card) {
+    const list = card && Array.isArray(card.holders) ? card.holders : [];
+    return list.filter(isObj).map(function (h) {
+      const name = str(h.profile);
+      return name ? (h.is_global === true ? name + " (root)" : name) : null;
+    }).filter(Boolean);
+  }
+
+  /** Recon-cited explanation for an opaque card of a provider that could expose usage, or null. */
+  function opaqueNote(card) {
+    if (!isObj(card) || card.kind === "self_hosted") return null;
+    if (cardView(card) !== "unavailable") return null;
+    return has(OPAQUE_NOTES, card.provider_id) ? OPAQUE_NOTES[card.provider_id] : null;
   }
 
   function sanitizeDomId(s) {
@@ -516,18 +545,30 @@
       const value = num(m.value);
       const limit = num(m.limit);
       const remaining = num(m.remaining);
+      const fromHeaders = m.source === "anthropic_headers";
+      const resetsAt = str(m.resets_at);
       const tip = "Source: " + (SOURCE_LABEL[m.source] || SOURCE_LABEL.none) +
         ". Scope: " + (SCOPE_LABEL[m.scope] || "unknown") +
-        ". Observed: " + fmtTime(m.observed_at) + ".";
+        ". Observed: " + fmtTime(m.observed_at) + "." +
+        (resetsAt ? " Reset reported by the provider: " + fmtTime(resetsAt) + "." : "") +
+        (fromHeaders ? " Value as of that call, not live; it is never extrapolated." : "");
       const parts = [];
       parts.push(h("div", { key: "head", className: "ud-meter-head" },
         h("span", { className: "ud-meter-label" }, str(m.label) || "Meter"),
         h(Badge, { conf: conf, tip: tip })));
-      parts.push(h("dl", { key: "vals", className: "ud-vals" },
-        h("div", null, h("dt", null, "Used"), h("dd", null, value === null ? "Not reported" : fmtNumber(value, unit))),
-        h("div", null, h("dt", null, "Limit"), h("dd", null, limit === null ? "Not reported" : fmtNumber(limit, unit))),
-        h("div", null, h("dt", null, remaining !== null && remaining < 0 ? "Overspent" : "Remaining"),
-          h("dd", null, remaining === null ? "Not reported" : fmtNumber(remaining < 0 ? -remaining : remaining, unit)))));
+      if (fromHeaders) {
+        // Utilization of a rolling window: used share + provider-reported reset; no invented remaining.
+        parts.push(h("dl", { key: "vals", className: "ud-vals" },
+          h("div", null, h("dt", null, "Used"), h("dd", null, value === null ? "Not reported" : fmtNumber(value, unit))),
+          h("div", null, h("dt", null, "Resets"), h("dd", { "data-resets-at": resetsAt || undefined }, resetsAt ? fmtTime(resetsAt) : "Not reported")),
+          h("div", null, h("dt", null, "As of"), h("dd", null, fmtTime(m.observed_at)))));
+      } else {
+        parts.push(h("dl", { key: "vals", className: "ud-vals" },
+          h("div", null, h("dt", null, "Used"), h("dd", null, value === null ? "Not reported" : fmtNumber(value, unit))),
+          h("div", null, h("dt", null, "Limit"), h("dd", null, limit === null ? "Not reported" : fmtNumber(limit, unit))),
+          h("div", null, h("dt", null, remaining !== null && remaining < 0 ? "Overspent" : "Remaining"),
+            h("dd", null, remaining === null ? "Not reported" : fmtNumber(remaining < 0 ? -remaining : remaining, unit)))));
+      }
       if (ratio !== null) {
         const pct = Math.round(ratio * 1000) / 10;
         parts.push(h("div", {
@@ -600,6 +641,8 @@
         ? "Plan: " + plan + (card.plan_source === "unverified_claim" ? " (unverified claim)" : "")
         : "Plan unknown";
       const reasonText = has(REASON_TEXT, card.reason) ? REASON_TEXT[card.reason] : null;
+      const note = opaqueNote(card);
+      const holders = holderNames(card);
 
       function closeDrawer() {
         props.onOpenChange(false);
@@ -630,7 +673,8 @@
           h("p", { className: "ud-muted ud-small" },
             card.kind === "self_hosted"
               ? "Endpoint health appears in the health strip below."
-              : "Session analytics only — profile-wide usage appears in the chart below, not as this account's allowance."));
+              : "Session analytics only — profile-wide usage appears in the chart below, not as this account's allowance."),
+          note ? h("p", { className: "ud-muted ud-small", "data-opaque-note": str(card.provider_id) }, note) : null);
       }
 
       return h("article", {
@@ -640,11 +684,16 @@
       },
         h("header", { className: "ud-card-head" },
           h("div", null,
-            h("h3", { className: "ud-card-title" }, str(card.provider_label) || str(card.provider_id) || "Provider"),
+            h("h3", { className: "ud-card-title" },
+              str(card.provider_label) || str(card.provider_id) || "Provider",
+              plan ? h("span", { className: "ud-card-plan", title: "Plan claim read from the credential; not verified." }, " [" + plan + "]") : null,
+              holders.length ? h("span", { className: "ud-card-holders", "data-holders": holders.join(","),
+                title: "Held by these Hermes homes (read from their auth.json; presence only, not validated)." },
+                " — " + holders.join(", ")) : null),
             h("div", { className: "ud-muted ud-small" }, str(card.account_label) || "Account")),
           h("div", { className: "ud-card-badges" },
             card.kind === "self_hosted" ? h("span", { className: "ud-kind" }, "Self-hosted endpoint") : null,
-            h(Badge, { conf: conf, tip: "Primary source for this card. Checked: " + fmtTime(card.checked_at) + "." }))),
+            h(Badge, { conf: conf, tip: "Primary source for this card. Checked: " + fmtTime(card.checked_at) + "." + (note && conf === "opaque" ? " " + note : "") }))),
         h("div", { className: "ud-card-meta ud-small" },
           h("span", null, planText), " · ",
           h("span", null, card.auth_status === "available" ? "Credential present (not validated)" : "No credential found"),
@@ -666,6 +715,7 @@
     function SubscriptionsZone(props) {
       const st = props.res.state;
       const reload = props.res.reload;
+      const machine = props.view === "machine";
       const [openId, setOpenId] = useState(null);
       // A dialog never outlives the filter change that may hide its card.
       useEffect(function () { setOpenId(null); }, [props.provider]);
@@ -682,8 +732,10 @@
         if (data.cards.length === 0) {
           content = h("div", null, err,
             h("div", { className: "ud-first-run", "data-state": "first_run" },
-              h("p", { className: "ud-first-run-title" }, "No providers detected in this profile"),
-              h("p", { className: "ud-small" }, "UsageDeck reads this profile's existing Hermes configuration and credential pool; it never asks for keys. Add or configure a provider in the dashboard's Keys or Config pages and it will appear here."),
+              h("p", { className: "ud-first-run-title" }, machine ? "No providers detected on this machine" : "No providers detected in this profile"),
+              h("p", { className: "ud-small" }, (machine
+                ? "UsageDeck reads the existing credential pools of the global Hermes home and every profile; it never asks for keys."
+                : "UsageDeck reads this profile's existing Hermes configuration and credential pool; it never asks for keys.") + " Add or configure a provider in the dashboard's Keys or Config pages and it will appear here."),
               h("button", { type: "button", className: "ud-btn", onClick: reload }, "Refresh")));
         } else {
           // The page-level provider filter narrows this list too (not only the usage chart).
@@ -709,7 +761,20 @@
       return h("section", { className: "ud-zone", "aria-labelledby": "ud-h-subs", "data-zone": "subscriptions" },
         h("div", { className: "ud-zone-head" },
           h("h2", { id: "ud-h-subs" }, "Subscriptions"),
-          st.data && (st.status === "error" || st.refreshing) ? h(StaleTag, { stale: true }) : null),
+          st.data && (st.status === "error" || st.refreshing) ? h(StaleTag, { stale: true }) : null,
+          h("div", { className: "ud-controls" },
+            h("div", { role: "group", "aria-label": "Subscription scope", className: "ud-seg", "data-view-toggle": props.view },
+              VIEWS.map(function (v) {
+                return h("button", {
+                  key: v, type: "button", className: cx("ud-btn", "ud-seg-btn", props.view === v && "ud-seg-on"),
+                  "aria-pressed": props.view === v ? "true" : "false", "data-view": v,
+                  onClick: function () { props.onView(v); },
+                }, v === "machine" ? "Whole machine" : "This profile");
+              })))),
+        h("p", { className: "ud-muted ud-small", "data-view-note": props.view },
+          machine
+            ? "Machine view: the global Hermes home plus every profile's credential pool, merged when they are the same account (JWT account identity). Each card lists the profiles that hold it."
+            : "Profile view: the dashboard's selected profile, with global fallback per provider. Cards are not merged across profiles."),
         content);
     }
 
@@ -892,6 +957,7 @@
 
     function HealthZone(props) {
       const st = props.res.state;
+      const machine = props.view === "machine";
       const reload = props.res.reload;
       let content;
       if (st.status === "loading" && !st.data) {
@@ -904,7 +970,7 @@
         const err = st.status === "error" ? h(ErrorCard, { key: "err", what: "endpoint health", error: st.error, onRetry: reload }) : null;
         content = h("div", { "aria-busy": st.refreshing ? "true" : undefined }, err,
           entries.length === 0
-            ? h("p", { className: "ud-empty-text" }, "No self-hosted endpoints detected in this profile.")
+            ? h("p", { className: "ud-empty-text" }, machine ? "No self-hosted endpoints detected on this machine." : "No self-hosted endpoints detected in this profile.")
             : h("ul", { className: "ud-health" }, entries.map(function (e, i) {
               return h(HealthRow, { key: str(e.endpoint_id) || i, entry: e, zoneStale: stale });
             })));
@@ -922,12 +988,13 @@
       const profileKey = currentProfileKey();
       const [windowDays, setWindowDays] = useState(DEFAULT_WINDOW);
       const [provider, setProvider] = useState("");
+      const [view, setView] = useState(DEFAULT_VIEW);
 
-      const subs = useResource("subs|" + profileKey, function (signal) {
-        return getJSON("/subscriptions", signal).then(validateSubscriptions);
+      const subs = useResource("subs|" + profileKey + "|" + view, function (signal) {
+        return getJSON("/subscriptions?view=" + view, signal).then(validateSubscriptions);
       });
-      const health = useResource("health|" + profileKey, function (signal) {
-        return getJSON("/health", signal).then(validateHealth);
+      const health = useResource("health|" + profileKey + "|" + view, function (signal) {
+        return getJSON("/health?view=" + view, signal).then(validateHealth);
       });
 
       const providers = useMemo(function () {
@@ -948,8 +1015,8 @@
       }, [providerValid, subs.state.status]);
       const effProvider = providerValid || subs.state.status !== "ready" ? provider : "";
 
-      const usage = useResource("usage|" + profileKey + "|" + windowDays + "|" + effProvider, function (signal) {
-        const q = "?window=" + windowDays + (effProvider ? "&provider=" + encodeURIComponent(effProvider) : "");
+      const usage = useResource("usage|" + profileKey + "|" + windowDays + "|" + effProvider + "|" + view, function (signal) {
+        const q = "?window=" + windowDays + (effProvider ? "&provider=" + encodeURIComponent(effProvider) : "") + "&view=" + view;
         return getJSON("/usage" + q, signal).then(function (env) { return validateUsage(env, windowDays); });
       });
 
@@ -964,16 +1031,16 @@
         h("header", { className: "ud-header" },
           h("div", null,
             h("h1", { className: "ud-title" }, "UsageDeck"),
-            h("p", { className: "ud-muted ud-small" }, "Detected subscriptions, session usage and self-hosted health for this profile. Read-only; no credentials are requested.")),
+            h("p", { className: "ud-muted ud-small" }, "Detected subscriptions across this machine's Hermes profiles, session usage for the selected profile, and self-hosted health. Read-only; no credentials are requested.")),
           h("div", { className: "ud-header-actions" },
             lastChecked ? h("span", { className: "ud-muted ud-small" }, "Updated " + fmtTime(new Date(lastChecked).toISOString().replace(/\.\d+Z$/, "Z"))) : null,
             h("button", {
               type: "button", className: "ud-btn", onClick: refreshAll, disabled: busy || undefined,
               title: "Re-requests all three zones. The server may answer from its 30-second cache, so values can be up to 30 seconds old.",
             }, busy ? "Refreshing…" : "Refresh"))),
-        h(SubscriptionsZone, { res: subs, provider: effProvider }),
+        h(SubscriptionsZone, { res: subs, provider: effProvider, view: view, onView: setView }),
         h(UsageZone, { res: usage, window: windowDays, onWindow: setWindowDays, provider: effProvider, onProvider: setProvider, providers: providers }),
-        h(HealthZone, { res: health }),
+        h(HealthZone, { res: health, view: view }),
         h("div", { className: "ud-sr", role: "status", "aria-live": "polite" },
           busy ? "Refreshing UsageDeck data" : "UsageDeck data up to date"));
     }
@@ -999,6 +1066,8 @@
     classifyError: classifyError,
     unwrapEnvelope: unwrapEnvelope,
     niceMax: niceMax,
+    holderNames: holderNames,
+    opaqueNote: opaqueNote,
   };
 
   if (typeof module !== "undefined" && module.exports) {

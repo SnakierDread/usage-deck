@@ -1,15 +1,20 @@
 """Cloud provider adapters (DESIGN.md §1.3).
 
-Nous, OpenAI Codex and Anthropic have no verified quota capability in the MVP:
-they are opaque by policy, never probed over the network, and never send OAuth
-credentials anywhere. OpenRouter reads exactly one documented endpoint.
+Nous and OpenAI Codex have no verified quota capability: they are opaque by policy,
+never probed over the network, and never send OAuth credentials anywhere (Codex: recon
+t_7dce2222 located a ChatGPT-backend usage endpoint by reading Hermes source only; no live
+response was verified, so it is not called -- DESIGN.md §9). Anthropic reads
+*previously captured* unified rate-limit headers from a local file (never a request).
+OpenRouter reads exactly one documented endpoint.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from datetime import timedelta
+from typing import List, Optional
 
-from ..models.dto import UNKNOWN_PERIOD, ProbeResult, UsageMeter, UsageResult, make_error
+from ..captures import UNIFIED_PREFIX, Capture, parse_reset_epoch, parse_utilization
+from ..models.dto import UNKNOWN_PERIOD, Period, ProbeResult, UsageMeter, UsageResult, fmt_ts, make_error
 from .base import (
     BaseAdapter,
     error_for_status,
@@ -45,8 +50,80 @@ class OpenAICodexAdapter(OpaqueCloudAdapter):
     adapter_name = "OpenAICodexAdapter"
 
 
+#: (header window tag, meter id, label, period label) for the two subscription windows.
+ANTHROPIC_WINDOWS = (
+    ("5h", "session_5h", "Session (5-hour window)", "rolling_5h"),
+    ("7d", "weekly_7d", "Weekly (7-day window)", "rolling_7d"),
+)
+
+
+def anthropic_meters(capture: Capture, now) -> List[UsageMeter]:
+    """Meters from one captured response. Never extrapolates.
+
+    ``value`` is the reported utilization as a percentage of the window (may exceed 100),
+    ``resets_at`` the reported reset instant, ``observed_at`` the time of the call that returned
+    the headers. A window whose reported reset is already in the past no longer describes the
+    current window, so it yields no meter (its utilization since the reset is unknown).
+    """
+    meters: List[UsageMeter] = []
+    for tag, meter_id, label, period_label in ANTHROPIC_WINDOWS:
+        utilization = parse_utilization(capture.headers.get(f"{UNIFIED_PREFIX}{tag}-utilization"))
+        if utilization is None:
+            continue
+        reset = parse_reset_epoch(capture.headers.get(f"{UNIFIED_PREFIX}{tag}-reset"))
+        if reset is not None and reset <= now:
+            continue
+        meters.append(UsageMeter(
+            id=meter_id,
+            label=label,
+            value=round(utilization * 100.0, 4),
+            limit=100.0,
+            remaining=None,
+            unit="percent",
+            scope="provider_account",
+            period=Period(None, None, period_label),
+            confidence="exact",
+            source="anthropic_headers",
+            observed_at=fmt_ts(capture.observed_at),
+            resets_at=fmt_ts(reset),
+        ))
+    return meters
+
+
 class AnthropicAdapter(OpaqueCloudAdapter):
+    """Session / weekly utilization from captured ``anthropic-ratelimit-unified-*`` headers.
+
+    No request is made. Without a capture for this credential the card is opaque, exactly as
+    before. Freshness is the capture's own call timestamp.
+    """
+
     adapter_name = "AnthropicAdapter"
+
+    @property
+    def source_label(self) -> str:  # type: ignore[override]
+        return "anthropic_headers" if self._capture() is not None else "local_inventory"
+
+    def _capture(self) -> Optional[Capture]:
+        store = self.ctx.captures
+        if store is None or not self.ctx.row_ids:
+            return None
+        return store.latest("anthropic", self.ctx.row_ids)
+
+    def _do_probe(self) -> ProbeResult:
+        capture = self._capture()
+        if capture is None:
+            return self._probe_result(False, None, self._capabilities(), reason="unsupported")
+        return self._probe_result(True, None, self._capabilities("quota"))
+
+    def _do_usage(self, window: int) -> UsageResult:
+        capture = self._capture()
+        if capture is None:
+            return UsageResult(meters=(), series=(), confidence="opaque", reason="unsupported")
+        meters = anthropic_meters(capture, self.ctx.now())
+        if not meters:
+            # Capture exists but carries no current-window utilization (expired window / no unified headers).
+            return UsageResult(meters=(), series=(), confidence="opaque", reason="source_unavailable")
+        return UsageResult(meters=tuple(meters), series=(), confidence="exact")
 
 
 class OpenRouterAdapter(BaseAdapter):

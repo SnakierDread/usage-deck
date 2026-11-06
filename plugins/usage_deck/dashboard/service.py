@@ -25,7 +25,8 @@ from .adapters.base import AdapterContext, AnalyticsReader, EndpointCache
 from .adapters.cloud import OPENROUTER_TARGET
 from .adapters.fallback import SessionAnalyticsAdapter
 from .adapters.transport import AllowedTarget, GuardedTransport, UrllibTransport
-from .discovery import InventoryItem, InventoryUnavailable, discover, host_inventory_source
+from .captures import CaptureStore
+from .discovery import InventoryItem, InventoryUnavailable, discover, discover_machine, host_inventory_source
 from .models.dto import (
     DebugInfo,
     DeckError,
@@ -49,10 +50,12 @@ CACHE_TTL_S = 30.0
 MAX_WORKERS = 4
 REFRESH_DEADLINE_S = 8.0
 DEFAULT_WINDOW = 30
+DEFAULT_VIEW = "machine"
+VIEWS = ("machine", "profile")
 _ALLOWED_PARAMS = {
-    "subscriptions": {"profile"},
-    "health": {"profile"},
-    "usage": {"profile", "window", "provider"},
+    "subscriptions": {"profile", "view"},
+    "health": {"profile", "view"},
+    "usage": {"profile", "window", "provider", "view"},
 }
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
@@ -72,6 +75,7 @@ class Query:
     window: int = DEFAULT_WINDOW
     provider: Optional[str] = None
     profile: Optional[str] = None
+    view: str = DEFAULT_VIEW
 
 
 def parse_query(endpoint: str, items: List[Tuple[str, str]]) -> Query:
@@ -98,7 +102,12 @@ def parse_query(endpoint: str, items: List[Tuple[str, str]]) -> Query:
         if value.lower() != "current" and not _PROFILE_RE.match(value):
             raise ApiError(400, "invalid_query")
         profile = value
-    return Query(window, provider, profile)
+    view = DEFAULT_VIEW
+    if "view" in seen:
+        if seen["view"] not in VIEWS:
+            raise ApiError(400, "invalid_query")
+        view = seen["view"]
+    return Query(window, provider, profile, view)
 
 
 # ---------------------------------------------------------------- snapshot
@@ -109,10 +118,24 @@ class _Snapshot:
     cards: List[dict]
     health: List[dict]
     created: float
+    view: str = "profile"
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def _default_captures(source: Any) -> CaptureStore:
+    """Read-only header captures next to the Hermes root; absent file = no captures."""
+    path_of = getattr(source, "captures_path", None)
+    return CaptureStore(path_of() if callable(path_of) else None)
+
+
+def _effective_view(source: Any, query: "Query") -> str:
+    """The machine view needs a source that can enumerate every home; otherwise fall back honestly."""
+    if query.view == "machine" and callable(getattr(source, "read_stores", None)):
+        return "machine"
+    return "profile"
 
 
 class UsageDeckService:
@@ -123,6 +146,7 @@ class UsageDeckService:
         transport: Any = None,
         clock: Optional[Callable[[], datetime]] = None,
         monotonic: Callable[[], float] = time.monotonic,
+        capture_factory: Optional[Callable[[Any], CaptureStore]] = None,
         cache_ttl: float = CACHE_TTL_S,
         max_workers: int = MAX_WORKERS,
         deadline: float = REFRESH_DEADLINE_S,
@@ -130,6 +154,7 @@ class UsageDeckService:
         self._inventory_factory = inventory_factory or host_inventory_source
         self._analytics_factory = analytics_factory or HostAnalyticsReader
         self._transport = transport or UrllibTransport()
+        self._capture_factory = capture_factory or _default_captures
         self._clock = clock or _utc_now
         self._monotonic = monotonic
         self._ttl = cache_ttl
@@ -200,7 +225,7 @@ class UsageDeckService:
         snap = self._deck(query)
         cards = snap.cards
         errors = [c["error"] for c in cards if c["error"]]
-        data = {"cards": cards, "inventory_state": "detected" if cards else "empty"}
+        data = {"cards": cards, "inventory_state": "detected" if cards else "empty", "view": snap.view}
         return self._ok(data, errors)
 
     def _health(self, query: Query) -> Tuple[int, dict]:
@@ -211,7 +236,7 @@ class UsageDeckService:
     def _usage(self, query: Query) -> Tuple[int, dict]:
         if query.provider is not None:
             source = self._inventory_factory()
-            items = discover(source)
+            items = discover_machine(source) if _effective_view(source, query) == "machine" else discover(source)
             if not any(item.provider_id == query.provider for item in items):
                 raise ApiError(404, "provider_not_found")
             # Session analytics has no provider/account attribution: never clone profile totals.
@@ -243,11 +268,13 @@ class UsageDeckService:
     # -- deck snapshot (cards + health) ----------------------------------
     def _deck(self, query: Query) -> _Snapshot:
         source = self._inventory_factory()
-        key = (source.home_key(), query.profile or "", "deck")
-        return self._cached(key, lambda: self._build_deck(source, query))
+        view = _effective_view(source, query)
+        key = (source.home_key(), query.profile or "", "deck", view)
+        return self._cached(key, lambda: self._build_deck(source, query, view))
 
-    def _build_deck(self, source: Any, query: Query) -> _Snapshot:
-        items = discover(source)
+    def _build_deck(self, source: Any, query: Query, view: str = "profile") -> _Snapshot:
+        items = discover_machine(source) if view == "machine" else discover(source)
+        captures = self._capture_factory(source)
         now = self._clock()
         reader = MemoAnalyticsReader(self._analytics_factory(query.profile))
         endpoints = EndpointCache()
@@ -262,7 +289,7 @@ class UsageDeckService:
             for item in items:
                 owns_health = bool(item.endpoint_id) and health_owner.get(item.endpoint_id) == item.account_id
                 ctx = contextvars.copy_context()  # a Context may only be entered once at a time
-                futures[executor.submit(ctx.run, self._run_item, item, reader, now, owns_health, endpoints)] = item
+                futures[executor.submit(ctx.run, self._run_item, item, reader, now, owns_health, endpoints, captures)] = item
             done, _pending = wait(list(futures), timeout=self._deadline)
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
@@ -290,10 +317,11 @@ class UsageDeckService:
                 health.append(health_dict)
         cards.sort(key=lambda c: (c["provider_id"], c["account_id"]))
         health.sort(key=lambda h: (h["provider_id"], h["endpoint_id"]))
-        return _Snapshot(cards, health, self._monotonic())
+        return _Snapshot(cards, health, self._monotonic(), view)
 
     def _context(self, item: InventoryItem, reader: AnalyticsReader, now: datetime,
-                 endpoints: Optional[EndpointCache] = None) -> AdapterContext:
+                 endpoints: Optional[EndpointCache] = None,
+                 captures: Optional[CaptureStore] = None) -> AdapterContext:
         targets: List[AllowedTarget] = []
         if item.provider_id.lower() == "openrouter":
             targets.append(OPENROUTER_TARGET)
@@ -317,11 +345,14 @@ class UsageDeckService:
             secrets=item.secrets,
             health_credential=item.health_credential,
             endpoint_cache=endpoints,
+            row_ids=item.row_ids,
+            captures=captures,
         )
 
     def _run_item(self, item: InventoryItem, reader: AnalyticsReader, now: datetime,
-                  owns_health: bool, endpoints: Optional[EndpointCache] = None) -> Tuple[dict, Optional[dict]]:
-        adapter = create_adapter(self._context(item, reader, now, endpoints))
+                  owns_health: bool, endpoints: Optional[EndpointCache] = None,
+                  captures: Optional[CaptureStore] = None) -> Tuple[dict, Optional[dict]]:
+        adapter = create_adapter(self._context(item, reader, now, endpoints, captures))
         probe = adapter.probe()
         usage = adapter.get_usage(DEFAULT_WINDOW)
         health: Optional[HealthStripEntry] = adapter.get_health() if owns_health else None
@@ -360,6 +391,7 @@ class UsageDeckService:
             stale=False,
             error=error,
             debug=DebugInfo(adapter=adapter.adapter_name, capabilities=caps, source=adapter.source_label),
+            holders=item.holders,
         )
         card_dict = check_wire("card", sanitize(to_plain(card), item.secrets))
         health_dict = check_wire("health", sanitize(to_plain(health), item.secrets)) if health is not None else None
@@ -374,6 +406,7 @@ class UsageDeckService:
             meters=(), checked_at=fmt_ts(now), stale=False,
             error=make_error(code, item.provider_id, item.account_id),
             debug=DebugInfo(adapter="none", capabilities=(), source="none"),
+            holders=item.holders,
         )
         return check_wire("card", sanitize(to_plain(card), item.secrets))
 
