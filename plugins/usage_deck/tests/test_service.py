@@ -80,7 +80,7 @@ class SubscriptionsTests(ServiceBase):
     def test_empty_inventory_is_200_empty(self):
         status, body = self.call(self.make(), "subscriptions")
         self.assertEqual(status, 200)
-        self.assertEqual(body["data"], {"cards": [], "inventory_state": "empty"})
+        self.assertEqual(body["data"], {"cards": [], "inventory_state": "empty", "view": "machine"})
         self.assertEqual(body["meta"]["partial"], False)
         self.assertEqual(body["meta"]["schema_version"], 1)
         self.assertTrue(body["ok"] and body["error"] is None)
@@ -116,7 +116,7 @@ class SubscriptionsTests(ServiceBase):
         for c in cards:
             self.assertEqual(set(c), {"id", "provider_id", "account_id", "provider_label", "account_label", "kind",
                                       "plan_name", "plan_source", "auth_status", "endpoint_id", "state", "confidence",
-                                      "reason", "meters", "checked_at", "stale", "error", "debug"})
+                                      "reason", "meters", "checked_at", "stale", "error", "debug", "holders"})
         self.assertFalse(body["meta"]["partial"])
 
     def test_no_secret_substrings_anywhere(self):

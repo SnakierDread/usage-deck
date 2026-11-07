@@ -31,6 +31,13 @@ Usage (host interpreter, from the repo root):
     python tests/acceptance/host_acceptance.py --self-check    # offline: fixture + validators only (no host)
 
 Stdlib only; needs the ``hermes`` CLI, ``git`` and ``openssl`` on PATH (or ``--hermes``).
+
+Interpreter for Hermes-dependent helpers. The harness itself needs only the stdlib, but the helper subprocesses that
+import Hermes modules (session seeding, the ``hermes_constants`` isolation probe) need Hermes's dependency closure,
+which only Hermes's own launcher bootstraps. They therefore run on a HERMES_PYTHON resolved once, in this order:
+(1) ``--hermes-python PATH``; (2) ``$HERMES_PYTHON``; (3) auto-detected by asking the ``hermes`` launcher what it runs
+on (the activated venv's interpreter, else its ``sys.executable``); (4) only then ``python3`` on PATH. See
+``hermes_python.py``.
 """
 
 from __future__ import annotations
@@ -59,6 +66,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hermes_python  # noqa: E402  (sibling module: which interpreter can import Hermes)
+
 REPO = Path(__file__).resolve().parents[2]
 PLUGIN_REL = "plugins/usage_deck"
 FIXTURE = REPO / PLUGIN_REL / "tests" / "fixtures" / "scratch_home"
@@ -70,9 +80,10 @@ OPENROUTER_HOST = "openrouter.ai"
 
 CARD_KEYS = {"id", "provider_id", "account_id", "provider_label", "account_label", "kind", "plan_name", "plan_source",
              "auth_status", "endpoint_id", "state", "confidence", "reason", "meters", "checked_at", "stale", "error",
-             "debug"}
+             "debug", "holders"}
+HOLDER_KEYS = {"profile", "is_global"}
 METER_KEYS = {"id", "label", "value", "limit", "remaining", "unit", "scope", "period", "confidence", "source",
-              "observed_at"}
+              "observed_at", "resets_at"}
 PERIOD_KEYS = {"start", "end", "label"}
 ERROR_KEYS = {"code", "message", "retryable", "provider_id", "account_id"}
 DEBUG_KEYS = {"adapter", "capabilities", "source", "sanitized"}
@@ -83,7 +94,7 @@ HEALTH_KEYS = {"endpoint_id", "provider_id", "display_name", "status", "confiden
                "cpu_percent", "memory_bytes", "checked_at", "stale", "reason", "error"}
 META_KEYS = {"schema_version", "request_id", "generated_at", "partial", "errors"}
 ENVELOPE_KEYS = {"ok", "data", "error", "meta"}
-DATA_KEYS = {"subscriptions": {"cards", "inventory_state"}, "health": {"entries"},
+DATA_KEYS = {"subscriptions": {"cards", "inventory_state", "view"}, "health": {"entries"},
              "usage": {"window_days", "provider_id", "series", "reason"}}
 REASONS = {"unsupported", "credentials_missing", "permission_denied", "attribution_unavailable", "no_observations",
            "metrics_unavailable", "source_unavailable"}
@@ -96,7 +107,8 @@ ENUMS = {
     "unit": {"usd", "count", "percent", "bytes"},
     "meter_scope": {"api_credential", "provider_account", "endpoint", "profile"},
     "series_scope": {"profile", "provider", "account"},
-    "meter_source": {"openrouter_key", "session_analytics", "prometheus", "none"},
+    "meter_source": {"openrouter_key", "session_analytics", "prometheus", "anthropic_headers", "none"},
+    "view": {"machine", "profile"},
     "status": {"healthy", "degraded", "offline", "unknown"},
     "error_code": {"invalid_query", "provider_not_found", "auth_required", "permission_denied", "timeout",
                    "upstream_unavailable", "malformed_response", "inventory_unavailable", "analytics_unavailable",
@@ -167,6 +179,8 @@ def validate_meter(errs, where, m):
     validate_period(errs, where + ".period", m["period"])
     if m["observed_at"] is not None and not TS_RE.match(str(m["observed_at"])):
         errs.append(f"{where}.observed_at")
+    if m["resets_at"] is not None and not TS_RE.match(str(m["resets_at"])):
+        errs.append(f"{where}.resets_at")
 
 
 def validate_card(errs, where, c):
@@ -195,6 +209,14 @@ def validate_card(errs, where, c):
         for i, m in enumerate(c["meters"]):
             validate_meter(errs, f"{where}.meters[{i}]", m)
     validate_error(errs, where + ".error", c["error"])
+    if not isinstance(c["holders"], list):
+        errs.append(f"{where}.holders: not a list")
+    else:
+        for i, holder in enumerate(c["holders"]):
+            if _keys(errs, f"{where}.holders[{i}]", holder, HOLDER_KEYS):
+                if not (isinstance(holder["profile"], str) and re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$", holder["profile"])) \
+                        or not isinstance(holder["is_global"], bool):
+                    errs.append(f"{where}.holders[{i}]: bad profile/is_global")
     if _keys(errs, where + ".debug", c["debug"], DEBUG_KEYS):
         if c["debug"]["sanitized"] is not True:
             errs.append(f"{where}.debug.sanitized")
@@ -270,6 +292,7 @@ def validate_envelope(endpoint, body, status=200):
         return errs
     if endpoint == "subscriptions":
         _enum(errs, "data.inventory_state", data["inventory_state"], {"empty", "detected"})
+        _enum(errs, "data.view", data["view"], ENUMS["view"])
         if (data["inventory_state"] == "empty") != (not data["cards"]):
             errs.append("data.inventory_state disagrees with cards")
         for i, c in enumerate(data["cards"]):
@@ -298,12 +321,18 @@ def source_binding_violations(cards, health, series):
     for c in cards:
         tag = f"{c['provider_id']}/{c['account_label']}"
         for m in c["meters"]:
-            if m["confidence"] == "exact" and not (
-                    m["source"] == "openrouter_key" and c["provider_id"] == "openrouter"
-                    and m["unit"] == "usd" and m["scope"] == "api_credential" and m["observed_at"]):
-                v.append(f"{tag}: exact meter without an openrouter_key source")
+            openrouter_ok = (m["source"] == "openrouter_key" and c["provider_id"] == "openrouter"
+                             and m["unit"] == "usd" and m["scope"] == "api_credential" and m["observed_at"])
+            headers_ok = (m["source"] == "anthropic_headers" and c["provider_id"] == "anthropic"
+                          and m["unit"] == "percent" and m["scope"] == "provider_account" and m["observed_at"]
+                          and m["period"]["label"] in ("rolling_5h", "rolling_7d")
+                          and m["period"]["start"] is None and m["period"]["end"] is None)
+            if m["confidence"] == "exact" and not (openrouter_ok or headers_ok):
+                v.append(f"{tag}: exact meter without a verified source (openrouter_key / anthropic_headers)")
             if m["source"] == "openrouter_key" and c["provider_id"] != "openrouter":
                 v.append(f"{tag}: openrouter_key source on another provider")
+            if m["source"] == "anthropic_headers" and c["provider_id"] != "anthropic":
+                v.append(f"{tag}: anthropic_headers source on another provider")
             if m["confidence"] == "self_hosted":
                 v.append(f"{tag}: self_hosted confidence on a billing meter")
         if c["confidence"] == "exact" and not any(m["confidence"] == "exact" for m in c["meters"]):
@@ -314,8 +343,10 @@ def source_binding_violations(cards, health, series):
             h = health_by_ep.get(c["endpoint_id"])
             if c["kind"] != "self_hosted" or h is None or not h["metrics_available"]:
                 v.append(f"{tag}: self_hosted card without successful metrics")
-        if c["kind"] == "cloud" and c["provider_id"] != "openrouter" and c["confidence"] != "opaque":
+        if c["kind"] == "cloud" and c["provider_id"] not in ("openrouter", "anthropic") and c["confidence"] != "opaque":
             v.append(f"{tag}: cloud card without a verified quota source must be opaque")
+        if c["provider_id"] == "anthropic" and c["confidence"] != "opaque" and not c["meters"]:
+            v.append(f"{tag}: anthropic card above opaque without a header meter")
         if c["auth_status"] == "available" and c["state"] == "error" and c["error"] is None:
             v.append(f"{tag}: error state without error")
     for h in health:
@@ -655,7 +686,8 @@ class Scratch:
         (self.root / "config.yaml").write_text(text)
 
     def watched(self):
-        files = ["auth.json", "config.yaml", ".env", "profiles/work/auth.json", "profiles/work/config.yaml"]
+        files = ["auth.json", "config.yaml", ".env", "profiles/work/auth.json", "profiles/work/config.yaml",
+                 "profiles/verifier/auth.json"]
         return {rel: stat_sig(self.root / rel) for rel in files}
 
     def corrupt_backups(self):
@@ -707,7 +739,11 @@ class Host:
     def get(self, path, token=True, **kw):
         return http_get(self.url + path, token=self.s.token if token is True else (token or None), **kw)
 
-    def api(self, endpoint, query="", **kw):
+    def api(self, endpoint, query="", view="profile", **kw):
+        """GET a plugin endpoint. The pre-machine-view scenarios assert profile-scoped inventories, so they
+        default to ``view=profile``; machine scenarios pass ``view=machine`` (or put view= in the query)."""
+        if view and "view=" not in query:
+            query = (query + "&" if query else "") + f"view={view}"
         return self.get(f"{API}/{endpoint}" + (("?" + query) if query else ""), **kw)
 
     def log_text(self):
@@ -786,8 +822,10 @@ class Context:
         self.fixture_text = {p.name: p.read_text() for p in FIXTURE.glob("*") if p.is_file()}
         self.fixture_auth = json.loads((FIXTURE / "auth.json").read_text())
         self.fixture_work_auth = json.loads((FIXTURE / "profiles" / "work" / "auth.json").read_text())
+        self.fixture_verifier_auth = json.loads((FIXTURE / "profiles" / "verifier" / "auth.json").read_text())
         self.long_secrets, self.short_secrets = split_secrets(
             collect_seeded_secrets(self.fixture_auth) | collect_seeded_secrets(self.fixture_work_auth)
+            | collect_seeded_secrets(self.fixture_verifier_auth)
             | config_secrets(self.fixture_text["config.yaml.template"]))
         self.icp = OpenRouterInterceptor(workdir)
         self.gpu = FakeEndpoint({
@@ -806,7 +844,7 @@ class Context:
         return s
 
     def seed_sessions(self, s: Scratch):
-        proc = subprocess.run([sys.executable, str(REPO / "tests" / "acceptance" / "seed_sessions.py"),
+        proc = subprocess.run([self.args.hermes_python, str(REPO / "tests" / "acceptance" / "seed_sessions.py"),
                                str(self.args.hermes_agent)], env={**s.env(), "HERMES_HOME": str(s.root)},
                               capture_output=True, text=True, timeout=120)
         self.R.check("seed synthetic sessions into the scratch state.db", proc.returncode == 0,
@@ -867,7 +905,7 @@ def scenario_isolation(ctx: Context):
                      "from hermes_constants import get_default_hermes_root\nprint(get_default_hermes_root())\n")
 
     def resolve(env):
-        proc = subprocess.run([sys.executable, str(probe), str(ctx.args.hermes_agent)], env=env, capture_output=True,
+        proc = subprocess.run([ctx.args.hermes_python, str(probe), str(ctx.args.hermes_agent)], env=env, capture_output=True,
                               text=True, timeout=60)
         return Path(proc.stdout.strip()).resolve() if proc.returncode == 0 and proc.stdout.strip() else None
 
@@ -915,11 +953,102 @@ def snapshot_real():
     return snap
 
 
+def fmt_epoch(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def write_synthetic_capture(s):
+    """A header capture for the fixture's anthropic row, written by this harness with INVENTED values.
+
+    Nothing in Hermes records ``anthropic-ratelimit-unified-*`` headers today, so the plugin's capture file is
+    produced here, in the scratch root only. Times are relative to now so the windows are still open when the
+    host reads them. Returns the expected values for the meter checks.
+    """
+    now = int(time.time())
+    observed = now - 90
+    fives, sevens = now + 3 * 3600, now + 3 * 86400
+    path = s.root / "plugin-data" / "usage-deck" / "anthropic-ratelimit.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"schema_version": 1, "captures": [{
+        "provider": "anthropic", "credential_id": "syn-anthropic-1", "observed_at": fmt_epoch(observed),
+        "headers": {
+            "anthropic-ratelimit-unified-5h-utilization": "0.25", "anthropic-ratelimit-unified-5h-reset": str(fives),
+            "anthropic-ratelimit-unified-7d-utilization": "0.5", "anthropic-ratelimit-unified-7d-reset": str(sevens),
+        }}]}))
+    return {"observed_at": fmt_epoch(observed), "session_reset": fmt_epoch(fives), "weekly_reset": fmt_epoch(sevens)}
+
+
+def machine_checks(R, host, bodies, capture):
+    msub = host.api("subscriptions", "view=machine")
+    mhealth = host.api("health", "view=machine")
+    musage = host.api("usage", "provider=anthropic&view=machine")
+    bodies += [msub.text, mhealth.text, musage.text]
+    mj = check_envelope_resp(R, "machine view /subscriptions", "subscriptions", msub)
+    mh = check_envelope_resp(R, "machine view /health", "health", mhealth)
+    mu = check_envelope_resp(R, "machine view /usage?provider=anthropic", "usage", musage)
+    mcards = mj["data"]["cards"] if mj else []
+    mentries = mh["data"]["entries"] if mh else []
+    pv = by_provider(mcards)
+
+    def held(c):
+        return [(h["profile"], h["is_global"]) for h in c["holders"]]
+
+    R.check("machine view: data.view == 'machine' and it is the default when no view is given",
+            bool(mj) and mj["data"]["view"] == "machine"
+            and (host.api("subscriptions", view=None).json or {}).get("data", {}).get("view") == "machine")
+    R.check("machine inventory is the union of root + profiles: codex merged to ONE card, openrouter stays two accounts "
+            "(root's and work's), anthropic only via profile 'verifier', both endpoints from the launch config",
+            sorted(c["provider_id"] for c in mcards) == [
+                "anthropic", "custom:gpu-box", "nous", "ollama", "openai-codex", "openrouter", "openrouter"],
+            str(sorted(c["provider_id"] for c in mcards)))
+    if len(mcards) == 7:
+        codex = pv["openai-codex"][0]
+        R.check("machine dedupe: root + verifier hold the same JWT account identity under different tokens -> one "
+                "card listing both holders (global first); plan stays an unverified claim; still opaque",
+                held(codex) == [("global", True), ("verifier", False)]
+                and (codex["plan_name"], codex["plan_source"], codex["state"], codex["confidence"]) ==
+                ("plus", "unverified_claim", "opaque", "opaque"), json.dumps(codex)[:300])
+        R.check("machine view: the two openrouter rows stay separate accounts, each held by exactly its own home",
+                sorted(held(c) for c in pv["openrouter"]) == [[("global", True)], [("work", False)]]
+                and all((c["state"], c["confidence"]) == ("ready", "exact") for c in pv["openrouter"])
+                and len({c["account_id"] for c in pv["openrouter"]}) == 2)
+        ant = pv["anthropic"][0]
+        meters = {m["id"]: m for m in ant["meters"]}
+        R.check("anthropic: exact session_5h / weekly_7d meters from the captured headers (synthetic values), "
+                "freshness == capture time, provider-reported resets, never extrapolated",
+                held(ant) == [("verifier", False)] and (ant["state"], ant["confidence"], ant["reason"]) == ("ready", "exact", None)
+                and sorted(meters) == ["session_5h", "weekly_7d"]
+                and (meters["session_5h"]["value"], meters["weekly_7d"]["value"]) == (25.0, 50.0)
+                and meters["session_5h"]["resets_at"] == capture["session_reset"]
+                and meters["weekly_7d"]["resets_at"] == capture["weekly_reset"]
+                and all(m["observed_at"] == capture["observed_at"] and m["source"] == "anthropic_headers"
+                        and m["unit"] == "percent" and m["limit"] == 100 and m["remaining"] is None
+                        and m["period"]["start"] is None and m["period"]["end"] is None for m in ant["meters"])
+                and ant["debug"]["source"] == "anthropic_headers", json.dumps(ant)[:400])
+        R.check("machine view: config-derived endpoints are held by the launch home ('global')",
+                held(pv["custom:gpu-box"][0]) == [("global", True)] and held(pv["ollama"][0]) == [("global", True)])
+        R.check("machine view: card ids are unique (one per merged account)",
+                len({c["account_id"] for c in mcards}) == 7)
+    R.check("machine view /health: still one row per endpoint (gpu-box healthy, ollama degraded)",
+            sorted(e["provider_id"] for e in mentries) == ["custom:gpu-box", "ollama"])
+    R.check("machine /usage?provider=anthropic: provider known only via another profile -> attribution unavailable, "
+            "empty series (profile totals never cloned)",
+            bool(mu) and mu["data"]["series"] == [] and mu["data"]["reason"] == "attribution_unavailable")
+    R.check("machine view: source binding holds (exact only with a verified source; self_hosted only with metrics)",
+            bool(mcards) and not source_binding_violations(mcards, mentries, []),
+            "; ".join(source_binding_violations(mcards, mentries, [])))
+    bad = host.api("subscriptions", "view=everything")
+    bodies.append(bad.text)
+    j = check_envelope_resp(R, "subscriptions?view=everything", "subscriptions", bad, status=400)
+    R.check("view=everything: invalid_query", bool(j) and j["error"]["code"] == "invalid_query")
+
+
 def scenario_main(ctx: Context):
     R = ctx.R
     R.scenario = "main"
     s = ctx.scratch("main")
     ctx.seed_sessions(s)
+    capture = write_synthetic_capture(s)
     install_plugin(s, R, ctx.head, enable=False)
 
     # ---- consent gate: installed but NOT enabled -> the host must not serve the plugin API
@@ -1119,6 +1248,9 @@ def scenario_main(ctx: Context):
                     and all(len(v) == 1 for v in wcards.values()), json.dumps(sorted(wcards))[:200])
         R.record = observed
 
+        # ---- machine view (DESIGN.md §10): global + every profile, deduped by JWT account identity
+        machine_checks(R, host, bodies, capture)
+
         # ---- egress: what did the plugin talk to?
         new_connects = ctx.icp.connects[plug_before:]
         R.check("plugin egress: only CONNECT openrouter.ai:443 (no other origin, no refresh/billing endpoints)",
@@ -1315,9 +1447,18 @@ def self_check(R):
             sorted(s[:12] for s in secrets_all if not s.startswith(synthetic)))
     jwt = pool["openai-codex"][0]["access_token"]
     payload = json.loads(base64.urlsafe_b64decode(jwt.split(".")[1] + "=="))
-    R.check("fixture: codex JWT is unsigned/synthetic and carries only the plan claim 'plus'",
+    ident = payload.get("https://api.openai.com/auth", {})
+    R.check("fixture: codex JWT is unsigned/synthetic: plan claim 'plus' plus invented udsyn-* account identity claims",
             payload.get("iss") == "synthetic.invalid" and payload.get("plan_type") == "plus"
-            and jwt.split(".")[2].startswith("udsyn"))
+            and jwt.split(".")[2].startswith("udsyn")
+            and set(ident) == {"chatgpt_account_id", "chatgpt_user_id", "chatgpt_plan_type"}
+            and all(str(v).startswith("udsyn-") or k == "chatgpt_plan_type" for k, v in ident.items()))
+    vauth = json.loads((FIXTURE / "profiles" / "verifier" / "auth.json").read_text())
+    vjwt = vauth["credential_pool"]["openai-codex"][0]["access_token"]
+    vclaims = json.loads(base64.urlsafe_b64decode(vjwt.split(".")[1] + "=="))["https://api.openai.com/auth"]
+    R.check("fixture: profile 'verifier' holds the SAME synthetic codex account identity under a different token "
+            "(machine-view merge) and an anthropic row only it has",
+            vclaims == ident and vjwt != jwt and sorted(vauth["credential_pool"]) == ["anthropic", "openai-codex"])
     R.check("fixture: a short (2-char) secret and a secret copied under a generic field exist",
             "el" in secrets_all and pool["nous"][0]["label"] == pool["nous"][0]["access_token"])
     blob = json.dumps(auth) + cfg
@@ -1330,8 +1471,8 @@ def self_check(R):
             "auth_status": "available", "endpoint_id": None, "state": "opaque", "confidence": "opaque",
             "reason": "unsupported", "meters": [], "checked_at": now, "stale": False, "error": None,
             "debug": {"adapter": "NousAdapter", "capabilities": ["session_analytics"], "source": "local_inventory",
-                      "sanitized": True}}
-    env = {"ok": True, "data": {"cards": [card], "inventory_state": "detected"}, "error": None,
+                      "sanitized": True}, "holders": [{"profile": "global", "is_global": True}]}
+    env = {"ok": True, "data": {"cards": [card], "inventory_state": "detected", "view": "machine"}, "error": None,
            "meta": {"schema_version": 1, "request_id": "0a1b2c3d-0000-4000-8000-0123456789ab", "generated_at": now,
                     "partial": False, "errors": []}}
     R.check("validator: accepts a contract-exact subscriptions envelope", validate_envelope("subscriptions", env) == [])
@@ -1344,6 +1485,10 @@ def self_check(R):
         "garbled timestamp": lambda e: e["data"]["cards"][0].update(checked_at="[REDACTED]-11-06T12:00:00Z"),
         "debug.sanitized false": lambda e: e["data"]["cards"][0]["debug"].update(sanitized=False),
         "meta.partial mismatch": lambda e: e["meta"].update(partial=True),
+        "holders dropped": lambda e: e["data"]["cards"][0].pop("holders"),
+        "holder without is_global": lambda e: e["data"]["cards"][0]["holders"].append({"profile": "x"}),
+        "data.view dropped": lambda e: e["data"].pop("view"),
+        "invalid data.view": lambda e: e["data"].update(view="all"),
     }
     for label, mutate in mutations.items():
         bad = copy.deepcopy(env)
@@ -1351,7 +1496,7 @@ def self_check(R):
         R.check(f"validator rejects: {label}", validate_envelope("subscriptions", bad) != [])
     meter = {"id": "api_spend", "label": "x", "value": 1.0, "limit": None, "remaining": None, "unit": "usd",
              "scope": "api_credential", "period": {"start": None, "end": None, "label": "unknown"},
-             "confidence": "exact", "source": "none", "observed_at": now}
+             "confidence": "exact", "source": "none", "observed_at": now, "resets_at": None}
     exact_wrong = dict(card, provider_id="nous", meters=[meter], confidence="exact", state="ready")
     R.check("source-binding validator rejects an exact meter whose source is not openrouter_key",
             bool(source_binding_violations([exact_wrong], [], [])))
@@ -1362,9 +1507,27 @@ def self_check(R):
 
 # --------------------------------------------------------------------------- main
 
+HERMES_PYTHON_HELP = """\
+interpreter for Hermes-dependent helpers (HERMES_PYTHON):
+  Helper subprocesses that import Hermes modules (session seeding, the hermes_constants isolation probe) need Hermes's
+  dependency closure, which only the hermes launcher bootstraps; a bare python3 lacks it (ModuleNotFoundError: ruamel).
+  They all run on one interpreter, resolved once, first hit wins:
+    1. --hermes-python PATH
+    2. $HERMES_PYTHON
+    3. auto-detect: the hermes launcher (--hermes) is asked what it runs on; the activated venv's interpreter is used,
+       else the launcher's sys.executable
+    4. python3 on PATH (last resort)
+  An explicit choice (1, 2) that is not an executable aborts the run. The chosen interpreter is printed in the banner and
+  must import hermes_constants/hermes_state before any scenario runs.
+"""
+
 def parse_args(argv):
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], epilog=HERMES_PYTHON_HELP,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hermes", default=shutil.which("hermes") or "hermes", help="hermes CLI to drive")
+    ap.add_argument("--hermes-python", metavar="PATH",
+                    help="interpreter for EVERY helper subprocess that imports Hermes modules (default: $HERMES_PYTHON, "
+                         "then auto-detected via the hermes launcher, then PATH python3)")
     ap.add_argument("--workdir", help="parent directory for the managed scratch tree (default: $HERMES_KANBAN_WORKSPACE or $TMPDIR)")
     ap.add_argument("--runtime-root", default=str(account_home() / ".hermes"),
                     help="where the machine's Hermes runtime (installs/, tools/) lives; linked read-only into each scratch root")
@@ -1375,12 +1538,20 @@ def parse_args(argv):
     ap.add_argument("--only", action="append", choices=("isolation", "main", "empty", "malformed", "unknown"),
                     help="run only these scenarios")
     ap.add_argument("--json-out", help="write the machine-readable report here")
-    args = ap.parse_args(argv)
+    return ap.parse_args(argv)
+
+
+def resolve_runtime(args):
+    """Resolve HERMES_PYTHON once and the hermes-agent checkout; fills ``args.hermes_python`` / ``hermes_agent``."""
+    res = hermes_python.resolve_hermes_python(args.hermes_python, os.environ, args.hermes)
+    args.hermes_python_resolution = res
+    args.hermes_python = res.python
     if not args.hermes_agent:
         import importlib.util
         spec = importlib.util.find_spec("hermes_constants")
-        args.hermes_agent = str(Path(spec.origin).parent) if spec and spec.origin else str(Path(args.runtime_root) / "hermes-agent")
-    return args
+        args.hermes_agent = (res.agent_root or (str(Path(spec.origin).parent) if spec and spec.origin else "")
+                             or str(Path(args.runtime_root) / "hermes-agent"))
+    return res
 
 
 def main(argv=None):
@@ -1399,13 +1570,23 @@ def main(argv=None):
         if not shutil.which(tool):
             print(f"missing required tool: {tool}", file=sys.stderr)
             return 2
+    try:
+        res = resolve_runtime(args)
+    except hermes_python.HermesPythonError as exc:
+        print(f"HERMES_PYTHON: {exc}", file=sys.stderr)
+        return 2
+    broken = hermes_python.check_closure(args.hermes_python, args.hermes_agent)
+    if broken:
+        print(f"HERMES_PYTHON {res.describe()}\n  cannot import the Hermes modules the helpers need ({broken}).\n"
+              "  Pass --hermes-python PATH (or set $HERMES_PYTHON) to the interpreter Hermes's launcher runs on.", file=sys.stderr)
+        return 2
     head, dirty = committed_head()
     if dirty and not args.allow_dirty:
         print("tracked files differ from HEAD; the harness installs the COMMITTED plugin. Commit or pass --allow-dirty:\n  "
               + "\n  ".join(dirty), file=sys.stderr)
         return 2
     workdir = Path(tempfile.mkdtemp(prefix="usage-deck-acceptance-", dir=parent))
-    print(f"UsageDeck host acceptance @ {head}\n  workdir: {workdir}\n  hermes:  {args.hermes}", flush=True)
+    print(f"UsageDeck host acceptance @ {head}\n  workdir: {workdir}\n  hermes:  {args.hermes}\n  hermes python: {res.describe()}", flush=True)
     real_before = snapshot_real()
     ctx = Context(args, workdir, R)
     wanted = set(args.only or ("isolation", "main", "empty", "malformed", "unknown"))

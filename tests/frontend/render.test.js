@@ -26,9 +26,9 @@ function routesFor(over) {
 test("renders all three zones from the namespaced API and never shows a credential input", async () => {
   const m = await mount({ routes: routesFor() });
   assert.deepEqual(m.$$("[data-zone]").map((z) => z.dataset.zone), ["subscriptions", "usage", "health"]);
-  assert.ok(m.calls.includes(B + "/subscriptions"));
-  assert.ok(m.calls.includes(B + "/usage?window=30"));
-  assert.ok(m.calls.includes(B + "/health"));
+  assert.ok(m.calls.includes(B + "/subscriptions?view=machine"));
+  assert.ok(m.calls.includes(B + "/usage?window=30&view=machine"));
+  assert.ok(m.calls.includes(B + "/health?view=machine"));
   assert.ok(m.calls.every((u) => u.startsWith("/api/plugins/usage-deck/")), "only the ratified namespace");
   assert.equal(m.$$("input, textarea, [type=password]").length, 0, "no credential wall");
   assert.equal(m.$(".usage-deck").dataset.phase, "connected");
@@ -129,7 +129,7 @@ test("loading skeleton shows no numbers or badges before data arrives", async ()
 test("empty inventory: first-run guidance with Refresh, no credential input", async () => {
   const m = await mount({ routes: routesFor({ subs: () => envelope({ cards: [], inventory_state: "empty" }), health: () => envelope({ entries: [] }) }) });
   const zone = m.$("[data-zone=subscriptions]");
-  assert.match(zone.textContent, /No providers detected in this profile/);
+  assert.match(zone.textContent, /No providers detected on this machine/);
   assert.ok([...zone.querySelectorAll("button")].some((b) => b.textContent === "Refresh"));
   assert.equal(m.$$("input, textarea, [type=password]").length, 0);
   assert.equal(m.$(".usage-deck").dataset.phase, "first_run");
@@ -278,8 +278,8 @@ test("window picker refetches; out-of-order completion keeps the latest selectio
   assert.equal(btn(30).getAttribute("aria-pressed"), "true");
   await m.click(btn(7));
   await m.click(btn(90));
-  assert.ok(m.calls.includes(B + "/usage?window=7"));
-  assert.ok(m.calls.includes(B + "/usage?window=90"));
+  assert.ok(m.calls.includes(B + "/usage?window=7&view=machine"));
+  assert.ok(m.calls.includes(B + "/usage?window=90&view=machine"));
   // 90 answers first, then the stale 7 arrives late
   await act(async () => { pending[90].resolve(envelope(F.usage(90, [F.point("2026-08-01"), F.point("2026-08-02")]))); });
   await act(async () => { pending[7].resolve(envelope(F.usage(7, [F.point("2026-11-05")]))); });
@@ -339,7 +339,7 @@ test("provider filter requests ?provider= and shows attribution-unavailable hone
     setter.call(sel, "openrouter");
     sel.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
   });
-  assert.ok(m.calls.includes(B + "/usage?window=30&provider=openrouter"));
+  assert.ok(m.calls.includes(B + "/usage?window=30&provider=openrouter&view=machine"));
   const z = m.$("[data-zone=usage]");
   assert.match(z.textContent, /Provider attribution unavailable from session analytics\./);
   assert.equal(z.querySelectorAll("figure.ud-chart").length, 0, "no profile totals cloned onto the provider");
@@ -472,7 +472,7 @@ function setVisibility(state) {
 
 test("polls while visible and stops while hidden", async () => {
   const m = await mount({ routes: routesFor(), pollMs: 30 });
-  const subsCalls = () => m.calls.filter((u) => u === B + "/subscriptions").length;
+  const subsCalls = () => m.calls.filter((u) => u === B + "/subscriptions?view=machine").length;
   assert.equal(subsCalls(), 1);
   await m.flush(80);
   const visibleCount = subsCalls();
@@ -498,7 +498,7 @@ test("manual Refresh re-requests all three zones and explains the cache", async 
   await m.click(btn);
   await m.flush(5);
   const added = m.calls.slice(before);
-  assert.deepEqual(added.sort(), [B + "/health", B + "/subscriptions", B + "/usage?window=30"].sort());
+  assert.deepEqual(added.sort(), [B + "/health?view=machine", B + "/subscriptions?view=machine", B + "/usage?window=30&view=machine"].sort());
   await m.unmount();
 });
 

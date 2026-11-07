@@ -1,6 +1,6 @@
 # UsageDeck MVP contract — v1
 
-Status: **ratified; backend and frontend implementation released**.
+Status: **ratified; backend and frontend implementation released**. Amended by card `t_04a4354d` (builder-authored, pending architect ratification): §9 source upgrade, §10 machine view, §11 badges; in-place pointers below.
 Owner: architect. Branch: `t_22e02c08`. Wire version: `1`.
 This document governs backend and frontend together. Examples below are contract examples, not live probe results. `docs/recon-providers.md` is evidence, not an API specification.
 
@@ -20,7 +20,7 @@ A second grounding correction is settled here, not left to workers: the CLI inst
 
 Discovery is local, read-only, scoped to the dashboard-selected profile using the host's request-scoped profile helper. Never mutate process environment per request. Resolve the active home through Hermes helpers, not `~/.hermes` string concatenation. Allow only host-validated profile names; no arbitrary filesystem paths in request parameters.
 
-Read credential pools profile-first, with global fallback **per provider only when the profile has zero pool entries for that provider**. A nonempty profile pool replaces the global provider pool; do not combine their accounts. This matches `hermes_cli/auth.py:934–958`. Legacy `providers` entries are used only when no effective pool exists for that provider. Add configured primary/custom providers even without credentials. Use the host's configuration loader (including its YAML support), never a hand-written YAML parser. Do not scan other profiles or read `.env` wholesale. Resolve only the credential references required by a discovered adapter, through host helpers. Never refresh OAuth, rotate credentials, persist pool health, or invoke an inference request.
+Read credential pools profile-first, with global fallback **per provider only when the profile has zero pool entries for that provider**. A nonempty profile pool replaces the global provider pool; do not combine their accounts. This matches `hermes_cli/auth.py:934–958`. Legacy `providers` entries are used only when no effective pool exists for that provider. Add configured primary/custom providers even without credentials. Use the host's configuration loader (including its YAML support), never a hand-written YAML parser. Do not scan other profiles or read `.env` wholesale (the **machine view** of §10 is the one exception: it reads other profiles' `auth.json` only). Resolve only the credential references required by a discovered adapter, through host helpers. Never refresh OAuth, rotate credentials, persist pool health, or invoke an inference request.
 
 One SubscriptionCard per effective pool account; one per configured endpoint without a pool account. A configured endpoint and pool row referring to the same provider/base URL are one inventory item, not two. Dedupe exact duplicate stored row IDs and normalized endpoints, not different accounts just because their provider matches. Do not dedupe different stored row IDs by hashing their secret values.
 
@@ -59,8 +59,8 @@ Registry resolution: exact built-in ID → configured custom/ollama endpoint ada
 | Class / registry entry | Allowed data sources in MVP | Meaning / fallback |
 |---|---|---|
 | NousAdapter / nous | local inventory and AnalyticsReader | No documented verified quota capability in recon; quota opaque. Never scrape Portal HTML or guess `/api/usage`. |
-| OpenAICodexAdapter / openai-codex | local inventory, safe plan claim, AnalyticsReader | Subscription quota opaque. Never send Codex OAuth to OpenAI billing endpoints; API org billing is not a ChatGPT subscription quota. |
-| AnthropicAdapter / anthropic | local inventory, safe plan claim, AnalyticsReader | OAuth/ordinary inference credentials do not establish org analytics or subscription quota access. Quota opaque. No SDK or admin endpoint guessing. |
+| OpenAICodexAdapter / openai-codex | local inventory, safe plan claim, AnalyticsReader | Subscription quota opaque. Never send Codex OAuth to OpenAI billing endpoints; API org billing is not a ChatGPT subscription quota. Reaffirmed in §9.2: recon did not prove the usage endpoint reachable, so it stays opaque. |
+| AnthropicAdapter / anthropic | local inventory, safe plan claim, AnalyticsReader, **captured unified rate-limit headers (read from a local file, §9.1)** | OAuth/ordinary inference credentials do not establish org analytics or subscription quota access. Quota opaque unless a header capture exists for the card's credential; then exact session/weekly utilization. No SDK or admin endpoint guessing, no request made to obtain headers. |
 | OpenRouterAdapter / openrouter | HTTPS `https://openrouter.ai/api/v1/key`; AnalyticsReader | Read documented numeric `usage`, `limit`, `limit_remaining` from `data`; USD, API-key scope. Exact only for returned finite values and matching limit period. Missing or unauthorized values opaque, never inferred from plan. |
 | SelfHostedAdapter / custom endpoints, ollama | configured origin's `/metrics`, `/v1/models` or `/api/tags` for health; AnalyticsReader separately | Successful supported metrics exposition gives self_hosted health, not a token quota. No metrics gives opaque health confidence, even if models are reachable. |
 | SessionAnalyticsAdapter / all other IDs | **only** AnalyticsReader mapped to GET `/api/analytics/usage` | Session analytics only; quota opaque, profile-only series estimated. No provider HTTP, config mutations, `/api/analytics/models`, DB reads or model-prefix attribution. |
@@ -175,6 +175,8 @@ HealthStripEntry {
 
 Health status: metrics success plus successful expected health JSON => healthy; health reachable but metrics unsupported/failed => degraded; all attempted requests fail connection/timeout => offline; invalid/unconfigured endpoint or nonconnection failures without valid health evidence => unknown. Metrics success but health request failure => degraded, with self_hosted confidence retained for the successful metrics observation. Health latency measures the selected successful health request, else successful metrics request, else null; a failed request is not zero latency. Missing CPU/memory remains null even with a valid empty exposition. Non-local adapters return no health row. At most one row per endpoint ID even if accounts share an endpoint.
 
+Wire deltas to the notation above (additive; `schema_version` stays `1`): `Holder`, `SubscriptionCard.holders`, `UsageMeter.resets_at`, `METER_SOURCES += anthropic_headers`, `/subscriptions data.view`. Normative text in §9-§10.
+
 ### 2.1 Secret masking at DTO construction
 
 Use one shared safe factory before any DTO exists, caches, logs, drawer data or response serialization. Allowlist fields above; no raw payload bag. Recursively redact values under any field name containing (case-insensitive) `key`, `token`, `secret`, `password`, plus authorization, cookie, credentials, bearer, jwt, access, refresh. Replacement is literal `[REDACTED]`; recurse through lists/maps and reject non-JSON objects. Do not retain suffixes or fingerprints. This intentionally forbids wire names like `input_tokens` and `api_key_id`; map allowed numeric analytics fields into `input_count`/`output_count` **before** the DTO factory. Do not allow a token-count exception that can also leak credential fields.
@@ -191,7 +193,7 @@ Required physical endpoints (approved in §0):
 
 Export a relative router (`/subscriptions`, `/usage`, `/health`) with **no prefix**; the host supplies `/api/plugins/usage-deck`. A test harness mounts it at the same API_BASE; actual host namespace must be verified in integration QA, not merely a standalone TestClient. The old `/api/usage-deck/*` namespace is not exposed.
 
-Common optional query `profile` is passed through the host profile validation/scope mechanism. Omitted = dashboard active profile. All endpoints inherit the dashboard auth/consent/profile gate; no public bypass and no provider credentials in requests. Unknown query parameters and repeated single-value parameters => 400 invalid_query. Window defaults to 30; accept only the literal strings `7`, `30`, `90` (not 07, floats or arbitrary days). Provider absent means unfiltered; empty string or >256 characters/control characters => 400; percent-decode once through the host, match exact discovered provider ID. Unknown inventory provider => 404 provider_not_found (this does **not** mean a discovered provider with unknown adapter should fail).
+Common optional query `profile` is passed through the host profile validation/scope mechanism. Optional `view=machine|profile` (default `machine`, §10) on all three endpoints. Omitted = dashboard active profile. All endpoints inherit the dashboard auth/consent/profile gate; no public bypass and no provider credentials in requests. Unknown query parameters and repeated single-value parameters => 400 invalid_query. Window defaults to 30; accept only the literal strings `7`, `30`, `90` (not 07, floats or arbitrary days). Provider absent means unfiltered; empty string or >256 characters/control characters => 400; percent-decode once through the host, match exact discovered provider ID. Unknown inventory provider => 404 provider_not_found (this does **not** mean a discovered provider with unknown adapter should fail).
 
 Every endpoint's plugin-owned success response (HTTP 200):
 
@@ -202,7 +204,7 @@ Every endpoint's plugin-owned success response (HTTP 200):
 `data` by suffix:
 
 ```text
-/subscriptions: { cards: list[SubscriptionCard], inventory_state: empty|detected }
+/subscriptions: { cards: list[SubscriptionCard], inventory_state: empty|detected, view: machine|profile }  # view added by §10
 /usage: { window_days: 7|30|90, provider_id: string|null,
           series: list[UsageTimeSeries], reason: Reason }
 /health: { entries: list[HealthStripEntry] }
@@ -232,7 +234,7 @@ Chart: window defaults 30; preserve selection within mount, reset profile data b
 
 Wire `self_hosted` is canonical, display badge is **Self-hosted** (resolves brief's hyphenated prose vs DTO enum). Other badge text: exact → **Exact**, estimated → **Estimated**, opaque → **Opaque**. Tooltip must name source, scope and observed time. Every number/meter/chart and health entry carries its own source badge; never rely solely on a card header badge.
 
-- exact: only directly reported numeric quantity for a known scope/period. OpenRouter key balance/usage can qualify; it is not an exact subscription percentage.
+- exact: only directly reported numeric quantity for a known scope/period. OpenRouter key balance/usage can qualify; it is not an exact subscription percentage. Anthropic's reported 5h/7d utilization from captured headers also qualifies (§9.1): it is the provider's own number for a named rolling window, shown with the capture time and never extrapolated.
 - estimated: session-local accounting, estimated spend or incomplete attribution/coverage. No estimated spend presented as a provider invoice or subscription allowance.
 - opaque: no verified measurement. No numeric quota/percent/reset rendering; null is not zero. Credentials and unverified plan claims cannot promote confidence.
 - self_hosted: operational metrics exposed by a configured endpoint's valid `/metrics`. It is a source category, **not** a higher accuracy tier than estimated/exact. Local token history, when available from session accounting, stays estimated separately.
@@ -257,7 +259,8 @@ DESIGN.md                              architect only
  plugins/usage_deck/plugin_api.py        backend; thin router, lazy integration
  plugins/usage_deck/adapters/            backend; protocol, registry, cloud/local/fallback
  plugins/usage_deck/models/              backend; DTOs, validators, redaction
- plugins/usage_deck/discovery.py         backend
+ plugins/usage_deck/discovery.py         backend (machine view: `discover_machine`, §10)
+ plugins/usage_deck/captures.py          backend; read-only header-capture store + write seam (§9.1)
  plugins/usage_deck/service.py           backend; snapshots/orchestration
  plugins/usage_deck/tests/               backend tests; QA may add new test files
  plugins/usage_deck/manifest.json         frontend; canonical dashboard manifest
@@ -282,6 +285,73 @@ Secret tests: seed unique sentinels in nested config/auth/HTTP/error strings; re
 Frontend fixtures: every terminal card state and loading transition; empty/nonempty inventory; partial failure; profile/window switch with out-of-order completion; null/zero/over-limit/unlimited progress behavior; badges per value; drawer text escaping; keyboard access; hidden-tab polling; chart attribution unavailable; health without metrics. Smoke-test all three zones in the real dashboard SDK, and install via `hermes plugins install ./plugins/usage_deck` only after staged packaging exists and owner-approved route namespace is settled. Live probes are read-only, opt-in through existing configured credentials; report nonresponsive endpoints honestly rather than assert fleet totals from old recon.
 
 Design ratification checklist: seven required sections present; recon preserved and corrections explicit; schemas and masks consistent; physical host mounting contract verified against source; §0 namespace choice approved; docs committed on requested branch; commit ID handed to both implementation cards. Runtime host installation and route smoke tests remain downstream implementation/QA obligations, not evidence claimed by this design card. No feature implementation or external design review is part of this card.
+
+## 9. Source upgrade: Anthropic header meters, Codex decision (delta, card t_04a4354d)
+
+Status: implemented; the delta text is builder-authored and **pending architect ratification**. It amends §1.3, §2, §3 and §5 only where stated here.
+
+### 9.1 Anthropic: session and weekly utilization from captured headers
+
+Evidence: recon `t_7dce2222` (`recon_report.md`). Anthropic OAuth responses carry `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset,status}` plus `-representative-claim`, `-fallback-percentage`, `-reset`, `-overage-*`. Utilization is a fraction (`0.0184` = 1.84 %, may exceed `1.0`); `*-reset` is epoch seconds. The recon cites public issues (anthropics/claude-code #12829, #55333) for the header names, not a live capture from this fleet.
+
+Finding that shapes the design: **nothing in the Hermes source tree records these headers** (searched at revision `b200f5bc60e31588ba2cb60e288029c4a54ba5fa`). The seams the recon cites (`_VENDOR_RESET_HEADERS`, `nous_rate_guard._parse_buckets_from_headers`, `rate_limit_tracker.parse_rate_limit_headers`) read `x-ratelimit-*` and the per-bucket `anthropic-ratelimit-requests/tokens-reset` headers only, and the `post_api_request` hook payload carries no response headers. UsageDeck therefore does **not** make a request to obtain them (no inference call, no spend; §1.1/§1.5 unchanged) and only reads a capture file:
+
+- Path: `<hermes root>/plugin-data/usage-deck/anthropic-ratelimit.json`, schema in `captures.py` (`schema_version: 1`; one capture per `{provider, credential_id}`; `credential_id` is the pool row's public `id`, never a token, email or fingerprint; `observed_at` is the time of the call that returned the headers; only allow-listed `anthropic-ratelimit-unified-*` header names with values up to 64 characters are loaded, everything else is dropped).
+- `captures.record_headers()` is the write seam a future capture hook would call. The plugin itself never calls it. **Until some component records captures, every Anthropic card is opaque, exactly as before.** This is the honest default, not a bug.
+- A capture file or entry flagged `"synthetic": true` is refused by the production reader, so test fixtures can never render as observations.
+
+Meter mapping (`AnthropicAdapter`, `adapters/cloud.py`), one meter per window that has a valid utilization:
+
+| field | value |
+|---|---|
+| `id` / `label` | `session_5h` "Session (5-hour window)" and `weekly_7d` "Weekly (7-day window)" |
+| `value` / `limit` / `remaining` | utilization × 100 rounded to 4 dp (may exceed 100, never clamped) / `100` / `null` |
+| `unit` / `scope` | `percent` / `provider_account` |
+| `period` | `{start:null, end:null, label:"rolling_5h"\|"rolling_7d"}`: a documented rolling window, boundaries never computed |
+| `confidence` / `source` | `exact` / `anthropic_headers` (new `METER_SOURCES` member) |
+| `observed_at` | the capture's call timestamp: the freshness. Never the read time |
+| `resets_at` (new) | the provider-reported reset instant, else `null` |
+
+Never extrapolated: a window whose reported reset is already in the past no longer describes the current window, so it produces **no** meter (its utilization since the reset is unknown and is not shown as zero). If no window survives, the card is `opaque` with `reason=source_unavailable`. A capture for a credential that is not on the card is never used. Without a capture: `opaque`, `reason=unsupported`, `debug.source=local_inventory`.
+
+UI: each meter carries its own `Exact` badge; the tooltip names the source ("Anthropic unified rate-limit headers captured from the last call"), scope, observed time and the provider's reset, and says the value is as of that call and never extrapolated. The row shows `Used`, `Resets`, `As of`, plus a progress bar (the rolling window is a known period; an over-100 % value is shown as over limit).
+
+### 9.2 Codex: stays opaque (decision)
+
+The card asked for backend usage data only "IF recon proved reachable". It did not: the recon read `agent/account_usage.py` and described the request (`GET https://chatgpt.com/wham/usage` or `/api/codex/usage`, `Authorization`, `ChatGPT-Account-ID`, residency header) but recorded **no live response, HTTP status or real response body**; the "sample response shape" is two fields inferred from `_codex_banked_resets`. Sending a Codex OAuth bearer to a new endpoint on that evidence would also contradict §1.3 ("never send Codex OAuth to OpenAI billing endpoints") and §1.5's fixed origin allowlist, and the plan windows' field names are unverified. Codex cards therefore keep `opaque`/`unsupported`, make no network call, and the UI explains why (recon `t_7dce2222`, no live response verified, §1.3) in the card body and badge tooltip. Reopening this needs an architect decision plus a read-only live probe whose status and sanitized body are recorded.
+
+## 10. Machine view: aggregation across Hermes homes (delta, card t_04a4354d)
+
+The subscriptions grid and health strip now default to a **machine view**; the profile-scoped view of §1.1 remains behind a toggle.
+
+- Query: `view=machine|profile` on `/subscriptions`, `/health` and `/usage`; default `machine`; anything else (or a repeat) is `400 invalid_query`. For `/usage` the value only decides which inventory validates `provider=`; usage series stay profile-wide session analytics (§1.4).
+- Sources: the root `auth.json` (`holder` `global`) and every `<root>/profiles/<name>/auth.json`, each read **on its own** (no shadowing, no config). A profile that merely falls back to the global pool does not hold those accounts. Legacy `providers` entries count only for providers with no pool row in the same file. This **supersedes §1.1's "do not scan other profiles" for the machine view only**: it widens what one dashboard session can see to every profile on the same machine, by explicit card instruction. Safeguards: only real directories with valid profile names directly under `<root>/profiles` and non-symlink `auth.json` files are opened (nothing outside the Hermes root), at most 64 profiles, an unreadable store is skipped with a path-free log line (the viewed home's own store still fails with `inventory_unavailable`), and no tokens or claims ever reach a response.
+- Config-derived items (custom endpoints, primary provider without credentials) come from the **viewed** profile's config only (host config loader) and are held by that profile (`global` when the viewed home is the root). They are dropped when a pooled account already covers the same provider (cloud) or provider and endpoint (self-hosted).
+- Identity (private merge key, never serialized): (1) the JWT account identity `chatgpt_account_id` **plus** user id (`chatgpt_user_id` / `user_id` / `chatgpt_account_user_id`) from the `https://api.openai.com/auth` claim, so two seats of one workspace stay two accounts and a refreshed token of the same seat merges; (2) otherwise provider plus an identical **public pool row id** (so two api-key rows to one endpoint remain two accounts, as in the profile view); (3) otherwise no identity: the row is never merged across homes. Secrets are never compared or hashed to merge (§1.1 unchanged), so an opaque credential copied under a new row id shows twice.
+- Card identity: `account_id`/`id` = `acct_` + SHA-256-24 of `[provider_id, endpoint, "machine:" + identity]`. The identity string is hashed, never emitted; JWT claims are read locally and never sent anywhere. Machine ids differ from profile-view ids by design. Labels are `Account N` per provider in first-seen order (global, then profiles alphabetically).
+- Merged card: first credential and plan claim found; secrets unioned for masking; capture lookup uses every public row id of the group.
+
+Wire delta (additive, `schema_version` stays `1`; every field always serialized):
+
+```text
+SubscriptionCard += holders: list[Holder]       # machine view: homes holding the account, global first; [] in profile view
+Holder { profile: string, is_global: boolean }  # profile matches ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$; "global" + is_global=true for the root
+UsageMeter       += resets_at: timestamp|null
+METER_SOURCES    += anthropic_headers
+/subscriptions data += view: machine|profile    # the effective view; "profile" if the source cannot enumerate homes
+```
+
+Example title: `OpenAI Codex [go] — verifier` (plan claim is an unverified claim; the holders list comes from local `auth.json` presence, not validity). Fixtures and checks: `plugins/usage_deck/tests/test_machine_view.py`, scratch fixture `tests/fixtures/scratch_home/` (adds profile `verifier`), and the real-host harness machine section.
+
+## 11. Confidence badges for the new claims
+
+| Rendered claim | Badge / treatment |
+|---|---|
+| Anthropic `Used`, `Resets`, `As of` | per-meter `Exact` (source `anthropic_headers`, ceiling `exact`; the UI lowers it to the lesser of claimed confidence and source ceiling) |
+| Anthropic without a usable capture | card `Opaque`; tooltip and body say no unified headers are captured and Hermes does not record them today (recon `t_7dce2222`); nothing estimated |
+| Codex | card `Opaque`; tooltip and body cite recon `t_7dce2222` (endpoint found by source reading only, no live response, §1.3) |
+| Plan `[go]` | unchanged: unverified claim, tooltip says so; not a measurement |
+| Holders `— verifier` | local inventory fact: tooltip says "read from auth.json; presence only, not validated"; not a usage claim, so no confidence tier applies |
 
 ## Grounding references
 

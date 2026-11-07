@@ -25,6 +25,7 @@ def _make_plugin(root: Path, backend: bool) -> Path:
         (p / "__init__.py").write_text("")
         (p / "plugin_api.py").write_text("router = None\n")
         (p / "discovery.py").write_text("d")
+        (p / "captures.py").write_text("c")
         (p / "service.py").write_text("s")
         for d in ("adapters", "models"):
             (p / d).mkdir()
@@ -54,6 +55,7 @@ class StageTests(unittest.TestCase):
         p = _make_plugin(self.tmp, backend=True)
         staged = sd.stage(p, require_backend=True)
         self.assertIn("plugin_api.py", staged)
+        self.assertIn("captures.py", staged)
         self.assertIn("adapters/mod.py", staged)
         self.assertIn("models/__init__.py", staged)
         self.assertFalse(any("tests" in s or "__pycache__" in s or s.endswith(".pyc") for s in staged))

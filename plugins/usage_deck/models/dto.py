@@ -43,7 +43,8 @@ ERROR_CODES = (
 )
 UNITS = ("usd", "count", "percent", "bytes")
 METER_SCOPES = ("api_credential", "provider_account", "endpoint", "profile")
-METER_SOURCES = ("openrouter_key", "session_analytics", "prometheus", "none")
+METER_SOURCES = ("openrouter_key", "session_analytics", "prometheus", "anthropic_headers", "none")
+VIEWS = ("machine", "profile")
 PLAN_SOURCES = ("unverified_claim", "provider", "none")
 AUTH_STATUSES = ("available", "missing", "rejected")
 KINDS = ("cloud", "self_hosted")
@@ -219,6 +220,8 @@ class UsageMeter:
     confidence: str
     source: str
     observed_at: Optional[str]
+    #: Provider-reported reset instant of the metered window (never computed or extrapolated).
+    resets_at: Optional[str] = None
 
     def __post_init__(self) -> None:
         _str("id", self.id)
@@ -233,6 +236,23 @@ class UsageMeter:
         _enum("confidence", self.confidence, CONFIDENCE_LABELS)
         _enum("source", self.source, METER_SOURCES)
         _ts("observed_at", self.observed_at)
+        _ts("resets_at", self.resets_at)
+
+
+_HOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+@dataclass(frozen=True)
+class Holder:
+    """One Hermes home (the global root or a named profile) whose auth.json holds an account."""
+
+    profile: str
+    is_global: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.profile, str) or not _HOLDER_RE.match(self.profile):
+            raise DtoError("holder.profile")
+        _bool("is_global", self.is_global)
 
 
 @dataclass(frozen=True)
@@ -271,6 +291,8 @@ class SubscriptionCard:
     stale: bool
     error: Optional[DeckError]
     debug: DebugInfo
+    #: Machine view only: the homes holding this account (empty in profile view).
+    holders: Tuple[Holder, ...] = ()
 
     def __post_init__(self) -> None:
         _str("id", self.id)
@@ -293,6 +315,8 @@ class SubscriptionCard:
             raise DtoError("error")
         if self.plan_name is None and self.plan_source == "unverified_claim":
             raise DtoError("plan_source without plan")
+        if not all(isinstance(h, Holder) for h in self.holders):
+            raise DtoError("holders")
 
 
 @dataclass(frozen=True)
@@ -449,12 +473,12 @@ def failure_envelope(error: DeckError, meta: dict) -> dict:
 # tables below are derived from the dataclasses above so they cannot drift.
 
 _WIRE_CLASSES = (
-    DeckError, Period, UsageMeter, DebugInfo, SubscriptionCard, UsagePoint, UsageTimeSeries, HealthStripEntry,
+    DeckError, Period, UsageMeter, Holder, DebugInfo, SubscriptionCard, UsagePoint, UsageTimeSeries, HealthStripEntry,
 )
 
 # Envelope (§3) and per-endpoint ``data`` keys that are not DTO fields.
 _ENVELOPE_KEYS = ("ok", "data", "error", "meta", "schema_version", "request_id", "generated_at", "partial", "errors")
-_DATA_KEYS = ("cards", "inventory_state", "window_days", "provider_id", "series", "reason", "entries")
+_DATA_KEYS = ("cards", "inventory_state", "view", "window_days", "provider_id", "series", "reason", "entries")
 
 #: Every field name the wire contract defines. Keys outside this set are not
 #: schema: the sanitizer scrubs them like any other string.
@@ -498,6 +522,8 @@ WIRE_VALUE_RULES = {
     "capabilities": _in(CAPABILITIES),  # list items inherit the key
     "status": _in(HEALTH_STATUSES),
     "inventory_state": _in(("empty", "detected")),
+    "view": _in(VIEWS),
+    "profile": _match(_HOLDER_RE),
     "bucket": _in(("day",)),
     "timezone": _in(("server_local",)),
     "coverage": _in(("partial", "complete")),
@@ -506,6 +532,7 @@ WIRE_VALUE_RULES = {
     "generated_at": _match(_TS_RE),
     "start": _match(_TS_RE),
     "end": _match(_TS_RE),
+    "resets_at": _match(_TS_RE),
     "day": _match(_DATE_RE),
     "request_id": _match(_UUID_RE),
     "account_id": _match(_HASH_ID_RE),
@@ -555,17 +582,23 @@ def _meter_from_wire(data: Any) -> UsageMeter:
     return UsageMeter(**{**data, "period": _period_from_wire(data["period"])})
 
 
+def _holder_from_wire(data: Any) -> Holder:
+    return Holder(**_exact_keys("holder", data, Holder))
+
+
 def card_from_wire(data: Any) -> SubscriptionCard:
     """Rebuild (and thereby validate) a card from its wire dict; strict key set."""
     data = _exact_keys("card", data, SubscriptionCard)
     debug = _exact_keys("debug", data["debug"], DebugInfo)
-    if not isinstance(data["meters"], list) or not isinstance(debug["capabilities"], list):
+    if not isinstance(data["meters"], list) or not isinstance(debug["capabilities"], list) \
+            or not isinstance(data["holders"], list):
         raise DtoError("card: expected lists")
     return SubscriptionCard(**{
         **data,
         "meters": tuple(_meter_from_wire(m) for m in data["meters"]),
         "error": _error_from_wire(data["error"]),
         "debug": DebugInfo(debug["adapter"], tuple(debug["capabilities"]), debug["source"], debug["sanitized"]),
+        "holders": tuple(_holder_from_wire(h) for h in data["holders"]),
     })
 
 
@@ -601,7 +634,7 @@ def check_wire(kind: str, data: Any) -> Any:
 
 _META_KEYS = ("schema_version", "request_id", "generated_at", "partial", "errors")
 _DATA_SHAPES = {
-    frozenset(("cards", "inventory_state")): "subscriptions",
+    frozenset(("cards", "inventory_state", "view")): "subscriptions",
     frozenset(("window_days", "provider_id", "series", "reason")): "usage",
     frozenset(("entries",)): "health",
 }
@@ -644,6 +677,7 @@ def check_envelope(body: Any) -> Any:
         raise DtoError("envelope.data: wire keys differ from schema")
     if shape == "subscriptions":
         _enum("inventory_state", data["inventory_state"], ("empty", "detected"))
+        _enum("view", data["view"], VIEWS)
         if not isinstance(data["cards"], list):
             raise DtoError("cards")
         for card in data["cards"]:

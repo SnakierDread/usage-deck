@@ -8,7 +8,7 @@ import unittest
 
 from plugins.usage_deck.adapters.cloud import OPENROUTER_KEY_URL
 from plugins.usage_deck.adapters.transport import HttpResponse, TransportError
-from plugins.usage_deck.discovery import FileInventorySource, discover
+from plugins.usage_deck.discovery import FileInventorySource, discover, discover_machine
 from plugins.usage_deck.service import UsageDeckService
 
 from .helpers import (
@@ -151,6 +151,16 @@ class DiscoveryKeyEnvTests(Base):
         self.custom = [{"name": "desktop", "base_url": BOX + "/v1", "key_env": ENV_NAME}]
         (item,) = discover(self.source())
         self.assertEqual(item.credential.reveal(), ENV_VALUE)
+
+    def test_machine_view_resolves_key_env_and_flags_unset(self):
+        self.custom = [{"name": "desktop", "base_url": BOX + "/v1", "key_env": ENV_NAME}]
+        (unset,) = discover_machine(self.source())
+        self.assertIsNone(unset.credential)
+        self.assertEqual((unset.auth_status, unset.credential_expected), ("missing", True))
+        self.env[ENV_NAME] = ENV_VALUE
+        (item,) = discover_machine(self.source())
+        self.assertEqual(item.credential.reveal(), ENV_VALUE)
+        self.assertEqual((item.auth_status, item.credential_expected), ("available", False))
 
 
 class KeyEnvServiceTests(Base):
