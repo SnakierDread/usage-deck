@@ -110,6 +110,8 @@ class AdapterContext:
     endpoint_cache: Optional[EndpointCache] = None
     row_ids: Tuple[str, ...] = ()  # public stored pool row ids (capture lookup key; never secret)
     captures: Optional[CaptureStore] = None  # read-only header captures, never a network call
+    # key_env named an env var with no value: a credential is expected but absent.
+    credential_expected: bool = False
 
     def __repr__(self) -> str:
         return f"AdapterContext(provider_id={self.provider_id!r}, account_id={self.account_id!r})"
@@ -129,6 +131,8 @@ class ProviderAdapter(Protocol):
     def get_health(self) -> Optional[HealthStripEntry]: ...
 
     def get_confidence(self) -> str: ...
+
+    def credential_rejected(self) -> bool: ...
 
 
 def error_for_status(status: int, provider_id: str, account_id: str) -> Optional[DeckError]:
@@ -219,6 +223,10 @@ class BaseAdapter:
         if not self._usage:
             self.get_usage(30)  # callable independently: reuse/produce the snapshot
         return self._confidence
+
+    def credential_rejected(self) -> bool:
+        """True only when a credential was actually sent and the provider answered 401."""
+        return False
 
     # -- helpers ---------------------------------------------------------
     def _probe_result(self, supported, reachable=None, capabilities=(), reason=None, error=None) -> ProbeResult:

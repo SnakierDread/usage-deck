@@ -83,6 +83,8 @@ Host `daily.day` uses the host local calendar timezone and a rolling days cutoff
 
 Only GET. Fixed cloud origin/path allowlist. Local requests must match inventory-configured http(s) origin; endpoints are never accepted from query strings. Derive `/metrics` and health paths from origin, not by blindly appending to `/v1`. Reject URL userinfo and credential-bearing query/fragment for transport; do not log the rejected raw URL. No redirects, including same-origin; no credentials copied to another origin. Verify TLS. Do not send inference credentials to `/metrics` by default; use only a separately configured metrics credential if one already exists. No new connection/credential UX in MVP.
 
+Custom-endpoint credentials resolve with precedence inline `api_key` > `env_secret(key_env)` (`key_env`/`api_key_env` of a `custom_providers` entry, read through the inventory source's `env_lookup`; only the variable's *value* is ever used and it is registered as a redaction secret). A `key_env` whose variable is unset yields no credential and **no request at all** (`credential_expected`): card `auth_status: missing`, reason `credentials_missing`, health `unknown`. An entry with no credential and no `key_env` (e.g. Ollama) is still probed anonymously; an anonymous 401 there is reported as `credentials_missing` (never as a rejected credential, and with no `auth_required` error). `auth_required` / `auth_status: rejected` are reserved for a request that actually carried a bearer and got 401.
+
 Inject a stdlib HTTP implementation (urllib, redirect handler disabled); finite per-request timeout 2 seconds, maximum response 1 MiB, maximum four concurrent provider workers, overall refresh deadline 8 seconds. On deadline pending items become timeout; workers may finish within their transport timeout but may not overwrite a later snapshot. No in-request retry; refresh provides retry. Bound Prometheus parsing to known simple numeric samples: CPU percent and memory bytes only when names/units match an allowlist. Never render arbitrary labels, exemplars, process paths or raw exposition. Reject NaN/Infinity/negative byte counters; average per-core CPU samples, do not add percentages.
 
 Coalesce requests and cache immutable sanitized snapshots for 30 seconds, keyed by validated profile/home, provider/account identity and window. Capture context into each worker; never share credentials across homes. Changing profile invalidates frontend state and starts new requests; discard late responses with an epoch counter. No raw credential-bearing HTTP payload persistence. Browser/API: Cache-Control: no-store. UI displays checked_at and stale status; no automatic stale-error-success substitution. Manual Refresh invokes normal endpoints (no unsupported refresh parameter); may hit the 30-second cache. Explain this in tooltip. Initial load then poll every 60 seconds while visible; stop when hidden.
@@ -129,7 +131,7 @@ SubscriptionCard {
   kind: cloud | self_hosted,
   plan_name: string|null,
   plan_source: unverified_claim | provider | none,
-  auth_status: available | missing,  # presence only, NOT validity
+  auth_status: available | missing | rejected,  # available = presence only, NOT validity; missing = no credential, none sent; rejected = a credential WAS sent and the provider answered 401
   endpoint_id: string|null,
   state: CardState, confidence: ConfidenceLabel,
   reason: Reason,

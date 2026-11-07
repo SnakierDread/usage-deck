@@ -103,7 +103,7 @@ ENUMS = {
     "state": {"ready", "error", "opaque", "empty"},
     "kind": {"cloud", "self_hosted"},
     "plan_source": {"unverified_claim", "provider", "none"},
-    "auth_status": {"available", "missing"},
+    "auth_status": {"available", "missing", "rejected"},
     "unit": {"usd", "count", "percent", "bytes"},
     "meter_scope": {"api_credential", "provider_account", "endpoint", "profile"},
     "series_scope": {"profile", "provider", "account"},

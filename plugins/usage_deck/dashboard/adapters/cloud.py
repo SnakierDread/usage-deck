@@ -129,6 +129,10 @@ class AnthropicAdapter(OpaqueCloudAdapter):
 class OpenRouterAdapter(BaseAdapter):
     adapter_name = "OpenRouterAdapter"
     source_label = "openrouter_key"
+    _rejected = False
+
+    def credential_rejected(self) -> bool:
+        return self._rejected
 
     def _do_probe(self) -> ProbeResult:
         # Capability probe only: a missing key is reported by get_usage, and
@@ -152,6 +156,7 @@ class OpenRouterAdapter(BaseAdapter):
             return UsageResult(reason="permission_denied")
         failure = error_for_status(response.status, ctx.provider_id, ctx.account_id)
         if failure is not None:
+            self._rejected = response.status == 401  # the bearer above was sent and refused
             return UsageResult(error=failure)
         malformed = UsageResult(error=make_error("malformed_response", ctx.provider_id, ctx.account_id))
         try:
