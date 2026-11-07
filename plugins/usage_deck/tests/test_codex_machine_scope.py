@@ -49,22 +49,24 @@ class CodexMachineScope(ServiceBase, SchemaAsserts):
 
     # -------------------------------------------------------------- selected-source success
 
-    def test_selected_profile_credential_is_sent_with_its_own_routing(self):
+    def test_selected_and_cross_profile_credentials_each_go_out_with_their_own_routing(self):
         mine = codex_token(account="udsyn-acct-S", user="udsyn-user-S", residency="udsyn-region-S", jti="mine")
         other = codex_token(account="udsyn-acct-O", user="udsyn-user-O", residency="udsyn-region-O", jti="other")
         self.seed({"id": "w1", "access_token": mine})                       # selected profile 'work'
-        self.s.write_profile("verifier", self.pool(("v1", other)))          # machine-only seat
+        self.s.write_profile("verifier", self.pool(("v1", other)))          # another profile's seat (§13)
         cards = self.codex(view="machine")
         self.assertEqual(len(cards), 2)
-        self.assertEqual(self.sent(), [("Bearer " + mine, "udsyn-acct-S", "udsyn-region-S")])
-        live = [c for c in cards if c["state"] == "ready"]
-        (card,) = live
-        self.assertEqual((card["confidence"], card["reason"], card["error"], card["auth_status"]),
-                         ("exact", None, None, "available"))
-        (m,) = card["meters"]
-        self.assertEqual((m["id"], m["unit"], m["source"], m["value"], m["limit"], m["remaining"]),
-                         ("workspace_spend", "credit", "chatgpt_wham_usage", 864.5, 1500.0, 635.5))
-        self.assertEqual([h["profile"] for h in card["holders"]], ["work"])
+        # one request per seat; the bearer and routing claims of each come from that seat's own token
+        self.assertEqual(sorted(self.sent()), sorted([("Bearer " + mine, "udsyn-acct-S", "udsyn-region-S"),
+                                                      ("Bearer " + other, "udsyn-acct-O", "udsyn-region-O")]))
+        self.assertEqual([c["state"] for c in cards], ["ready", "ready"])
+        for card in cards:
+            self.assertEqual((card["confidence"], card["reason"], card["error"], card["auth_status"]),
+                             ("exact", None, None, "available"))
+            (m,) = card["meters"]
+            self.assertEqual((m["id"], m["unit"], m["source"], m["value"], m["limit"], m["remaining"]),
+                             ("workspace_spend", "credit", "chatgpt_wham_usage", 864.5, 1500.0, 635.5))
+        self.assertEqual(sorted(h["profile"] for c in cards for h in c["holders"]), ["verifier", "work"])  # attribution kept
 
     def test_global_fallback_is_the_selected_profiles_effective_source(self):
         glob = codex_token(account="udsyn-acct-G", user="udsyn-user-G", residency="udsyn-region-G", jti="g")
@@ -74,9 +76,9 @@ class CodexMachineScope(ServiceBase, SchemaAsserts):
         self.assertEqual(cards[0]["state"], "ready")
         self.assertEqual(self.sent(), [("Bearer " + glob, "udsyn-acct-G", "udsyn-region-G")])
 
-    # -------------------------------------------------------------- machine-only: zero egress
+    # -------------------------------------------------------------- other profiles' seats (DESIGN §13)
 
-    def test_machine_only_codex_holders_issue_no_request_and_supply_no_credential(self):
+    def test_machine_view_reads_other_profiles_codex_seats_with_their_own_credential(self):
         self.s.write_auth({"credential_pool": {}})                         # work and global hold no Codex row
         a = codex_token(account="udsyn-acct-A", user="udsyn-user-A", residency="zq", jti="a")
         b = codex_token(account="udsyn-acct-B", user="udsyn-user-B", residency="udsyn-region-B", jti="b")
@@ -85,23 +87,58 @@ class CodexMachineScope(ServiceBase, SchemaAsserts):
         svc = self.make()
         cards = self.codex(svc=svc, view="machine")
         self.assertEqual(len(cards), 2)
-        self.assertEqual(self.transport.requests, [])                      # zero egress of any kind
+        self.assertEqual(sorted(self.sent()), sorted([("Bearer " + a, "udsyn-acct-A", "zq"),
+                                                      ("Bearer " + b, "udsyn-acct-B", "udsyn-region-B")]))
         for card in cards:
-            self.assertEqual((card["state"], card["confidence"], card["reason"], card["error"], card["meters"]),
-                             ("opaque", "opaque", "source_unavailable", None, []))
-            self.assertEqual(card["auth_status"], "available")             # presence of the holder's row only
-        # item level: no credential, not live, and the service grants no outbound target at all
+            self.assertEqual((card["state"], card["confidence"], card["reason"], card["error"]),
+                             ("ready", "exact", None, None))
+            self.assertEqual(len(card["meters"]), 1)
+        # item level: the credential comes from the holder, the item is flagged cross-profile, and the
+        # service grants nothing but the one wham GET (read-only allowlist, in code)
         src = FileInventorySource(self.s.home, self.s.root, config_loader=lambda: {"model": {}},
                                   custom_provider_loader=lambda c: [], env_lookup=lambda n: None)
         items = [i for i in discover_machine(src) if i.provider_id == "openai-codex"]
         self.assertEqual(len(items), 2)
         for item in items:
-            self.assertEqual((item.credential, item.live_source), (None, False))
-            ctx = svc._context(item, None, NOW)
-            self.assertFalse(ctx.live_source)
-            with self.assertRaises(TransportError):  # the guard has no allowed target: the URL is refused unsent
-                ctx.transport.get(CODEX_USAGE_URL, headers={})
+            self.assertTrue(item.live_source and item.cross_profile)
+            self.assertIsNotNone(item.credential)
+            ctx = svc._context(item, None, NOW, machine_view=True)
+            self.transport.requests.clear()
+            for url in ("https://chatgpt.com/backend-api/usage", "https://chatgpt.com/backend-api/wham/usage?x=1",
+                        "https://api.openai.com/v1/usage", "https://chatgpt.com.evil.example/backend-api/wham/usage"):
+                with self.assertRaises(TransportError):
+                    ctx.transport.get(url, headers={})
+            with self.assertRaises(TransportError):
+                ctx.transport.request("POST", CODEX_USAGE_URL, headers={})
+            self.assertEqual(self.transport.requests, [])
+            ctx.transport.get(CODEX_USAGE_URL, headers={})
+            self.assertEqual(len(self.transport.requests), 1)
+
+    def test_cross_profile_item_outside_the_machine_view_is_inventory_only_again(self):
+        # Defence in depth: even a hand-built cross-profile item gets no credential/target from the service
+        # unless the deck being built is the machine view.
+        self.s.write_auth({"credential_pool": {}})
+        self.s.write_profile("a", self.pool(("a1", codex_token(account="udsyn-acct-A", user="udsyn-user-A", jti="a"))))
+        svc = self.make()
+        src = FileInventorySource(self.s.home, self.s.root, config_loader=lambda: {"model": {}},
+                                  custom_provider_loader=lambda c: [], env_lookup=lambda n: None)
+        (item,) = [i for i in discover_machine(src) if i.provider_id == "openai-codex"]
+        self.assertTrue(item.cross_profile)
+        ctx = svc._context(item, None, NOW, machine_view=False)
+        self.assertEqual((ctx.credential, ctx.live_source, ctx.cross_profile), (None, False, False))
+        with self.assertRaises(TransportError):
+            ctx.transport.get(CODEX_USAGE_URL, headers={})
         self.assertEqual(self.transport.requests, [])
+
+    def test_profile_view_never_spends_another_profiles_credential(self):
+        self.s.write_auth({"credential_pool": {}})
+        self.s.write_profile("verifier", self.pool(("v1", codex_token(account="udsyn-acct-V", user="udsyn-user-V", jti="v"))))
+        for query in ([("view", "profile")], [("view", "machine")]):
+            status, body = self.make().handle("subscriptions", query, profile_only=True)  # restricted principal
+            self.assertEqual((status, body["data"]["view"], body["data"]["cards"]), (200, "profile", []))
+        status, body = self.make().handle("subscriptions", [("view", "profile")])
+        self.assertEqual(body["data"]["cards"], [])
+        self.assertEqual(self.transport.requests, [])                      # zero egress: nothing of verifier's left
 
     def test_machine_only_adapter_is_inert_even_if_a_credential_and_target_were_wired(self):
         # Defence in depth: the adapter itself refuses on live_source=False (probe and usage).

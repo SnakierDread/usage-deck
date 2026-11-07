@@ -790,10 +790,11 @@ class CodexService(ServiceBase, SchemaAsserts):
         self.assertEqual([h["ChatGPT-Account-ID"] for _, h, _ in self.transport.requests], ["udsyn-acct-PROFILE"])
         self.assertEqual(self.transport.requests[0][1]["Authorization"], "Bearer " + profile_token)
 
-    def test_machine_view_sends_only_the_selected_profiles_account_with_its_own_credential(self):
-        # Was "each merged account": the isolation rule (DESIGN §12.5) narrows that. 'work' has no codex row, so
-        # the global pool is its effective one: seat A (global + architect copy) is live with the GLOBAL token;
-        # seat B is held by 'verifier' alone, i.e. machine-only inventory: no request, no credential.
+    def test_machine_view_sends_each_seat_with_its_own_credential(self):
+        # DESIGN §13 (user-ratified 2026-11-07) supersedes the §12.5 narrowing: 'work' has no codex row, so
+        # the global pool is its effective one: seat A (global + architect copy) is read with the GLOBAL
+        # token (the selected profile's own source is preferred); seat B is held by 'verifier' alone and is
+        # read with the verifier's own token (cross-profile meter read). One request per seat.
         seat_a = codex_token(account="udsyn-acct-A", user="u1", jti="1")
         seat_a_again = codex_token(account="udsyn-acct-A", user="u1", jti="2")  # refreshed token of the same seat
         seat_b = codex_token(account="udsyn-acct-A", user="u2", jti="3")
@@ -803,9 +804,10 @@ class CodexService(ServiceBase, SchemaAsserts):
         self.transport.routes[CODEX_USAGE_URL] = json_response(limit_body())
         cards = self.codex(view="machine")
         self.assertEqual(len(cards), 2)  # two seats of one workspace stay two accounts
-        self.assertEqual(len(self.transport.requests), 1)
-        self.assertEqual(self.transport.requests[0][1]["Authorization"], "Bearer " + seat_a)
-        self.assertEqual(sorted((c["state"], c["reason"]) for c in cards), [("opaque", "source_unavailable"), ("ready", None)])
+        self.assertEqual(len(self.transport.requests), 2)
+        self.assertEqual(sorted(r[1]["Authorization"] for r in self.transport.requests),
+                         sorted(["Bearer " + seat_a, "Bearer " + seat_b]))  # never the architect copy
+        self.assertEqual(sorted((c["state"], c["reason"]) for c in cards), [("ready", None), ("ready", None)])
 
     def test_other_providers_never_reach_the_codex_route(self):
         self.s.write_auth({"credential_pool": {

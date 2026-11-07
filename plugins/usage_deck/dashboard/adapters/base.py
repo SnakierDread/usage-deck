@@ -114,6 +114,10 @@ class AdapterContext:
     #: False for machine-only inventory (no member belongs to the selected profile's effective
     #: credentials/config): adapters must make NO outbound request (DESIGN.md §12.5).
     live_source: bool = True
+    #: True when the credential (or, for self-hosted, the endpoint) belongs to a profile other than the
+    #: selected one: machine-view exemption (DESIGN.md §13), meter reads through the read-only probe
+    #: allowlist only. A self-hosted card in this mode scrapes ``/metrics`` anonymously and nothing else.
+    cross_profile: bool = False
     # key_env named an env var with no value: a credential is expected but absent.
     credential_expected: bool = False
 

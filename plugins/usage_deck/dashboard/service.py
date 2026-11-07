@@ -24,7 +24,7 @@ from .adapters.analytics import HostAnalyticsReader, MemoAnalyticsReader
 from .adapters.base import AdapterContext, AnalyticsReader, EndpointCache
 from .adapters.cloud import CODEX_PROVIDER_ID, CODEX_TARGET, OPENROUTER_TARGET
 from .adapters.fallback import SessionAnalyticsAdapter
-from .adapters.transport import AllowedTarget, GuardedTransport, UrllibTransport
+from .adapters.transport import AllowedTarget, CrossProfileProbeTransport, GuardedTransport, UrllibTransport
 from .captures import CaptureStore
 from .discovery import InventoryItem, InventoryUnavailable, discover, discover_machine, host_inventory_source
 from .models.dto import (
@@ -295,6 +295,10 @@ class UsageDeckService:
         endpoints = EndpointCache()
         health_owner: Dict[str, str] = {}
         for item in items:  # a card with a live source owns the endpoint's single health row
+            # (the selected profile's own card first; a cross-profile scrape only when nothing else is live)
+            if item.endpoint_id and item.live_source and not item.cross_profile and item.endpoint_id not in health_owner:
+                health_owner[item.endpoint_id] = item.account_id
+        for item in items:
             if item.endpoint_id and item.live_source and item.endpoint_id not in health_owner:
                 health_owner[item.endpoint_id] = item.account_id
         for item in items:
@@ -307,7 +311,8 @@ class UsageDeckService:
             for item in items:
                 owns_health = bool(item.endpoint_id) and health_owner.get(item.endpoint_id) == item.account_id
                 ctx = contextvars.copy_context()  # a Context may only be entered once at a time
-                futures[executor.submit(ctx.run, self._run_item, item, reader, now, owns_health, endpoints, captures)] = item
+                futures[executor.submit(ctx.run, self._run_item, item, reader, now, owns_health, endpoints, captures,
+                                        view == "machine")] = item
             done, _pending = wait(list(futures), timeout=self._deadline)
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
@@ -339,15 +344,30 @@ class UsageDeckService:
 
     def _context(self, item: InventoryItem, reader: AnalyticsReader, now: datetime,
                  endpoints: Optional[EndpointCache] = None,
-                 captures: Optional[CaptureStore] = None) -> AdapterContext:
+                 captures: Optional[CaptureStore] = None,
+                 machine_view: bool = False) -> AdapterContext:
+        # Defence in depth (DESIGN.md §13): a cross-profile item outside the machine view is local
+        # inventory again, whatever produced it: no credential, no live source, no target.
+        blocked = item.cross_profile and not machine_view
         targets: List[AllowedTarget] = []
-        if item.live_source:  # machine-only inventory never gets an outbound target (DESIGN.md §12.5)
-            if item.provider_id.lower() == "openrouter":
-                targets.append(OPENROUTER_TARGET)
+        transport: Any
+        if item.cross_profile and not blocked:
+            # DESIGN.md §13: another profile's credential/endpoint, dashboard MACHINE view only, read-only
+            # usage probes only (the ceiling in ``CROSS_PROFILE_PROBES`` is re-checked on every request).
             if item.provider_id.strip().lower() == CODEX_PROVIDER_ID:
-                targets.append(CODEX_TARGET)  # DESIGN.md §9.2: fixed, never derived from claims/config/response
-            if item.endpoint is not None and item.endpoint.safe:
-                targets.append(AllowedTarget(item.endpoint.scheme, item.endpoint.host, item.endpoint.port, None))
+                targets.append(CODEX_TARGET)
+            elif item.endpoint is not None and item.endpoint.safe:
+                targets.append(AllowedTarget(item.endpoint.scheme, item.endpoint.host, item.endpoint.port, ("/metrics",)))
+            transport = CrossProfileProbeTransport(GuardedTransport(self._transport, targets))
+        else:
+            if item.live_source and not blocked:  # machine-only inventory never gets an outbound target (§12.5)
+                if item.provider_id.lower() == "openrouter":
+                    targets.append(OPENROUTER_TARGET)
+                if item.provider_id.strip().lower() == CODEX_PROVIDER_ID:
+                    targets.append(CODEX_TARGET)  # DESIGN.md §9.2: fixed, never derived from claims/config/response
+                if item.endpoint is not None and item.endpoint.safe:
+                    targets.append(AllowedTarget(item.endpoint.scheme, item.endpoint.host, item.endpoint.port, None))
+            transport = GuardedTransport(self._transport, targets)
         return AdapterContext(
             provider_id=item.provider_id,
             account_id=item.account_id,
@@ -355,27 +375,28 @@ class UsageDeckService:
             account_label=item.account_label,
             kind=item.kind,
             analytics=reader,
-            transport=GuardedTransport(self._transport, targets),
+            transport=transport,
             clock=lambda: now,
             endpoint=item.endpoint,
             endpoint_id=item.endpoint_id,
-            credential=item.credential,
+            credential=None if blocked else item.credential,
             auth_status=item.auth_status,
             plan_name=item.plan_name,
             plan_source=item.plan_source,
             secrets=item.secrets,
-            health_credential=item.health_credential,
+            health_credential=None if blocked else item.health_credential,
             endpoint_cache=endpoints,
             credential_refs=item.credential_refs,
             captures=captures,
-            live_source=item.live_source,
+            live_source=item.live_source and not blocked,
+            cross_profile=item.cross_profile and not blocked,
             credential_expected=item.credential_expected,
         )
 
     def _run_item(self, item: InventoryItem, reader: AnalyticsReader, now: datetime,
                   owns_health: bool, endpoints: Optional[EndpointCache] = None,
-                  captures: Optional[CaptureStore] = None) -> Tuple[dict, Optional[dict]]:
-        adapter = create_adapter(self._context(item, reader, now, endpoints, captures))
+                  captures: Optional[CaptureStore] = None, machine_view: bool = False) -> Tuple[dict, Optional[dict]]:
+        adapter = create_adapter(self._context(item, reader, now, endpoints, captures, machine_view))
         probe = adapter.probe()
         usage = adapter.get_usage(DEFAULT_WINDOW)
         health: Optional[HealthStripEntry] = adapter.get_health() if owns_health else None

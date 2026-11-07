@@ -65,8 +65,9 @@
     "openai-codex": "No Codex spend meter for this account: UsageDeck reads only the ChatGPT workspace spend control, and this account has none it can show right now (no usable credential, an unrecognised or expired reading, or access was not permitted). Nothing is estimated. Any plan shown is an unverified claim from the credential.",
     anthropic: "No Anthropic session/weekly meter: no usable capture for this credential. No usable capture; enable the optional observer and use this account normally. A meter can only appear after an ordinary request returns eligible headers (DESIGN.md §12.1). Nothing is estimated.",
   };
-  // Machine view only (DESIGN.md §12.5): inventory of other profiles' accounts is listed, never used live.
-  const MACHINE_ONLY_NOTE = "No live source from this profile: in the machine view, an account held only by other profiles is local inventory, and UsageDeck never uses another profile's credentials for outbound requests. Open the holder's profile to check it live.";
+  // Machine view only (DESIGN.md §12.5, amended by §13): the machine view reads meters with any local profile's
+  // credential, but only through the documented read-only usage probes; other accounts stay local inventory.
+  const MACHINE_ONLY_NOTE = "No live source for this account: the machine view reads meters with any local profile's credential only through the documented read-only usage probes (Codex spend control, endpoint /metrics), and none exists for this account, so it is local inventory. Nothing is estimated.";
   const SCOPE_LABEL = {
     api_credential: "API credential",
     provider_account: "Provider account",
@@ -994,7 +995,7 @@
         !metricsOk && !de ? h("span", { className: "ud-muted ud-small" }, "Metrics unavailable") : null,
         reason && !de ? h("span", { className: "ud-muted ud-small" }, reason) : null,
         props.machine && statusKey === "unknown" && e.reason === "source_unavailable" && !de
-          ? h("span", { className: "ud-muted ud-small", "data-machine-only-note": "true", title: MACHINE_ONLY_NOTE }, "Not probed from this profile") : null,
+          ? h("span", { className: "ud-muted ud-small", "data-machine-only-note": "true", title: MACHINE_ONLY_NOTE }, "Not probed") : null,
         de ? h("span", { className: "ud-small ud-health-err", role: "note" }, "⚠ " + de.message) : null);
     }
 

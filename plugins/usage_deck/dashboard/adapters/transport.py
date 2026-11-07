@@ -143,3 +143,71 @@ class GuardedTransport:
                 continue  # exact-path targets take no query (not even an empty one)
             return self._inner.get(url, headers, timeout, max_bytes)
         raise TransportError(TransportError.FORBIDDEN_URL)
+
+
+# ------------------------------------------------- machine-view cross-profile probes
+#
+# DESIGN.md §13 (user-ratified 2026-11-07): the dashboard MACHINE view may read a usage meter with ANY
+# local profile's credential, but only through the documented read-only usage probes below. This table is
+# the code-enforced ceiling (method + origin + exact path); it is checked on every request made with a
+# credential that does not belong to the selected profile, in addition to the per-item AllowedTarget.
+
+@dataclass(frozen=True)
+class ProbeShape:
+    """One permitted read-only probe. ``host=None`` means "the inventory-configured endpoint origin"."""
+
+    method: str
+    scheme: Optional[str]
+    host: Optional[str]
+    port: Optional[int]
+    path: str
+
+
+CROSS_PROFILE_PROBES: Tuple[ProbeShape, ...] = (
+    ProbeShape("GET", "https", "chatgpt.com", 443, "/backend-api/wham/usage"),
+    # Reserved ceiling entry: no adapter issues this request today; adding the probe needs its own decision.
+    ProbeShape("GET", "https", "api.anthropic.com", 443, "/api/oauth/usage"),
+    ProbeShape("GET", None, None, None, "/metrics"),
+)
+
+
+def probe_allowed(method: str, url: str) -> bool:
+    """True only for a GET that matches a ``CROSS_PROFILE_PROBES`` shape exactly (no query, no userinfo)."""
+    if method != "GET":
+        return False
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return False
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if port == 0 or "@" in parts.netloc or "#" in url or "?" in url or scheme not in ("http", "https") or not host:
+        return False
+    for shape in CROSS_PROFILE_PROBES:
+        if shape.path != parts.path:
+            continue
+        if shape.host is None:
+            return True  # endpoint /metrics: the origin itself is pinned by the item's AllowedTarget
+        if (shape.scheme, shape.host) == (scheme, host) and _effective_port(scheme, shape.port) == _effective_port(scheme, port):
+            return True
+    return False
+
+
+class CrossProfileProbeTransport:
+    """Read-only guard for requests made with a credential that is not the selected profile's.
+
+    ``get`` passes only ``CROSS_PROFILE_PROBES`` shapes on to the (item-scoped) guarded transport;
+    ``request`` refuses every method but GET, so a write verb can never be issued through it.
+    """
+
+    def __init__(self, inner: HttpTransport):
+        self._inner = inner
+
+    def request(self, method, url, headers=None, timeout=DEFAULT_TIMEOUT_S, max_bytes=MAX_RESPONSE_BYTES) -> HttpResponse:
+        if not probe_allowed(str(method).upper(), url):
+            raise TransportError(TransportError.FORBIDDEN_URL)
+        return self._inner.get(url, headers, timeout, max_bytes)
+
+    def get(self, url, headers=None, timeout=DEFAULT_TIMEOUT_S, max_bytes=MAX_RESPONSE_BYTES) -> HttpResponse:
+        return self.request("GET", url, headers, timeout, max_bytes)
