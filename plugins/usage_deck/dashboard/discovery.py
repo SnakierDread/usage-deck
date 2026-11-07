@@ -42,6 +42,7 @@ _LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.:/@+-]{0,63}$")
 _CRED_FIELDS = ("access_token", "agent_key", "api_key")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 MAX_AUTH_BYTES = 4 * 1024 * 1024
+MAX_HOME_FILE_BYTES = 1024 * 1024  # a sibling home's config.yaml / .env (DESIGN.md §13)
 MAX_PROFILES = 64
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 GLOBAL_PROFILE = "global"
@@ -68,11 +69,18 @@ class RawInventory:
 
 @dataclass(frozen=True)
 class StoreRead:
-    """One auth store (the global root or one profile) read on its own: no shadowing, no config."""
+    """One home (the global root or one profile) read on its own: no shadowing.
+
+    ``raw`` carries that home's auth pool and, for every home OTHER than the one being viewed, its own
+    ``config.yaml`` custom endpoints (DESIGN.md §13). ``env`` resolves a ``key_env`` name against that
+    home's ``.env`` ONLY (never ``os.environ`` or another home); it is None where no sibling ``.env`` was
+    read, and it is never part of equality or ``repr``.
+    """
 
     profile: str
     is_global: bool
     raw: RawInventory
+    env: Optional[Callable[[str], Optional[str]]] = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -141,6 +149,40 @@ def _dict_section(store: Optional[dict], key: str) -> Dict[str, Any]:
     return section if isinstance(section, dict) else {}
 
 
+def _bounded_regular_file(path: Path) -> bool:
+    """A real (non-symlink) file of bounded size: the only kind of sibling-home file ever opened."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        return path.stat().st_size <= MAX_HOME_FILE_BYTES
+    except OSError:
+        return False
+
+
+def host_home_config(directory: Path) -> Optional[dict]:
+    """Parsed ``<directory>/config.yaml`` through the host's shared safe YAML reader, or None.
+
+    A pure read of exactly one file: never the host's ``load_config`` (it creates directories, writes
+    backups and expands ``${VAR}`` against the running process), so a sibling home is never modified and
+    no value is resolved against the wrong environment.
+    """
+    path = Path(directory) / "config.yaml"
+    if not _bounded_regular_file(path):
+        return None
+    from utils import fast_safe_load  # type: ignore  # host helper, lazy
+    data = fast_safe_load(path.read_text(encoding="utf-8-sig"))
+    return data if isinstance(data, dict) else None
+
+
+def host_home_env(directory: Path) -> Dict[str, str]:
+    """Assignments of ``<directory>/.env`` through the host's one ``.env`` tokenizer (dict only)."""
+    path = Path(directory) / ".env"
+    if not _bounded_regular_file(path):
+        return {}
+    from agent.secret_scope import load_env_file  # type: ignore  # host helper, lazy; never touches os.environ
+    return load_env_file(path)
+
+
 class FileInventorySource:
     """Inventory from ``<home>/auth.json`` (+ optional global root) and a config loader.
 
@@ -156,7 +198,11 @@ class FileInventorySource:
         config_loader: Optional[Callable[[], Dict[str, Any]]] = None,
         custom_provider_loader: Optional[Callable[[Dict[str, Any]], List[Dict[str, Any]]]] = None,
         env_lookup: Optional[Callable[[str], Optional[str]]] = None,
+        home_config_loader: Optional[Callable[[Path], Optional[Dict[str, Any]]]] = None,
+        home_env_loader: Optional[Callable[[Path], Dict[str, str]]] = None,
     ):
+        self._home_config_loader = home_config_loader
+        self._home_env_loader = home_env_loader
         self._home = Path(home)
         self._global = Path(global_home) if global_home else None
         self._config_loader = config_loader
@@ -193,8 +239,47 @@ class FileInventorySource:
     def captures_path(self) -> Path:
         return default_store_path(self.root_dir())
 
+    def _sibling_config(self, directory: Path, name: str) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """(custom endpoints, primary) from ANOTHER home's own ``config.yaml``; empty when unreadable."""
+        if self._home_config_loader is None or self._custom_loader is None:
+            return [], None
+        try:
+            config = self._home_config_loader(directory)
+            if not isinstance(config, dict) or not config:
+                return [], None
+            custom = [dict(e) for e in self._custom_loader(config) if isinstance(e, dict)]
+        except Exception:  # noqa: BLE001 - a sibling's broken config never breaks the viewed home
+            log.warning("usage_deck: skipped an unreadable config (%s)", name)
+            return [], None
+        primary = None
+        model = config.get("model")
+        if isinstance(model, dict):
+            provider = model.get("provider")
+            if isinstance(provider, str) and provider.strip():
+                primary = {"provider": provider.strip(), "base_url": model.get("base_url")}
+        return custom, primary
+
+    def _sibling_env(self, directory: Path, name: str,
+                     custom: List[Dict[str, Any]]) -> Optional[Callable[[str], Optional[str]]]:
+        """``key_env`` lookup over ANOTHER home's ``.env`` alone, limited to the variables its custom
+        endpoints name (every other secret in the file is dropped at once, never retained)."""
+        wanted = {k for k in (_key_env_of(e) for e in custom) if k}
+        if self._home_env_loader is None or not wanted:
+            return None
+        try:
+            mapping = self._home_env_loader(directory)
+        except Exception:  # noqa: BLE001
+            log.warning("usage_deck: skipped an unreadable env file (%s)", name)
+            return None
+        values = {k: v for k, v in (mapping.items() if isinstance(mapping, dict) else ())
+                  if k in wanted and isinstance(v, str) and v}
+        if not values:
+            return None
+        return values.get
+
     def read_stores(self) -> List[StoreRead]:
-        """Read global ``auth.json`` and every ``profiles/<name>/auth.json`` on their own.
+        """Read global ``auth.json`` and every ``profiles/<name>/auth.json`` on their own, plus (for
+        every home other than the viewed one) that home's own ``config.yaml`` endpoints and ``.env``.
 
         Only real directories under ``<root>/profiles`` whose names are valid profile names, and only
         non-symlink ``auth.json`` files, are read, so nothing outside the Hermes root is ever opened.
@@ -217,16 +302,22 @@ class FileInventorySource:
         stores: List[StoreRead] = []
         for name, is_global, directory in candidates:
             auth = directory / "auth.json"
+            data: Optional[dict] = None
             try:
-                if auth.is_symlink() or not auth.is_file():
-                    continue
-                data = _load_json(auth)
+                if not auth.is_symlink() and auth.is_file():
+                    data = _load_json(auth)
             except (InventoryUnavailable, OSError):
                 if directory.resolve() == current:
                     raise InventoryUnavailable("auth store unreadable") from None
                 log.warning("usage_deck: skipped an unreadable auth store (%s)", name)
                 continue
-            if data is None:
+            custom: List[Dict[str, Any]] = []
+            primary: Optional[Dict[str, Any]] = None
+            env_lookup: Optional[Callable[[str], Optional[str]]] = None
+            if directory.resolve() != current:  # the viewed home's config/.env follow the profile-view path
+                custom, primary = self._sibling_config(directory, name)
+                env_lookup = self._sibling_env(directory, name, custom)
+            if data is None and not custom and primary is None:
                 continue
             pool: Dict[str, List[Dict[str, Any]]] = {}
             for provider, entries in _dict_section(data, "credential_pool").items():
@@ -238,8 +329,8 @@ class FileInventorySource:
                       if isinstance(entry, dict) and str(provider) not in pool}
             holder = (is_global, name)
             stores.append(StoreRead(name, is_global, RawInventory(
-                str(directory.resolve()), pool, legacy, [], None,
-                {provider: holder for provider in pool}, {provider: holder for provider in legacy})))
+                str(directory.resolve()), pool, legacy, custom, primary,
+                {provider: holder for provider in pool}, {provider: holder for provider in legacy}), env_lookup))
         return stores
 
     def read(self) -> RawInventory:
@@ -322,6 +413,8 @@ def host_inventory_source() -> FileInventorySource:
         config_loader=load_config,
         custom_provider_loader=lambda cfg: get_compatible_custom_providers(cfg),
         env_lookup=get_env_value,
+        home_config_loader=host_home_config,
+        home_env_loader=host_home_env,
     )
 
 
@@ -635,6 +728,10 @@ def _machine_identity(holder: Holder, item: InventoryItem) -> str:
     normalized = item.endpoint.normalized if item.endpoint else None
     if item.jwt_pair is not None:
         return identity_json(["jwt", item.provider_id, normalized, item.jwt_pair[0], item.jwt_pair[1]])
+    if getattr(item, "origin", None) == "config" and normalized is not None:
+        # A configured endpoint with no pool row is the box itself (no account behind it): homes that
+        # configure the same provider at the same endpoint are one card with several holders (§13).
+        return identity_json(["config", item.provider_id, normalized])
     return identity_json(["row", holder.is_global, holder.profile, item.provider_id, normalized, item.row_ref])
 
 
@@ -694,8 +791,12 @@ def discover_machine(source: Any) -> List[InventoryItem]:
 
     for store in source.read_stores():
         holder = Holder(store.profile, store.is_global)
-        for item in discover(_StaticSource(store.raw, None)):  # no env fallback: it belongs to the selected profile
+        # ``store.env`` is the home's OWN ``.env`` (None for the viewed home, whose env is ``env`` below): a
+        # sibling's ``key_env`` is resolved in its owning home alone, never against another home or process.
+        for item in discover(_StaticSource(store.raw, store.env)):
             selected = _is_selected_source(holder, item, raw)
+            if not selected and item.origin == "config" and item.endpoint is None:
+                continue  # another home's cloud provider without an account is not a subscription (§13)
             if selected and not item.credential and item.provider_id.lower() == "openrouter" and env:
                 secret = env("OPENROUTER_API_KEY")
                 if isinstance(secret, str) and secret:
@@ -739,6 +840,12 @@ def discover_machine(source: Any) -> List[InventoryItem]:
         # profile's store may, but only where a documented read-only usage probe exists for the provider.
         cross = None if usable is not None else _cross_profile_member(members)
         cross_live = cross is not None or (not selected_any and _metrics_scrapable(first))
+        if health_usable is None and cross_live and _metrics_scrapable(first):
+            # The owning home's own ``key_env`` secret, resolved from its own ``.env``, authenticates the one
+            # same-origin ``/metrics`` scrape (the policy of §9.1 self-hosted probe auth). Nothing else of
+            # another home is ever sent: not an inline ``api_key``, not a pool row, not a models probe.
+            health_usable = next((item for _holder, item, _selected in members
+                                  if item.health_credential is not None), None)
         plan = next((i for i in items if i.plan_name), None)
         secrets = frozenset().union(*(i.secrets for i in items))
         refs = tuple(dict.fromkeys(r for i in items for r in i.credential_refs))
@@ -761,8 +868,8 @@ def discover_machine(source: Any) -> List[InventoryItem]:
             secrets=secrets,
             credential_refs=refs,
             identity_key=identity,
-            credential_expected=usable is None and any(
-                i.credential_expected for _holder, i, selected in members if selected),
+            credential_expected=usable is None and health_usable is None and any(
+                i.credential_expected for _holder, i, selected in members if selected or cross_live),
             holders=tuple(holders),
             live_source=selected_any or cross_live,
             cross_profile=cross_live,

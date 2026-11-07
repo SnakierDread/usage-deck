@@ -224,13 +224,26 @@ class HonestTaxonomyWithoutAKey(Base):
         self.assertEqual(entry["confidence"], "opaque")
         self.assertEqual(scan_for(envelopes, [SENTINEL_TOKEN]), [])
 
-    def test_machine_only_member_makes_no_request(self):
-        """Another profile's key_env/credentials are inventory only: the viewed home alone supplies them."""
+    def test_machine_only_member_scrapes_metrics_anonymously_only(self):
+        """DESIGN.md §13 (user authority 2026-11-07) supersedes the old no-request rule for the MACHINE view:
+        another profile's endpoint gets ONE read-only ``/metrics`` GET, and its inference credential (here an
+        inline pool token) is never attached to it nor sent to any other route."""
         self.custom = []
         self.s.write_profile("other", {"credential_pool": {"custom:desktop": [
             {"id": "o1", "base_url": BOX + "/v1", "access_token": SENTINEL_TOKEN}]}})
         box = StrictBoxTransport(good=SENTINEL_TOKEN)
-        self.deck(box, view="machine")
+        _cards, _health, envelopes = self.deck(box, view="machine")
+        self.assertEqual([u for u, _h in box.requests], [BOX + "/metrics"])
+        self.assertEqual(box.auth_for("/metrics"), [None])
+        self.assertEqual(scan_for(envelopes, [SENTINEL_TOKEN]), [])
+
+    def test_machine_only_member_makes_no_request_in_the_profile_view(self):
+        """The profile/worker view never touches another profile's endpoint or credential."""
+        self.custom = []
+        self.s.write_profile("other", {"credential_pool": {"custom:desktop": [
+            {"id": "o1", "base_url": BOX + "/v1", "access_token": SENTINEL_TOKEN}]}})
+        box = StrictBoxTransport(good=SENTINEL_TOKEN)
+        self.deck(box, view="profile")
         self.assertEqual(box.requests, [])
 
 
@@ -360,10 +373,17 @@ class HostCredentialHelperDiskOnly(unittest.TestCase):
         self.assertEqual(cards[0]["auth_status"], "available")
         self.assertEqual(scan_for(envelopes, [ENV_VALUE, OTHER_VALUE, ROOT_VALUE]), [])
 
-    def test_machine_view_consults_only_the_running_homes_env(self):
+    def test_machine_view_never_borrows_another_homes_env_for_the_running_homes_box(self):
+        """The running home's own box carries only its own key. (DESIGN.md §13: the OTHER home's box is
+        also scraped now, but only on ``/metrics`` and anonymously here because its pool row's inline
+        token outranks its ``key_env``; the other home's token never leaves its own origin.)"""
         box = StrictBoxTransport()
         _cards, health, envelopes = self.deck(box, view="machine")
-        self.assert_only_this_home(box)
+        own = [(u, h) for u, h in box.requests if u.startswith(BOX + "/")]
+        other = [(u, h) for u, h in box.requests if u.startswith(OTHER_BOX + "/")]
+        self.assertEqual({h.get("Authorization") for _u, h in own}, {"Bearer " + ENV_VALUE})
+        self.assertEqual([(u, h.get("Authorization")) for u, h in other], [(OTHER_BOX + "/metrics", None)])
+        self.assertEqual(len(own) + len(other), len(box.requests))
         self.assertEqual([e["status"] for e in health if e["endpoint_id"] and "desktop" in e["provider_id"]],
                          ["healthy"])
         self.assertEqual(scan_for(envelopes, [ENV_VALUE, OTHER_VALUE, ROOT_VALUE]), [])
