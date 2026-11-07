@@ -177,6 +177,30 @@ class OptInRecords(ObserverBase):
         capture = self.read()
         self.assertEqual((capture.observed_at, capture.headers[P5 + "utilization"]), (NOW - timedelta(seconds=30), "0.25"))
 
+    def test_registered_hook_callback_roundtrips_payload_to_sink_and_flag_gates_it(self):
+        """The exact callable handed to ``register_hook`` (not a test-built Observer): flag off -> no file,
+        flag on -> one scoped entry, and the routing root never reaches the file or the log."""
+        ctx = RecordingContext()
+        with mock.patch.object(observer, "host_has_hook", return_value=True):
+            observer.register(ctx)
+        ((name, callback),) = ctx.hooks
+        self.assertEqual(name, "provider_ratelimit_headers")
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        live = payload(hermes_root=str(self.root), observed_at=stamp)
+        live["telemetry_schema_version"] = 1  # host envelope field, ignored
+        for config, expect_file in (({"usage_deck": {"capture_anthropic_headers": False}}, False), (ENABLED, True)):
+            with self.subTest(enabled=expect_file), mock.patch.object(
+                    observer, "host_context", return_value=HostContext(self.home, self.root, config)):
+                callback(**live)
+            self.assertEqual(self.store_path.exists(), expect_file)
+        (entry,) = json.loads(self.store_path.read_text())["captures"]
+        self.assertEqual((entry["credential_id"], entry["holder"], entry["observed_at"]),
+                         ("ant-row-1", {"profile": "work", "is_global": False}, stamp))
+        self.assertEqual(entry["headers"], GOOD_HEADERS)
+        text = self.store_path.read_text()
+        for private in (str(self.root), "hermes_root", "execution_profile", "telemetry_schema_version"):
+            self.assertNotIn(private, text)
+
     def test_global_fallback_row_is_attributed_to_the_global_holder_not_the_profile(self):
         self.fire(holder={"profile": "global", "is_global": True}, credential_id="g-row")
         (entry,) = json.loads(self.store_path.read_text())["captures"]
