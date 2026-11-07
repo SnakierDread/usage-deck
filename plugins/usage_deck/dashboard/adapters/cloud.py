@@ -45,10 +45,6 @@ _DECIMAL_RE = re.compile(r"-?[0-9]+(?:\.[0-9]+)?")
 _EPOCH_RE = re.compile(r"[0-9]+(?:\.0+)?")
 _MAX_TOKEN_CHARS = 16384
 _MAX_NUMBER_CHARS = 64
-#: Residency values shorter than this are not added to the masking context: a two-letter region
-#: code is a routing hint, not a secret, and masking it would corrupt unrelated text (plan
-#: "business" for region "us"). The account id is always masked.
-_MIN_MASKED_RESIDENCY = 4
 
 
 @dataclass(frozen=True)
@@ -66,7 +62,7 @@ class CodexRouting:
     def masking_values(self) -> frozenset:
         """Values to add to the private masking context (DESIGN.md §9.2 term 2)."""
         values = {self.account_id}
-        if self.residency is not None and len(self.residency) >= _MIN_MASKED_RESIDENCY:
+        if self.residency is not None:  # every private routing value joins, whatever its length
             values.add(self.residency)
         return frozenset(values)
 

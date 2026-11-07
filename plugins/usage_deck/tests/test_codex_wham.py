@@ -158,8 +158,10 @@ class RoutingClaims(unittest.TestCase):
         routing = codex_routing(codex_token())
         self.assertNotIn(ACCOUNT, repr(routing) + str(routing))
         self.assertEqual(routing.masking_values(), frozenset({ACCOUNT, RESIDENCY}))
-        # a short region code is a hint, not a secret: masking it would corrupt e.g. plan "business"
-        self.assertEqual(CodexRouting(ACCOUNT, "us").masking_values(), frozenset({ACCOUNT}))
+        # DESIGN.md §9.2 term 2: every private routing value joins the masking context, whatever its length
+        for short in ("us", "zq", "a"):
+            self.assertEqual(CodexRouting(ACCOUNT, short).masking_values(), frozenset({ACCOUNT, short}))
+        self.assertEqual(CodexRouting("a", None).masking_values(), frozenset({"a"}))
 
     def test_request_headers_are_exactly_the_approved_set(self):
         token = codex_token()
@@ -248,6 +250,14 @@ class Egress(unittest.TestCase):
             "https://chatgpt.com/backend-api/wham/usage?x=1",       # query
             "https://chatgpt.com/backend-api/wham/usage?",          # even an empty query
             "https://chatgpt.com/backend-api/wham/usage#frag",      # fragment
+            "https://chatgpt.com/backend-api/wham/usage#",          # even an empty fragment
+            "https://chatgpt.com/backend-api/wham/usage?#",
+            "https://chatgpt.com:443/backend-api/wham/usage#",
+            "https://chatgpt.com:0/backend-api/wham/usage",         # explicit port 0 is not the default port
+            "https://chatgpt.com:000/backend-api/wham/usage",
+            "https://chatgpt.com:00/backend-api/wham/usage",
+            "http://chatgpt.com:0/backend-api/wham/usage",
+            "https://chatgpt.com:/backend-api/wham/usage#",
             "https://user@chatgpt.com/backend-api/wham/usage",      # userinfo
             "https://user:pw@chatgpt.com/backend-api/wham/usage",
             "https://chatgpt.com:8443/backend-api/wham/usage",      # other port
@@ -849,11 +859,43 @@ class CodexService(ServiceBase, SchemaAsserts):
             self.assertEqual(scan_for(obj, needles), [], name)
         self.assertNotIn("balance", json.dumps(envelope))  # no credits-balance meter
 
-    def test_a_short_residency_does_not_corrupt_the_plan_claim(self):
-        self.seed({"id": "c1", "access_token": codex_token(residency="us", plan="business")})
+    def test_a_short_residency_is_masked_and_never_leaks_private_text(self):
+        # Private-text leakage, not an enum collision: the residency "zq" is a routing value, and the
+        # free-text plan claim built around it must not reach the DTO, the cache or the logs.
+        private_plan = "zq-private-plan"
+        token = codex_token(residency="zq", plan=private_plan)
+        self.seed({"id": "c1", "access_token": token})
         self.transport.routes[CODEX_USAGE_URL] = json_response(limit_body())
-        (card,) = self.codex()
-        self.assertEqual((card["plan_name"], card["state"]), ("business", "ready"))
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        root = logging.getLogger()
+        old_level = root.level
+        root.addHandler(handler)
+        root.setLevel(logging.DEBUG)
+        self.addCleanup(root.removeHandler, handler)
+        self.addCleanup(root.setLevel, old_level)
+        svc = self.make()
+        status, envelope = svc.handle("subscriptions", [("view", "profile")])
+        self.assertEqual(status, 200)
+        self.assert_exact_envelope("subscriptions", status, envelope)
+        (card,) = [c for c in envelope["data"]["cards"] if c["provider_id"] == "openai-codex"]
+        self.assertEqual((card["state"], card["confidence"], card["reason"], card["error"]), ("ready", "exact", None, None))
+        routing = codex_routing(token)
+        self.assertEqual(routing.masking_values(), frozenset({ACCOUNT, "zq"}))
+        _, health = svc.handle("health", [])
+        needles = [private_plan, "zq", ACCOUNT, token, token.split(".")[1], token.split(".")[2]]
+        for name, obj in (("subscriptions", envelope), ("health", health), ("cache", repr(svc._cache)),
+                          ("logs", [r.getMessage() + repr(r.args) for r in records])):
+            self.assertEqual(scan_for(obj, needles), [], name)
+        # schema preservation: exact keys/enums/vocabulary and numeric observations survive unchanged
+        check_wire("card", card)
+        (m,) = card["meters"]
+        self.assertEqual((m["id"], m["unit"], m["scope"], m["source"], m["confidence"]),
+                         ("workspace_spend", "credit", "provider_account", "chatgpt_wham_usage", "exact"))
+        self.assertEqual((m["value"], m["limit"], m["remaining"]), (864.5, 1500.0, 635.5))
+        self.assertEqual(card["plan_source"], "unverified_claim")
+        self.assertEqual((card["auth_status"], card["debug"]["source"]), ("available", "chatgpt_wham_usage"))
 
     def test_routing_values_join_the_masking_context(self):
         self.seed({"id": "c1", "access_token": codex_token()})
