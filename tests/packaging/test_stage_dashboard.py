@@ -111,6 +111,28 @@ class RepoPackagingTests(unittest.TestCase):
         for rel in (m["entry"], m["css"]):
             self.assertTrue((plugin / "dashboard" / rel).is_file(), rel)
 
+    def test_codex_spend_control_ships_in_the_staged_package_byte_for_byte(self):
+        """DESIGN.md §9.2: the credit unit, the wham source and the one Codex target are in the *staged* copies too."""
+        import hashlib
+        plugin = REPO / "plugins" / "usage_deck"
+        for rel in ("adapters/cloud.py", "adapters/transport.py", "models/dto.py", "service.py", "discovery.py", "dist/index.js"):
+            canonical, staged = plugin / rel, plugin / "dashboard" / rel
+            self.assertEqual(hashlib.sha256(canonical.read_bytes()).hexdigest(),
+                             hashlib.sha256(staged.read_bytes()).hexdigest(), rel)
+        staged = plugin / "dashboard"
+        self.assertIn('AllowedTarget("https", "chatgpt.com", 443, ("/backend-api/wham/usage",))',
+                      (staged / "adapters" / "cloud.py").read_text())
+        dto = (staged / "models" / "dto.py").read_text()
+        self.assertIn('"credit"', dto)
+        self.assertIn('"chatgpt_wham_usage"', dto)
+        js = (staged / "dist" / "index.js").read_text()
+        self.assertIn("chatgpt_wham_usage", js)
+        self.assertIn('credit: "credits"', js)
+        self.assertNotIn("no live response was verified", js)
+        # nothing else was granted the Codex target: it appears exactly once in the staged backend
+        hits = [p.relative_to(staged).as_posix() for p in staged.rglob("*.py") if "chatgpt.com" in p.read_text()]
+        self.assertEqual(sorted(hits), ["adapters/cloud.py"])
+
     def test_no_symlinks_in_package(self):
         plugin = REPO / "plugins" / "usage_deck"
         for dirpath, dirs, files in os.walk(plugin):

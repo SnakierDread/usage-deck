@@ -6,7 +6,7 @@ derived from, or may ever be replaced by a real credential, hostname or account.
 
 | File | Contents |
 |---|---|
-| `auth.json` | Root credential pool, 3 cloud accounts: `nous` (`syn-nous-1`), `openrouter` (`syn-or-1`), `openai-codex` (`syn-codex-1`, an *unsigned* JWT with `iss: synthetic.invalid` and only `plan_type: plus`) |
+| `auth.json` | Root credential pool, 3 cloud accounts: `nous` (`syn-nous-1`), `openrouter` (`syn-or-1`), `openai-codex` (`syn-codex-1`, an *unsigned* JWT with `iss: synthetic.invalid`, `plan_type: plus` and invented `udsyn-*` account claims; the harness serves its Codex spend-control route from a loopback TLS fake, never the real origin) |
 | `config.yaml.template` | 2 self-hosted endpoints: primary provider `ollama` (no credential, no `/metrics`) and custom provider `gpu-box` (has `/metrics`). `@@GPU_BASE_URL@@` / `@@OLLAMA_BASE_URL@@` are replaced with the harness's loopback fakes; the Nous keepalive thread is disabled so the host never refreshes OAuth or rewrites `auth.json` |
 | `profiles/work/` | A secondary profile with its own openrouter row, to exercise profile-first pool shadowing (per provider, never combined) and the host's profile gate |
 

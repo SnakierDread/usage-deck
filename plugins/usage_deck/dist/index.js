@@ -47,6 +47,7 @@
     session_analytics: "estimated",
     prometheus: "self_hosted",
     anthropic_headers: "exact",
+    chatgpt_wham_usage: "exact",
     none: "opaque",
   };
   const SOURCE_LABEL = {
@@ -54,11 +55,14 @@
     session_analytics: "Hermes session analytics",
     prometheus: "Endpoint metrics",
     anthropic_headers: "Anthropic unified rate-limit headers captured from the last call",
+    chatgpt_wham_usage: "ChatGPT workspace spend control (wham/usage)",
     none: "No verified source",
   };
-  // Provider-specific, recon-cited reasons an opaque card shows no meter (DESIGN.md §9). Fixed local copy.
+  // Provider-specific, fixed local explanations for an opaque card that shows no meter (DESIGN.md §9).
+  // Codex: source-aware (§9.2). The superseded blanket "never read" explanation is gone: the route is
+  // ratified and read, so an opaque card means this account returned nothing this meter can honestly show.
   const OPAQUE_NOTES = {
-    "openai-codex": "No Codex usage meter: recon t_7dce2222 found a ChatGPT-backend usage endpoint (chatgpt.com/wham/usage) by reading Hermes source only; no live response was verified, and sending Codex OAuth there is not permitted by DESIGN.md §1.3. Any plan shown is an unverified claim from the credential.",
+    "openai-codex": "No Codex spend meter for this account: UsageDeck reads only the ChatGPT workspace spend control, and this account has none it can show right now (no usable credential, an unrecognised or expired reading, or access was not permitted). Nothing is estimated. Any plan shown is an unverified claim from the credential.",
     anthropic: "No Anthropic session/weekly meter: no unified rate-limit headers are captured for this credential. Hermes does not record them today (recon t_7dce2222), so meters appear only after a call's headers have been captured. Nothing is estimated.",
   };
   const SCOPE_LABEL = {
@@ -67,7 +71,7 @@
     endpoint: "Endpoint",
     profile: "This Hermes profile",
   };
-  const UNIT_LABEL = { usd: "USD", count: "count", percent: "percent", bytes: "bytes" };
+  const UNIT_LABEL = { usd: "USD", count: "count", percent: "percent", bytes: "bytes", credit: "credits" };
 
   // Fixed local copy for Reason codes — upstream text never reaches the UI.
   const REASON_TEXT = {
@@ -220,6 +224,7 @@
       return (v < 0 ? "-" : "") + (i === 0 ? String(Math.round(x)) : x.toFixed(1)) + " " + units[i];
     }
     if (unit === "percent") return (Math.round(v * 10) / 10) + "%";
+    if (unit === "credit") return v.toLocaleString("en-US", { maximumFractionDigits: 2 }) + " credits";
     return v.toLocaleString("en-US", { maximumFractionDigits: 2 });
   }
 
@@ -560,12 +565,14 @@
       const limit = num(m.limit);
       const remaining = num(m.remaining);
       const fromHeaders = m.source === "anthropic_headers";
+      const fromSpend = m.source === "chatgpt_wham_usage";
       const resetsAt = str(m.resets_at);
       const tip = "Source: " + (SOURCE_LABEL[m.source] || SOURCE_LABEL.none) +
         ". Scope: " + (SCOPE_LABEL[m.scope] || "unknown") +
         ". Observed: " + fmtTime(m.observed_at) + "." +
         (resetsAt ? " Reset reported by the provider: " + fmtTime(resetsAt) + "." : "") +
-        (fromHeaders ? " Value as of that call, not live; it is never extrapolated." : "");
+        (fromHeaders ? " Value as of that call, not live; it is never extrapolated." : "") +
+        (fromSpend ? " Credits reported for this seat's workspace spend limit, as of the last refresh; not USD, not messages, not a fleet total." : "");
       const parts = [];
       parts.push(h("div", { key: "head", className: "ud-meter-head" },
         h("span", { className: "ud-meter-label" }, str(m.label) || "Meter"),
@@ -574,6 +581,14 @@
         // Utilization of a rolling window: used share + provider-reported reset; no invented remaining.
         parts.push(h("dl", { key: "vals", className: "ud-vals" },
           h("div", null, h("dt", null, "Used"), h("dd", null, value === null ? "Not reported" : fmtNumber(value, unit))),
+          h("div", null, h("dt", null, "Resets"), h("dd", { "data-resets-at": resetsAt || undefined }, resetsAt ? fmtTime(resetsAt) : "Not reported")),
+          h("div", null, h("dt", null, "As of"), h("dd", null, fmtTime(m.observed_at)))));
+      } else if (fromSpend) {
+        // Workspace spend control: the provider's own used/limit/remaining credits and reset; null stays "Not reported".
+        parts.push(h("dl", { key: "vals", className: "ud-vals" },
+          h("div", null, h("dt", null, "Used"), h("dd", null, value === null ? "Not reported" : fmtNumber(value, unit))),
+          h("div", null, h("dt", null, "Limit"), h("dd", null, limit === null ? "Not reported" : fmtNumber(limit, unit))),
+          h("div", null, h("dt", null, "Remaining"), h("dd", null, remaining === null ? "Not reported" : fmtNumber(remaining, unit))),
           h("div", null, h("dt", null, "Resets"), h("dd", { "data-resets-at": resetsAt || undefined }, resetsAt ? fmtTime(resetsAt) : "Not reported")),
           h("div", null, h("dt", null, "As of"), h("dd", null, fmtTime(m.observed_at)))));
       } else {

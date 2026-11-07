@@ -1,6 +1,7 @@
 # UsageDeck MVP contract — v1
 
 Status: **ratified; backend and frontend implementation released**. Amended by card `t_04a4354d` (builder-authored, pending architect ratification): §9 source upgrade, §10 machine view, §11 badges; in-place pointers below.
+Codex-only amendment ratified by architect `t_ad8bf9bc` on November 7, 2026: §9.2 and `docs/decisions/codex-wham-usage.md` reopen one verified usage route. This does not re-ratify unrelated pending deltas or claim the new adapter is implemented.
 Owner: architect. Branch: `t_22e02c08`. Wire version: `1`.
 This document governs backend and frontend together. Examples below are contract examples, not live probe results. `docs/recon-providers.md` is evidence, not an API specification.
 
@@ -28,7 +29,7 @@ Preserve stored `provider_id` literally (including case/punctuation for custom n
 
 `account_id` = `acct_` plus first 24 lowercase hexadecimal characters of SHA-256 over UTF-8 JSON of `[provider_id, normalized_endpoint, public_row_id_or_ordinal]` (compact separators, ensure_ascii=True). Public row ID is a stored non-secret row `id`; otherwise a one-based source-order ordinal. Endpoint normalization removes trailing `/`, userinfo, query and fragment; lowercase scheme and hostname, preserve path/port. IDs may change if an anonymous account's source order changes; never derive them from tokens, emails or JWT subjects. `endpoint_id` uses the same algorithm with `ep_` and `[provider_id, normalized_endpoint]`. Card `id` equals `account_id`. No secrets appear in ID inputs.
 
-Display account labels as `Account 1`, `Account 2`, etc. in source order, not emails or provider account IDs. Plan metadata may be extracted from known plan-name claims in existing JWTs locally, without verifying their authority; allowlist short strings and set `plan_source=unverified_claim`. Never send JWTs anywhere, and never use a plan claim to infer a quota, billing cycle, account identity or entitlement. Unsupported claims yield null plan. No live fleet addresses or credential assumptions in code.
+Display account labels as `Account 1`, `Account 2`, etc. in source order, not emails or provider account IDs. Plan metadata may be extracted from known plan-name claims in existing JWTs locally, without verifying their authority; allowlist short strings and set `plan_source=unverified_claim`. Never send JWTs anywhere except the narrowly approved Codex access-token bearer and private routing claims to the exact §9.2 target. Never use a plan claim to infer a quota, billing cycle, account identity or entitlement. Unsupported claims yield null plan. No live fleet addresses or credential assumptions in code.
 
 ### 1.2 Protocol and orchestration
 
@@ -59,7 +60,7 @@ Registry resolution: exact built-in ID → configured custom/ollama endpoint ada
 | Class / registry entry | Allowed data sources in MVP | Meaning / fallback |
 |---|---|---|
 | NousAdapter / nous | local inventory and AnalyticsReader | No documented verified quota capability in recon; quota opaque. Never scrape Portal HTML or guess `/api/usage`. |
-| OpenAICodexAdapter / openai-codex | local inventory, safe plan claim, AnalyticsReader | Subscription quota opaque. Never send Codex OAuth to OpenAI billing endpoints; API org billing is not a ChatGPT subscription quota. Reaffirmed in §9.2: recon did not prove the usage endpoint reachable, so it stays opaque. |
+| OpenAICodexAdapter / openai-codex | local inventory, safe plan claim, AnalyticsReader; HTTPS GET `https://chatgpt.com/backend-api/wham/usage` only (§9.2) | Exact credit quantities only for the supported workspace spend-control shape; otherwise opaque/error under §9.2. Codex OAuth is allowed only at that fixed usage target, never at OpenAI platform billing/admin endpoints. API org billing is not ChatGPT subscription quota. |
 | AnthropicAdapter / anthropic | local inventory, safe plan claim, AnalyticsReader, **captured unified rate-limit headers (read from a local file, §9.1)** | OAuth/ordinary inference credentials do not establish org analytics or subscription quota access. Quota opaque unless a header capture exists for the card's credential; then exact session/weekly utilization. No SDK or admin endpoint guessing, no request made to obtain headers. |
 | OpenRouterAdapter / openrouter | HTTPS `https://openrouter.ai/api/v1/key`; AnalyticsReader | Read documented numeric `usage`, `limit`, `limit_remaining` from `data`; USD, API-key scope. Exact only for returned finite values and matching limit period. Missing or unauthorized values opaque, never inferred from plan. |
 | SelfHostedAdapter / custom endpoints, ollama | configured origin's `/metrics`, `/v1/models` or `/api/tags` for health; AnalyticsReader separately | Successful supported metrics exposition gives self_hosted health, not a token quota. No metrics gives opaque health confidence, even if models are reachable. |
@@ -81,7 +82,7 @@ Host `daily.day` uses the host local calendar timezone and a rolling days cutoff
 
 ### 1.5 Transport, cache and security
 
-Only GET. Fixed cloud origin/path allowlist. Local requests must match inventory-configured http(s) origin; endpoints are never accepted from query strings. Derive `/metrics` and health paths from origin, not by blindly appending to `/v1`. Reject URL userinfo and credential-bearing query/fragment for transport; do not log the rejected raw URL. No redirects, including same-origin; no credentials copied to another origin. Verify TLS. Do not send inference credentials to `/metrics` by default; use only a separately configured metrics credential if one already exists. No new connection/credential UX in MVP.
+Only GET. Fixed cloud origin/path allowlist. Cloud targets: OpenRouter `AllowedTarget("https", "openrouter.ai", 443, ("/api/v1/key",))`; Codex `AllowedTarget("https", "chatgpt.com", 443, ("/backend-api/wham/usage",))`, granted only to the selected openai-codex context (§9.2). No wildcard or fallback Codex paths; reject query/fragment on that target. Local requests must match inventory-configured http(s) origin; endpoints are never accepted from query strings. Derive `/metrics` and health paths from origin, not by blindly appending to `/v1`. Reject URL userinfo and credential-bearing query/fragment for transport; do not log the rejected raw URL. No redirects, including same-origin; no credentials copied to another origin. The sole newly ratified credential egress is the selected Codex access token and private routing headers to the exact chatgpt.com target above, not api.openai.com billing or configured proxies. Verify TLS. Do not send inference credentials to `/metrics` by default; use only a separately configured metrics credential if one already exists. No new connection/credential UX in MVP.
 
 Custom-endpoint credentials resolve with precedence inline `api_key` > `env_secret(key_env)` (`key_env`/`api_key_env` of a `custom_providers` entry, read through the inventory source's `env_lookup`; only the variable's *value* is ever used and it is registered as a redaction secret). A `key_env` whose variable is unset yields no credential and **no request at all** (`credential_expected`): card `auth_status: missing`, reason `credentials_missing`, health `unknown`. An entry with no credential and no `key_env` (e.g. Ollama) is still probed anonymously; an anonymous 401 there is reported as `credentials_missing` (never as a rejected credential, and with no `auth_required` error). `auth_required` / `auth_status: rejected` are reserved for a request that actually carried a bearer and got 401.
 
@@ -117,11 +118,11 @@ Period {
 UsageMeter {
   id: string, label: string,
   value: number|null, limit: number|null, remaining: number|null,
-  unit: usd | count | percent | bytes,
+  unit: usd | count | percent | bytes | credit,
   scope: api_credential | provider_account | endpoint | profile,
   period: Period,
   confidence: ConfidenceLabel,
-  source: openrouter_key | session_analytics | prometheus | none,
+  source: openrouter_key | session_analytics | prometheus | anthropic_headers | chatgpt_wham_usage | none,
   observed_at: timestamp|null
 }
 
@@ -176,6 +177,7 @@ HealthStripEntry {
 Health status: metrics success plus successful expected health JSON => healthy; health reachable but metrics unsupported/failed => degraded; all attempted requests fail connection/timeout => offline; invalid/unconfigured endpoint or nonconnection failures without valid health evidence => unknown. Metrics success but health request failure => degraded, with self_hosted confidence retained for the successful metrics observation. Health latency measures the selected successful health request, else successful metrics request, else null; a failed request is not zero latency. Missing CPU/memory remains null even with a valid empty exposition. Non-local adapters return no health row. At most one row per endpoint ID even if accounts share an endpoint.
 
 Wire deltas to the notation above (additive; `schema_version` stays `1`): `Holder`, `SubscriptionCard.holders`, `UsageMeter.resets_at`, `METER_SOURCES += anthropic_headers`, `/subscriptions data.view`. Normative text in §9-§10.
+Codex delta (`t_ad8bf9bc`, §9.2): `UNITS += credit`, `METER_SOURCES += chatgpt_wham_usage`; auth_status remains presence-only `available|missing` (no `rejected`). All canonical and staged validators, frontend unit/source tables and test/acceptance schema copies must agree. Regenerate staging rather than hand-editing it. The expanded exact-source ceiling applies only to supported numeric observations, not every successful HTTP response.
 
 ### 2.1 Secret masking at DTO construction
 
@@ -234,7 +236,7 @@ Chart: window defaults 30; preserve selection within mount, reset profile data b
 
 Wire `self_hosted` is canonical, display badge is **Self-hosted** (resolves brief's hyphenated prose vs DTO enum). Other badge text: exact → **Exact**, estimated → **Estimated**, opaque → **Opaque**. Tooltip must name source, scope and observed time. Every number/meter/chart and health entry carries its own source badge; never rely solely on a card header badge.
 
-- exact: only directly reported numeric quantity for a known scope/period. OpenRouter key balance/usage can qualify; it is not an exact subscription percentage. Anthropic's reported 5h/7d utilization from captured headers also qualifies (§9.1): it is the provider's own number for a named rolling window, shown with the capture time and never extrapolated.
+- exact: only directly reported numeric quantity for a known scope/period. OpenRouter key balance/usage can qualify; it is not an exact subscription percentage. Anthropic's reported 5h/7d utilization from captured headers also qualifies (§9.1): it is the provider's own number for a named rolling window, shown with the capture time and never extrapolated. Codex workspace spend controls reported in credits qualify under §9.2, source `chatgpt_wham_usage`; not USD, message counts, other subscription windows or fleet totals.
 - estimated: session-local accounting, estimated spend or incomplete attribution/coverage. No estimated spend presented as a provider invoice or subscription allowance.
 - opaque: no verified measurement. No numeric quota/percent/reset rendering; null is not zero. Credentials and unverified plan claims cannot promote confidence.
 - self_hosted: operational metrics exposed by a configured endpoint's valid `/metrics`. It is a source category, **not** a higher accuracy tier than estimated/exact. Local token history, when available from session accounting, stays estimated separately.
@@ -316,9 +318,15 @@ Never extrapolated: a window whose reported reset is already in the past no long
 
 UI: each meter carries its own `Exact` badge; the tooltip names the source ("Anthropic unified rate-limit headers captured from the last call"), scope, observed time and the provider's reset, and says the value is as of that call and never extrapolated. The row shows `Used`, `Resets`, `As of`, plus a progress bar (the rolling window is a known period; an over-100 % value is shown as over limit).
 
-### 9.2 Codex: stays opaque (decision)
+### 9.2 Codex: verified wham usage route reopened (ratified decision)
 
-The card asked for backend usage data only "IF recon proved reachable". It did not: the recon read `agent/account_usage.py` and described the request (`GET https://chatgpt.com/wham/usage` or `/api/codex/usage`, `Authorization`, `ChatGPT-Account-ID`, residency header) but recorded **no live response, HTTP status or real response body**; the "sample response shape" is two fields inferred from `_codex_banked_resets`. Sending a Codex OAuth bearer to a new endpoint on that evidence would also contradict §1.3 ("never send Codex OAuth to OpenAI billing endpoints") and §1.5's fixed origin allowlist, and the plan windows' field names are unverified. Codex cards therefore keep `opaque`/`unsupported`, make no network call, and the UI explains why (recon `t_7dce2222`, no live response verified, §1.3) in the card body and badge tooltip. Reopening this needs an architect decision plus a read-only live probe whose status and sanitized body are recorded.
+Architect card `t_ad8bf9bc` supersedes the earlier opaque/no-network decision on November 7, 2026. Its required reopening evidence is now satisfied: scout `t_7dfdeb27` recorded **HTTP 200** for GET `https://chatgpt.com/backend-api/wham/usage`, response Date `2026-11-07T16:14:40Z`. The complete sanitized observed body (email/user_id/account_id replaced with `[REDACTED]`) is `docs/evidence/codex-wham-usage-200.sanitized.json`. Provenance and the **normative approval terms** are in `docs/decisions/codex-wham-usage.md`; that document is part of this contract. No new probe, production write, refresh or credential mutation is authorized by this amendment.
+
+Only the selected existing Codex access-token bearer plus same-token account/residency routing claims may leave the private context, and only for that exact guarded GET target (§1.5). OpenAI platform billing/admin, `/backend-api/usage`, old guessed paths, redirects, cookies, session minting, other origins and endpoint overrides remain forbidden. Missing or malformed routing claims do not trigger fallback calls. No arbitrary upstream identity or plan fields are emitted.
+
+Mapping: `spend_control.individual_limit` with source `workspace_spend_controls`, unit `credit` produces one meter `workspace_spend`, label `Workspace spend limit (monthly)`, value/limit/remaining from the respective `used`/`limit`/`remaining` numeric observations; finite numeric strings are accepted. Unit **credit**, not count or USD; scope `provider_account`; source `chatgpt_wham_usage`; period `{start:null,end:null,label:"monthly_workspace"}`; confidence exact; observed_at is the immutable refresh snapshot observation time; resets_at is the valid reported `reset_at` UTC instant or null. Missing values remain null. No calendar start/end or usage history is invented. Deferred: credits-balance meter, model/rate-limit mappings, plan-specific alternatives and account aggregation. Unsupported shapes remain opaque/source_unavailable, invalid present values are malformed_response, expired observations are not rendered as current. See the decision for precise validation and error rules.
+
+Credential presence remains auth_status `available|missing`: a 401 yields an auth_required error, not a new `rejected` enum and not refresh. The old Codex-always-opaque UI explanation must be replaced with source-aware ready/opaque/error states and credits display. Downstream tests must verify egress isolation, sanitized output, all schema/unit/source copies, transport failures, expiry and staged packaging. Further endpoints or schema shapes require a new architect decision and recorded sanitized evidence; successful reachability of this one account is not a general API guarantee.
 
 ## 10. Machine view: aggregation across Hermes homes (delta, card t_04a4354d)
 
@@ -328,7 +336,7 @@ The subscriptions grid and health strip now default to a **machine view**; the p
 - Sources: the root `auth.json` (`holder` `global`) and every `<root>/profiles/<name>/auth.json`, each read **on its own** (no shadowing, no config). A profile that merely falls back to the global pool does not hold those accounts. Legacy `providers` entries count only for providers with no pool row in the same file. This **supersedes §1.1's "do not scan other profiles" for the machine view only**: it widens what one dashboard session can see to every profile on the same machine, by explicit card instruction. Safeguards: only real directories with valid profile names directly under `<root>/profiles` and non-symlink `auth.json` files are opened (nothing outside the Hermes root), at most 64 profiles, an unreadable store is skipped with a path-free log line (the viewed home's own store still fails with `inventory_unavailable`), and no tokens or claims ever reach a response.
 - Config-derived items (custom endpoints, primary provider without credentials) come from the **viewed** profile's config only (host config loader) and are held by that profile (`global` when the viewed home is the root). They are dropped when a pooled account already covers the same provider (cloud) or provider and endpoint (self-hosted).
 - Identity (private merge key, never serialized): (1) the JWT account identity `chatgpt_account_id` **plus** user id (`chatgpt_user_id` / `user_id` / `chatgpt_account_user_id`) from the `https://api.openai.com/auth` claim, so two seats of one workspace stay two accounts and a refreshed token of the same seat merges; (2) otherwise provider plus an identical **public pool row id** (so two api-key rows to one endpoint remain two accounts, as in the profile view); (3) otherwise no identity: the row is never merged across homes. Secrets are never compared or hashed to merge (§1.1 unchanged), so an opaque credential copied under a new row id shows twice.
-- Card identity: `account_id`/`id` = `acct_` + SHA-256-24 of `[provider_id, endpoint, "machine:" + identity]`. The identity string is hashed, never emitted; JWT claims are read locally and never sent anywhere. Machine ids differ from profile-view ids by design. Labels are `Account N` per provider in first-seen order (global, then profiles alphabetically).
+- Card identity: `account_id`/`id` = `acct_` + SHA-256-24 of `[provider_id, endpoint, "machine:" + identity]`. The identity string is hashed, never emitted; JWT claims are read locally and never sent anywhere except the same-token private account/residency routing headers expressly authorized by §9.2. Machine ids differ from profile-view ids by design. Labels are `Account N` per provider in first-seen order (global, then profiles alphabetically).
 - Merged card: first credential and plan claim found; secrets unioned for masking; capture lookup uses every public row id of the group.
 
 Wire delta (additive, `schema_version` stays `1`; every field always serialized):
@@ -349,7 +357,7 @@ Example title: `OpenAI Codex [go] — verifier` (plan claim is an unverified cla
 |---|---|
 | Anthropic `Used`, `Resets`, `As of` | per-meter `Exact` (source `anthropic_headers`, ceiling `exact`; the UI lowers it to the lesser of claimed confidence and source ceiling) |
 | Anthropic without a usable capture | card `Opaque`; tooltip and body say no unified headers are captured and Hermes does not record them today (recon `t_7dce2222`); nothing estimated |
-| Codex | card `Opaque`; tooltip and body cite recon `t_7dce2222` (endpoint found by source reading only, no live response, §1.3) |
+| Codex | supported workspace credit observations: per-meter `Exact`, source `chatgpt_wham_usage`, unit displayed `credits`; otherwise source-aware opaque/error and fixed safe explanation (§9.2). Do not retain the superseded blanket no-live-response tooltip. |
 | Plan `[go]` | unchanged: unverified claim, tooltip says so; not a measurement |
 | Holders `— verifier` | local inventory fact: tooltip says "read from auth.json; presence only, not validated"; not a usage claim, so no confidence tier applies |
 

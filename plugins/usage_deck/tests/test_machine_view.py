@@ -9,6 +9,7 @@ import os
 import unittest
 from pathlib import Path
 
+from plugins.usage_deck.adapters.cloud import CODEX_USAGE_URL
 from plugins.usage_deck.discovery import (
     FileInventorySource,
     InventoryUnavailable,
@@ -18,7 +19,7 @@ from plugins.usage_deck.discovery import (
 )
 from plugins.usage_deck.models.dto import Holder
 
-from .helpers import ALL_SENTINELS, SENTINEL_KEY, SENTINEL_REFRESH, SENTINEL_TOKEN, make_jwt, scan_for
+from .helpers import ALL_SENTINELS, SENTINEL_KEY, SENTINEL_REFRESH, SENTINEL_TOKEN, json_response, make_jwt, scan_for
 from .test_schema_preservation import SchemaAsserts
 from .test_service import GPU, METRICS, ServiceBase
 
@@ -221,6 +222,8 @@ class MachineViaService(MachineBase, SchemaAsserts):
 
     def test_default_is_machine_view_with_holders(self):
         self.seed_machine()
+        # The Codex route answers with a shape that carries no supported spend control: opaque, not an error.
+        self.transport.routes[CODEX_USAGE_URL] = json_response({"spend_control": None})
         body = self.cards()
         self.assertEqual(body["data"]["view"], "machine")
         by_plan = {c["plan_name"]: c for c in body["data"]["cards"] if c["provider_id"] == "openai-codex"}

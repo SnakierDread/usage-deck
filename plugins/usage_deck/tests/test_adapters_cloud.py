@@ -57,7 +57,8 @@ class RegistryTests(unittest.TestCase):
 
 class OpaqueCloudTests(unittest.TestCase):
     def test_opaque_providers_happy_path_make_no_network_calls(self):
-        for cls, pid in ((NousAdapter, "nous"), (OpenAICodexAdapter, "openai-codex"), (AnthropicAdapter, "anthropic")):
+        # Codex is no longer in this list: it reads one ratified route (tests/test_codex_wham.py).
+        for cls, pid in ((NousAdapter, "nous"), (AnthropicAdapter, "anthropic")):
             transport = FakeTransport()
             adapter = cls(make_ctx(provider_id=pid, transport=transport))
             probe = adapter.probe()

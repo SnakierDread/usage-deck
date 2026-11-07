@@ -1,0 +1,50 @@
+{
+  "user_id": "[REDACTED]",
+  "account_id": "[REDACTED]",
+  "email": "[REDACTED]",
+  "plan_type": "business",
+  "rate_limit": null,
+  "code_review_rate_limit": null,
+  "additional_rate_limits": null,
+  "model_usage": {
+    "gpt-6-astra": {
+      "available": true,
+      "available_at": null,
+      "credits_would_enable": false
+    }
+  },
+  "credits": {
+    "has_credits": true,
+    "unlimited": false,
+    "overage_limit_reached": false,
+    "balance": "635.5151499509811",
+    "approx_local_messages": [
+      159,
+      826
+    ],
+    "approx_cloud_messages": [
+      25,
+      159
+    ]
+  },
+  "spend_control": {
+    "reached": false,
+    "individual_limit": {
+      "source": "workspace_spend_controls",
+      "unit": "credit",
+      "limit": "1500",
+      "used": "864.4848500490189",
+      "remaining": "635.5151499509811",
+      "used_percent": 58,
+      "remaining_percent": 42,
+      "reset_after_seconds": 2015121,
+      "reset_at": 1796083201
+    }
+  },
+  "rate_limit_reached_type": null,
+  "promo": null,
+  "rate_limit_reset_credits": {
+    "available_count": 0,
+    "applicable_available_count": 0
+  }
+}

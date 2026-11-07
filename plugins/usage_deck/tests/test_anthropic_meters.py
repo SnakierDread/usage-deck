@@ -159,13 +159,15 @@ class OpaqueFallbacks(unittest.TestCase):
         self.assertIn("quota", probe.capabilities)
         self.assertEqual(adapter.source_label, "anthropic_headers")
 
-    def test_codex_stays_opaque_and_never_calls_out(self):
+    def test_codex_without_usable_routing_claims_makes_no_request(self):
+        # DESIGN.md §9.2: Codex reads one ratified route, but a credential whose token carries no
+        # account claim (here: not a JWT at all) is opaque/source_unavailable with no request.
         transport = FakeTransport()
         ctx = make_ctx("openai-codex", credential="syn.codex.jwt", transport=transport)
         adapter = create_adapter(ctx)
         self.assertIsInstance(adapter, OpenAICodexAdapter)
         usage = adapter.get_usage(30)
-        self.assertEqual((usage.meters, usage.confidence, usage.reason), ((), "opaque", "unsupported"))
+        self.assertEqual((usage.meters, usage.confidence, usage.reason), ((), "opaque", "source_unavailable"))
         self.assertEqual(transport.requests, [])
         self.assertIsInstance(create_adapter(make_ctx("anthropic")), AnthropicAdapter)
 

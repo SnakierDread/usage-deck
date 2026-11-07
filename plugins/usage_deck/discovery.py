@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 from .adapters import is_self_hosted_provider
 from .adapters.base import SecretValue
+from .adapters.cloud import CODEX_PROVIDER_ID, codex_routing
 from .captures import default_store_path
 from .models.dto import Holder
 from .models.identity import Endpoint, make_account_id, make_endpoint_id, parse_endpoint
@@ -506,6 +507,10 @@ def discover(source: Any) -> List[InventoryItem]:
             credential = source.env_secret(draft.key_env)
         if credential:
             secrets.add(credential)
+            if provider_id.strip().lower() == CODEX_PROVIDER_ID:
+                routing = codex_routing(credential)  # private routing claims join the masking context
+                if routing is not None:
+                    secrets |= routing.masking_values()
         kind = "self_hosted" if is_self_hosted_provider(provider_id) else "cloud"
         endpoint = draft.endpoint if kind == "self_hosted" else None
         normalized = endpoint.normalized if endpoint else None
