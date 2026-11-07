@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -128,7 +128,7 @@ def _utc_now() -> datetime:
 def _default_captures(source: Any) -> CaptureStore:
     """Read-only header captures next to the Hermes root; absent file = no captures."""
     path_of = getattr(source, "captures_path", None)
-    return CaptureStore(path_of() if callable(path_of) else None)
+    return CaptureStore(path_of() if callable(path_of) else None)  # scoped refs + the adapter's refresh clock
 
 
 def _effective_view(source: Any, query: "Query") -> str:
@@ -174,12 +174,19 @@ class UsageDeckService:
     def health(self, query: Query) -> Tuple[int, dict]:
         return self._guarded(lambda: self._health(query))
 
-    def handle(self, endpoint: str, items: List[Tuple[str, str]]) -> Tuple[int, dict]:
-        """Validate the query then dispatch; the single entry point for the router."""
+    def handle(self, endpoint: str, items: List[Tuple[str, str]], *, profile_only: bool = False) -> Tuple[int, dict]:
+        """Validate the query then dispatch; the single entry point for the router.
+
+        ``profile_only`` is set by the router for a profile-restricted host principal (DESIGN.md §12.5): the
+        machine view is a full-trust machine-owner inventory, so such a principal is clamped to the profile
+        view whatever ``view=`` says (a query string can never widen authorization).
+        """
         try:
             query = parse_query(endpoint, items)
         except ApiError as exc:
             return self._fail(exc.status, exc.error)
+        if profile_only and query.view != "profile":
+            query = replace(query, view="profile")
         return getattr(self, endpoint)(query)
 
     # -- envelope helpers ------------------------------------------------
@@ -244,7 +251,7 @@ class UsageDeckService:
                     "series": [], "reason": "attribution_unavailable"}
             return self._ok(data, [])
         source = self._inventory_factory()
-        key = (source.home_key(), query.profile or "", "usage", query.window)
+        key = (self._source_key(source), query.profile or "", "usage", query.window)
         series = self._cached(key, lambda: self._read_series(query))
         if series is None:
             raise ApiError(503, "analytics_unavailable")
@@ -265,11 +272,19 @@ class UsageDeckService:
             return None
         return check_wire("series", sanitize(to_plain(result.series[0])))
 
+    @staticmethod
+    def _source_key(source: Any) -> str:
+        """Cache identity of the inventory source: the viewed home AND the root whose stores it enumerates,
+        so a snapshot can never leak across roots (machine inventory) or across profiles."""
+        root_of = getattr(source, "root_dir", None)
+        root = str(root_of()) if callable(root_of) else ""
+        return f"{source.home_key()}|{root}"
+
     # -- deck snapshot (cards + health) ----------------------------------
     def _deck(self, query: Query) -> _Snapshot:
         source = self._inventory_factory()
         view = _effective_view(source, query)
-        key = (source.home_key(), query.profile or "", "deck", view)
+        key = (self._source_key(source), query.profile or "", "deck", view)
         return self._cached(key, lambda: self._build_deck(source, query, view))
 
     def _build_deck(self, source: Any, query: Query, view: str = "profile") -> _Snapshot:
@@ -279,6 +294,9 @@ class UsageDeckService:
         reader = MemoAnalyticsReader(self._analytics_factory(query.profile))
         endpoints = EndpointCache()
         health_owner: Dict[str, str] = {}
+        for item in items:  # a card with a live source owns the endpoint's single health row
+            if item.endpoint_id and item.live_source and item.endpoint_id not in health_owner:
+                health_owner[item.endpoint_id] = item.account_id
         for item in items:
             if item.endpoint_id and item.endpoint_id not in health_owner:
                 health_owner[item.endpoint_id] = item.account_id
@@ -323,12 +341,13 @@ class UsageDeckService:
                  endpoints: Optional[EndpointCache] = None,
                  captures: Optional[CaptureStore] = None) -> AdapterContext:
         targets: List[AllowedTarget] = []
-        if item.provider_id.lower() == "openrouter":
-            targets.append(OPENROUTER_TARGET)
-        if item.provider_id.strip().lower() == CODEX_PROVIDER_ID:
-            targets.append(CODEX_TARGET)  # DESIGN.md §9.2: fixed, never derived from claims/config/response
-        if item.endpoint is not None and item.endpoint.safe:
-            targets.append(AllowedTarget(item.endpoint.scheme, item.endpoint.host, item.endpoint.port, None))
+        if item.live_source:  # machine-only inventory never gets an outbound target (DESIGN.md §12.5)
+            if item.provider_id.lower() == "openrouter":
+                targets.append(OPENROUTER_TARGET)
+            if item.provider_id.strip().lower() == CODEX_PROVIDER_ID:
+                targets.append(CODEX_TARGET)  # DESIGN.md §9.2: fixed, never derived from claims/config/response
+            if item.endpoint is not None and item.endpoint.safe:
+                targets.append(AllowedTarget(item.endpoint.scheme, item.endpoint.host, item.endpoint.port, None))
         return AdapterContext(
             provider_id=item.provider_id,
             account_id=item.account_id,
@@ -347,8 +366,9 @@ class UsageDeckService:
             secrets=item.secrets,
             health_credential=item.health_credential,
             endpoint_cache=endpoints,
-            row_ids=item.row_ids,
+            credential_refs=item.credential_refs,
             captures=captures,
+            live_source=item.live_source,
             credential_expected=item.credential_expected,
         )
 

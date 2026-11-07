@@ -116,7 +116,7 @@ test("opaque Codex cards (unsupported, expired, no credential, forbidden) show n
     assert.doesNotMatch(c.textContent, /recon|t_7dce2222|no live response|1\.3/);
     assert.ok(!/\b\d+ credits\b/.test(c.textContent), "no number: " + c.textContent);
   }
-  assert.match(m.$("[data-card-id=acct_o1]").textContent, /No credential was found for this account/);
+  assert.match(m.$("[data-card-id=acct_o1]").textContent, /No credential was sent for this account \(none was found\)/);
   assert.match(m.$("[data-card-id=acct_o2]").textContent, /does not permit reading this data/);
   await m.unmount();
 });

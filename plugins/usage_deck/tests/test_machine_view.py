@@ -95,24 +95,47 @@ class DedupeMerge(MachineBase):
         self.assertEqual(len([i for i in self.machine() if i.provider_id == "openai-codex"]), 2)
 
     def test_account_identity_helper(self):
-        self.assertEqual(account_identity("openai-codex", codex_token("A", "U", "go")), "jwt:openai-codex:A:U")
+        self.assertEqual(account_identity("openai-codex", codex_token("A", "U", "go")), ("A", "U"))
         self.assertIsNone(account_identity("openai-codex", make_jwt({"plan": "go"})))
         for token in (None, "", "abc", "a.b.c", make_jwt({AUTH: {"chatgpt_account_id": "bad id!"}}),
                       make_jwt({AUTH: {"chatgpt_account_id": 5}})):
             self.assertIsNone(account_identity("openai-codex", token))
+        # account claim alone (no user claim) is NOT an identity (§12.5): it only names a workspace
         no_user = make_jwt({AUTH: {"chatgpt_account_id": "A"}})
-        self.assertEqual(account_identity("openai-codex", no_user), "jwt:openai-codex:A:")
+        self.assertIsNone(account_identity("openai-codex", no_user))
+        # user claim priority: chatgpt_user_id, then user_id, then chatgpt_account_user_id
+        both = make_jwt({AUTH: {"chatgpt_account_id": "A", "user_id": "second", "chatgpt_user_id": "first",
+                                "chatgpt_account_user_id": "third"}})
+        self.assertEqual(account_identity("openai-codex", both), ("A", "first"))
+        second = make_jwt({AUTH: {"chatgpt_account_id": "A", "user_id": "second", "chatgpt_account_user_id": "third"}})
+        self.assertEqual(account_identity("openai-codex", second), ("A", "second"))
+        third = make_jwt({AUTH: {"chatgpt_account_id": "A", "chatgpt_account_user_id": "third"}})
+        self.assertEqual(account_identity("openai-codex", third), ("A", "third"))
+        # exact claim namespace only; no email / subject / other-provider fallback
+        self.assertIsNone(account_identity("openai-codex", make_jwt(
+            {"https://api.openai.com/other": {"chatgpt_account_id": "A", "chatgpt_user_id": "U"}})))
+        self.assertIsNone(account_identity("openai-codex", make_jwt(
+            {"sub": "user-sub", "email": "a@b.example", AUTH: {"chatgpt_account_id": "A"}})))
+        self.assertIsNone(account_identity("openai-codex-2", codex_token("A", "U", "go")))
+        self.assertIsNone(account_identity("OpenAI-Codex", codex_token("A", "U", "go")))
+        self.assertIsNone(account_identity("anthropic", codex_token("A", "U", "go")))
 
-    def test_opaque_credentials_merge_only_on_identical_public_row_id(self):
+    def test_identical_public_row_ids_in_different_homes_never_merge(self):
+        """Public row ids are store-local (§12.5): equal ids across holders are NOT a shared account."""
         self.s.write_auth(pool("anthropic", {"id": "same", "access_token": "sk-ant-1"}), where="global")
         self.s.write_profile("a", pool("anthropic", {"id": "same", "access_token": "sk-ant-1"}))
         self.s.write_profile("b", pool("anthropic", {"id": "different", "access_token": "sk-ant-1"}))  # same secret, other row
         self.s.write_auth({"credential_pool": {}})
         items = [i for i in self.machine() if i.provider_id == "anthropic"]
-        self.assertEqual(len(items), 2)  # never merged by hashing/comparing secrets
-        merged = next(i for i in items if len(i.holders) == 2)
-        self.assertEqual([h.profile for h in merged.holders], ["global", "a"])
-        self.assertEqual(merged.row_ids, ("same",))
+        self.assertEqual(len(items), 3)  # never merged by row id or by comparing secrets
+        self.assertEqual(sorted(len(i.holders) for i in items), [1, 1, 1])
+        self.assertEqual(len({i.account_id for i in items}), 3)
+        refs = sorted(r for i in items for r in i.credential_refs)
+        self.assertEqual(refs, [(False, "a", "same"), (False, "b", "different"), (True, "global", "same")])
+        for item in items:  # each card only ever carries ITS OWN store's reference
+            self.assertEqual(len(item.credential_refs), 1)
+            self.assertEqual((item.credential_refs[0][0], item.credential_refs[0][1]),
+                             (item.holders[0].is_global, item.holders[0].profile))
 
     def test_anonymous_rows_are_never_merged_across_homes(self):
         self.s.write_auth({"credential_pool": {"nous": [{"access_token": "n-1"}]}}, where="global")

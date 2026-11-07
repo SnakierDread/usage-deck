@@ -790,7 +790,10 @@ class CodexService(ServiceBase, SchemaAsserts):
         self.assertEqual([h["ChatGPT-Account-ID"] for _, h, _ in self.transport.requests], ["udsyn-acct-PROFILE"])
         self.assertEqual(self.transport.requests[0][1]["Authorization"], "Bearer " + profile_token)
 
-    def test_machine_view_sends_each_merged_account_once_with_its_own_credential(self):
+    def test_machine_view_sends_only_the_selected_profiles_account_with_its_own_credential(self):
+        # Was "each merged account": the isolation rule (DESIGN §12.5) narrows that. 'work' has no codex row, so
+        # the global pool is its effective one: seat A (global + architect copy) is live with the GLOBAL token;
+        # seat B is held by 'verifier' alone, i.e. machine-only inventory: no request, no credential.
         seat_a = codex_token(account="udsyn-acct-A", user="u1", jti="1")
         seat_a_again = codex_token(account="udsyn-acct-A", user="u1", jti="2")  # refreshed token of the same seat
         seat_b = codex_token(account="udsyn-acct-A", user="u2", jti="3")
@@ -800,10 +803,9 @@ class CodexService(ServiceBase, SchemaAsserts):
         self.transport.routes[CODEX_USAGE_URL] = json_response(limit_body())
         cards = self.codex(view="machine")
         self.assertEqual(len(cards), 2)  # two seats of one workspace stay two accounts
-        self.assertEqual(len(self.transport.requests), 2)
-        bearers = {h["Authorization"] for _, h, _ in self.transport.requests}
-        self.assertEqual(len(bearers), 2)
-        self.assertTrue(all(b in ("Bearer " + seat_a, "Bearer " + seat_a_again, "Bearer " + seat_b) for b in bearers))
+        self.assertEqual(len(self.transport.requests), 1)
+        self.assertEqual(self.transport.requests[0][1]["Authorization"], "Bearer " + seat_a)
+        self.assertEqual(sorted((c["state"], c["reason"]) for c in cards), [("opaque", "source_unavailable"), ("ready", None)])
 
     def test_other_providers_never_reach_the_codex_route(self):
         self.s.write_auth({"credential_pool": {

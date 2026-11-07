@@ -58,13 +58,15 @@
     chatgpt_wham_usage: "ChatGPT workspace spend control (wham/usage)",
     none: "No verified source",
   };
-  // Provider-specific, fixed local explanations for an opaque card that shows no meter (DESIGN.md §9).
+  // Provider-specific, fixed local explanations for an opaque card that shows no meter (DESIGN.md §9, §12.1).
   // Codex: source-aware (§9.2). The superseded blanket "never read" explanation is gone: the route is
   // ratified and read, so an opaque card means this account returned nothing this meter can honestly show.
   const OPAQUE_NOTES = {
     "openai-codex": "No Codex spend meter for this account: UsageDeck reads only the ChatGPT workspace spend control, and this account has none it can show right now (no usable credential, an unrecognised or expired reading, or access was not permitted). Nothing is estimated. Any plan shown is an unverified claim from the credential.",
-    anthropic: "No Anthropic session/weekly meter: no unified rate-limit headers are captured for this credential. Hermes does not record them today (recon t_7dce2222), so meters appear only after a call's headers have been captured. Nothing is estimated.",
+    anthropic: "No Anthropic session/weekly meter: no usable capture for this credential. No usable capture; enable the optional observer and use this account normally. A meter can only appear after an ordinary request returns eligible headers (DESIGN.md §12.1). Nothing is estimated.",
   };
+  // Machine view only (DESIGN.md §12.5): inventory of other profiles' accounts is listed, never used live.
+  const MACHINE_ONLY_NOTE = "No live source from this profile: in the machine view, an account held only by other profiles is local inventory, and UsageDeck never uses another profile's credentials for outbound requests. Open the holder's profile to check it live.";
   const SCOPE_LABEL = {
     api_credential: "API credential",
     provider_account: "Provider account",
@@ -382,7 +384,14 @@
     }).filter(Boolean);
   }
 
-  /** Recon-cited explanation for an opaque card of a provider that could expose usage, or null. */
+  /** Why a machine-view card has no live source (held only by other profiles), or null. */
+  function machineOnlyNote(card) {
+    if (!isObj(card) || cardView(card) !== "unavailable" || card.reason !== "source_unavailable") return null;
+    if (card.provider_id === "anthropic" && isObj(card.debug) && card.debug.source === "anthropic_headers") return null; // had a capture
+    return holderNames(card).length > 0 ? MACHINE_ONLY_NOTE : null;
+  }
+
+  /** Explanation for an opaque card of a provider that could expose usage, or null. */
   function opaqueNote(card) {
     if (!isObj(card) || card.kind === "self_hosted") return null;
     if (cardView(card) !== "unavailable") return null;
@@ -671,6 +680,7 @@
         : "Plan unknown";
       const reasonText = has(REASON_TEXT, card.reason) ? REASON_TEXT[card.reason] : null;
       const note = opaqueNote(card);
+      const machineNote = machineOnlyNote(card);
       const holders = holderNames(card);
 
       function closeDrawer() {
@@ -703,7 +713,8 @@
             card.kind === "self_hosted"
               ? "Endpoint health appears in the health strip below."
               : "Session analytics only — profile-wide usage appears in the chart below, not as this account's allowance."),
-          note ? h("p", { className: "ud-muted ud-small", "data-opaque-note": str(card.provider_id) }, note) : null);
+          note ? h("p", { className: "ud-muted ud-small", "data-opaque-note": str(card.provider_id) }, note) : null,
+          machineNote ? h("p", { className: "ud-muted ud-small", "data-machine-only-note": "true" }, machineNote) : null);
       }
 
       return h("article", {
@@ -722,7 +733,7 @@
             h("div", { className: "ud-muted ud-small" }, str(card.account_label) || "Account")),
           h("div", { className: "ud-card-badges" },
             card.kind === "self_hosted" ? h("span", { className: "ud-kind" }, "Self-hosted endpoint") : null,
-            h(Badge, { conf: conf, tip: "Primary source for this card. Checked: " + fmtTime(card.checked_at) + "." + (note && conf === "opaque" ? " " + note : "") }))),
+            h(Badge, { conf: conf, tip: "Primary source for this card. Checked: " + fmtTime(card.checked_at) + "." + (note && conf === "opaque" ? " " + note : "") + (machineNote ? " " + machineNote : "") }))),
         h("div", { className: "ud-card-meta ud-small" },
           h("span", null, planText), " · ",
           h("span", { "data-auth-status": authInfo(card.auth_status).key, title: authInfo(card.auth_status).tip },
@@ -803,7 +814,7 @@
               })))),
         h("p", { className: "ud-muted ud-small", "data-view-note": props.view },
           machine
-            ? "Machine view: the global Hermes home plus every profile's credential pool, merged when they are the same account (JWT account identity). Each card lists the profiles that hold it."
+            ? "Machine view: the global Hermes home plus every profile's credential pool (auth.json only), merged only when a Codex login carries the same account and user identity. Each card lists the profiles that hold it; accounts held only by other profiles are inventory and are never probed with their credentials."
             : "Profile view: the dashboard's selected profile, with global fallback per provider. Cards are not merged across profiles."),
         content);
     }
@@ -982,6 +993,8 @@
         stale ? h(StaleTag, { stale: true }) : null,
         !metricsOk && !de ? h("span", { className: "ud-muted ud-small" }, "Metrics unavailable") : null,
         reason && !de ? h("span", { className: "ud-muted ud-small" }, reason) : null,
+        props.machine && statusKey === "unknown" && e.reason === "source_unavailable" && !de
+          ? h("span", { className: "ud-muted ud-small", "data-machine-only-note": "true", title: MACHINE_ONLY_NOTE }, "Not probed from this profile") : null,
         de ? h("span", { className: "ud-small ud-health-err", role: "note" }, "⚠ " + de.message) : null);
     }
 
@@ -1002,7 +1015,7 @@
           entries.length === 0
             ? h("p", { className: "ud-empty-text" }, machine ? "No self-hosted endpoints detected on this machine." : "No self-hosted endpoints detected in this profile.")
             : h("ul", { className: "ud-health" }, entries.map(function (e, i) {
-              return h(HealthRow, { key: str(e.endpoint_id) || i, entry: e, zoneStale: stale });
+              return h(HealthRow, { key: str(e.endpoint_id) || i, entry: e, zoneStale: stale, machine: machine });
             })));
       }
       return h("section", { className: "ud-zone", "aria-labelledby": "ud-h-health", "data-zone": "health" },
@@ -1099,6 +1112,7 @@
     niceMax: niceMax,
     holderNames: holderNames,
     opaqueNote: opaqueNote,
+    machineOnlyNote: machineOnlyNote,
   };
 
   if (typeof module !== "undefined" && module.exports) {

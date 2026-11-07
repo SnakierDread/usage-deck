@@ -1,7 +1,8 @@
 """Anthropic session/weekly meters from captured unified rate-limit headers (DESIGN.md §9).
 
 All header data here is SYNTHETIC: ``fixtures/synthetic_anthropic_capture.json`` is invented (and flagged
-``"synthetic": true``) or built inline. Nothing was captured from a real Anthropic response.
+``"synthetic": true``) or built inline. Nothing was captured from a real Anthropic response. Capture schema 2
+(scoped by holder, DESIGN.md §12.3); the writer/reader safety cases live in ``test_capture_store.py``.
 """
 
 import json
@@ -37,8 +38,14 @@ def store(allow_synthetic=True, path=FIXTURE):
     return CaptureStore(path, allow_synthetic=allow_synthetic)
 
 
-def adapter_for(row_ids, captures, **kw):
-    ctx = make_ctx("anthropic", credential="sk-ant-oat-synthetic-0000", row_ids=tuple(row_ids), captures=captures, **kw)
+def refs(*row_ids, profile="work", is_global=False):
+    """Scoped capture references ``(is_global, profile, row id)`` of one auth store."""
+    return [(is_global, profile, row_id) for row_id in row_ids]
+
+
+def adapter_for(row_ids, captures, profile="work", **kw):
+    ctx = make_ctx("anthropic", credential="sk-ant-oat-synthetic-0000", credential_refs=tuple(refs(*row_ids, profile=profile)),
+                   captures=captures, **kw)
     return create_adapter(ctx), ctx
 
 
@@ -47,17 +54,17 @@ class FixtureIsLabelledSynthetic(unittest.TestCase):
         data = json.loads(FIXTURE.read_text())
         self.assertIs(data["synthetic"], True)
         self.assertIn("SYNTHETIC", data["_note"])
-        self.assertIsNone(store(allow_synthetic=False).latest("anthropic", ["ant-syn-fresh"]))
-        self.assertIsNotNone(store().latest("anthropic", ["ant-syn-fresh"]))
+        self.assertIsNone(store(allow_synthetic=False).latest("anthropic", refs("ant-syn-fresh")))
+        self.assertIsNotNone(store().latest("anthropic", refs("ant-syn-fresh")))
 
     def test_per_capture_synthetic_flag_is_also_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.json"
-            path.write_text(json.dumps({"schema_version": 1, "captures": [{
-                "provider": "anthropic", "credential_id": "x1", "observed_at": "2026-11-06T11:00:00Z",
-                "synthetic": True, "headers": {P5 + "utilization": "0.1"}}]}))
-            self.assertIsNone(CaptureStore(path).latest("anthropic", ["x1"]))
-            self.assertIsNotNone(CaptureStore(path, allow_synthetic=True).latest("anthropic", ["x1"]))
+            path.write_text(json.dumps({"schema_version": 2, "captures": [{
+                "provider": "anthropic", "holder": {"profile": "work", "is_global": False}, "credential_id": "x1",
+                "observed_at": "2026-11-06T11:00:00Z", "synthetic": True, "headers": {P5 + "utilization": "0.1"}}]}))
+            self.assertIsNone(CaptureStore(path).latest("anthropic", refs("x1")))
+            self.assertIsNotNone(CaptureStore(path, allow_synthetic=True).latest("anthropic", refs("x1")))
 
 
 class MeterMapping(unittest.TestCase):
@@ -125,7 +132,7 @@ class MeterMapping(unittest.TestCase):
         self.assertEqual(parse_reset_epoch("1793977200"), datetime(2026, 11, 6, 15, 0, tzinfo=timezone.utc))
 
     def test_meter_mapping_is_pure_over_a_capture(self):
-        capture = store().latest("anthropic", ["ant-syn-fresh"])
+        capture = store().latest("anthropic", refs("ant-syn-fresh"))
         self.assertEqual([m.id for m in anthropic_meters(capture, NOW)], ["session_5h", "weekly_7d"])
         later = datetime(2026, 11, 7, 0, 0, tzinfo=timezone.utc)  # after the 5h reset, before the 7d one
         self.assertEqual([m.id for m in anthropic_meters(capture, later)], ["weekly_7d"])
@@ -147,9 +154,9 @@ class OpaqueFallbacks(unittest.TestCase):
     def test_capture_for_a_different_provider_is_not_used(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.json"
-            path.write_text(json.dumps({"schema_version": 1, "captures": [{
-                "provider": "openrouter", "credential_id": "r1", "observed_at": "2026-11-06T11:00:00Z",
-                "headers": {P5 + "utilization": "0.1"}}]}))
+            path.write_text(json.dumps({"schema_version": 2, "captures": [{
+                "provider": "openrouter", "holder": {"profile": "work", "is_global": False}, "credential_id": "r1",
+                "observed_at": "2026-11-06T11:00:00Z", "headers": {P5 + "utilization": "0.1"}}]}))
             self.assert_opaque(adapter_for(["r1"], CaptureStore(path))[0])
 
     def test_capture_present_marks_quota_capability_and_source(self):
@@ -170,90 +177,6 @@ class OpaqueFallbacks(unittest.TestCase):
         self.assertEqual((usage.meters, usage.confidence, usage.reason), ((), "opaque", "source_unavailable"))
         self.assertEqual(transport.requests, [])
         self.assertIsInstance(create_adapter(make_ctx("anthropic")), AnthropicAdapter)
-
-
-class CaptureFileHandling(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.path = Path(self._tmp.name) / "plugin-data" / "usage-deck" / "anthropic-ratelimit.json"
-
-    def write(self, text):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(text if isinstance(text, str) else json.dumps(text))
-
-    def entry(self, **kw):
-        base = {"provider": "anthropic", "credential_id": "row1", "observed_at": "2026-11-06T11:00:00Z",
-                "headers": {P5 + "utilization": "0.1"}}
-        base.update(kw)
-        return base
-
-    def test_missing_corrupt_oversize_or_wrong_schema_files_mean_no_capture(self):
-        self.assertIsNone(CaptureStore(self.path).latest("anthropic", ["row1"]))
-        self.assertIsNone(CaptureStore(None).latest("anthropic", ["row1"]))
-        for text in ("not json", "[]", json.dumps({"schema_version": 2, "captures": [self.entry()]}),
-                     json.dumps({"schema_version": 1, "captures": "nope"}), "x" * (256 * 1024 + 1)):
-            self.write(text)
-            self.assertIsNone(CaptureStore(self.path).latest("anthropic", ["row1"]), text[:20])
-
-    def test_one_bad_entry_does_not_hide_the_good_ones(self):
-        self.write({"schema_version": 1, "captures": [
-            self.entry(credential_id="eyJhbGciOi.secretlooking"), self.entry(credential_id="sk-ant-abc"),
-            self.entry(observed_at="yesterday", credential_id="bad-ts"),
-            self.entry(headers={P5 + "utilization": "x" * 100}, credential_id="long"), "junk", self.entry()]})
-        found = CaptureStore(self.path)
-        self.assertIsNotNone(found.latest("anthropic", ["row1"]))
-        for rid in ("eyJhbGciOi.secretlooking", "sk-ant-abc", "bad-ts", "long"):
-            self.assertIsNone(found.latest("anthropic", [rid]), rid)
-
-    def test_only_allowlisted_headers_are_loaded(self):
-        self.write({"schema_version": 1, "captures": [self.entry(headers={
-            P5 + "utilization": "0.1", "authorization": "Bearer should-never-be-here", "x-other": "1",
-            "Anthropic-RateLimit-Unified-Status": "allowed"})]})
-        capture = CaptureStore(self.path).latest("anthropic", ["row1"])
-        self.assertEqual(sorted(capture.headers), [P5 + "utilization", "anthropic-ratelimit-unified-status"])
-
-    def test_newest_capture_wins_across_credential_ids(self):
-        self.write({"schema_version": 1, "captures": [
-            self.entry(credential_id="a", observed_at="2026-11-06T10:00:00Z"),
-            self.entry(credential_id="b", observed_at="2026-11-06T11:00:00Z")]})
-        found = CaptureStore(self.path).latest("anthropic", ["a", "b"])
-        self.assertEqual(found.credential_id, "b")
-
-    def test_record_headers_round_trip_filters_and_replaces(self):
-        when = datetime(2026, 11, 6, 11, 0, 5, tzinfo=timezone.utc)
-        headers = {P5 + "utilization": "0.31", P5 + "reset": "1793977200", "Authorization": "Bearer leak-me-not",
-                   "set-cookie": "s=1", "content-type": "application/json"}
-        record_headers(self.path, "anthropic", "row1", headers, when)
-        record_headers(self.path, "anthropic", "row2", {P7 + "utilization": "0.5"}, when)
-        record_headers(self.path, "anthropic", "row1", {P5 + "utilization": "0.40"}, when.replace(minute=30))
-        text = self.path.read_text()
-        for leak in ("leak-me-not", "Authorization", "cookie", "content-type"):
-            self.assertNotIn(leak, text)
-        data = json.loads(text)
-        self.assertEqual(data["schema_version"], 1)
-        self.assertEqual([c["credential_id"] for c in data["captures"]], ["row1", "row2"])
-        found = CaptureStore(self.path).latest("anthropic", ["row1"])
-        self.assertEqual(found.headers[P5 + "utilization"], "0.40")
-        self.assertEqual(found.observed_at, when.replace(minute=30))
-        self.assertEqual([p.name for p in self.path.parent.iterdir()], [self.path.name])  # no temp leftovers
-
-    def test_record_headers_rejects_bad_input(self):
-        when = datetime(2026, 11, 6, 11, 0, tzinfo=timezone.utc)
-        with self.assertRaises(CaptureError):
-            record_headers(self.path, "anthropic", "row1", {"x-other": "1"}, when)  # no unified headers
-        with self.assertRaises(CaptureError):
-            record_headers(self.path, "anthropic", "row1", {P5 + "utilization": "0.1"}, when.replace(tzinfo=None))
-        with self.assertRaises(CaptureError):
-            record_headers(self.path, "anthropic", "sk-ant-secret", {P5 + "utilization": "0.1"}, when)
-        self.assertFalse(self.path.exists())
-
-    def test_allowlist_matches_recon_header_names(self):
-        for name in ("status", "reset", "5h-status", "5h-reset", "5h-utilization", "7d-status", "7d-reset",
-                     "7d-utilization", "representative-claim", "fallback-percentage", "overage-status",
-                     "overage-disabled-reason"):
-            self.assertIn("anthropic-ratelimit-unified-" + name, ALLOWED_HEADERS)
-        self.assertEqual(default_store_path(Path("/r")), Path("/r/plugin-data/usage-deck/anthropic-ratelimit.json"))
 
 
 class AnthropicCardThroughService(ServiceBase, SchemaAsserts):

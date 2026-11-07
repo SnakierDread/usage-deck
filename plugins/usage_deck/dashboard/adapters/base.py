@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Dict, FrozenSet, Optional, Protocol, Tuple
 
-from ..captures import CaptureStore
+from ..captures import CaptureStore, CredentialRef
 from ..models.dto import (
     DeckError,
     HealthStripEntry,
@@ -108,8 +108,12 @@ class AdapterContext:
     secrets: FrozenSet[str] = frozenset()
     health_credential: Optional[SecretValue] = None  # separately configured metrics credential only
     endpoint_cache: Optional[EndpointCache] = None
-    row_ids: Tuple[str, ...] = ()  # public stored pool row ids (capture lookup key; never secret)
+    #: Scoped ``(is_global, profile, public row id)`` capture references (never secret, never a DTO key).
+    credential_refs: Tuple[CredentialRef, ...] = ()
     captures: Optional[CaptureStore] = None  # read-only header captures, never a network call
+    #: False for machine-only inventory (no member belongs to the selected profile's effective
+    #: credentials/config): adapters must make NO outbound request (DESIGN.md §12.5).
+    live_source: bool = True
     # key_env named an env var with no value: a credential is expected but absent.
     credential_expected: bool = False
 

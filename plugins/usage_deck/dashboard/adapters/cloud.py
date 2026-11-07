@@ -253,6 +253,8 @@ class OpenAICodexAdapter(OpaqueCloudAdapter):
 
     def _do_probe(self) -> ProbeResult:
         # Local-only: no request is spent to obtain a badge; get_usage makes the one request.
+        if not self.ctx.live_source:  # machine-only inventory: not the selected profile's credential
+            return self._probe_result(False, None, self._capabilities(), reason="source_unavailable")
         if not self.ctx.credential:
             return self._probe_result(False, None, self._capabilities(), reason="credentials_missing")
         if self._routing() is None:
@@ -266,6 +268,9 @@ class OpenAICodexAdapter(OpaqueCloudAdapter):
 
     def _fetch(self) -> UsageResult:
         ctx = self.ctx
+        if not ctx.live_source:
+            # Machine-only inventory: another profile's credential is never used for an outbound request.
+            return UsageResult(reason="source_unavailable")
         if not ctx.credential:
             return UsageResult(reason="credentials_missing")
         token = ctx.credential.reveal()
@@ -357,9 +362,9 @@ class AnthropicAdapter(OpaqueCloudAdapter):
 
     def _capture(self) -> Optional[Capture]:
         store = self.ctx.captures
-        if store is None or not self.ctx.row_ids:
+        if store is None or not self.ctx.credential_refs:
             return None
-        return store.latest("anthropic", self.ctx.row_ids)
+        return store.latest("anthropic", self.ctx.credential_refs, now=self.ctx.now())
 
     def _do_probe(self) -> ProbeResult:
         capture = self._capture()
@@ -393,6 +398,9 @@ class OpenRouterAdapter(BaseAdapter):
 
     def _do_usage(self, window: int) -> UsageResult:
         ctx = self.ctx
+        if not ctx.live_source:
+            # Machine-only inventory: another profile's credential is never used for an outbound request.
+            return UsageResult(reason="source_unavailable")
         if not ctx.credential:
             return UsageResult(reason="credentials_missing")
         headers = {
