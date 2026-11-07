@@ -20,9 +20,9 @@ read real credentials. Every child process therefore gets a **clean environment*
 harness proves this (``isolation`` checks: naive env resolves to the real root, harness env to the scratch root) and
 asserts the real ``~/.hermes`` credential/config files are byte-identical before and after.
 
-Network: all HTTPS is forced through a loopback proxy that refuses everything but openrouter.ai:443. Fake loopback endpoints serve the two self-hosted endpoints, and a loopback CONNECT
-proxy + throw-away CA terminates TLS for ``openrouter.ai:443`` so the OpenRouter adapter's real HTTPS path runs against a
-synthetic payload. Everything the fixture produces is **synthetic**; the harness makes no claim about any live pool.
+Network: all HTTPS is forced through a loopback proxy that refuses everything but openrouter.ai:443 and chatgpt.com:443. Fake loopback endpoints serve the two self-hosted endpoints, and a loopback CONNECT
+proxy + throw-away CA terminates TLS for those two origins so the OpenRouter adapter's and the Codex spend-control adapter's
+real HTTPS paths run against synthetic payloads (the real chatgpt.com is never contacted). Everything the fixture produces is **synthetic**; the harness makes no claim about any live pool.
 
 Usage (host interpreter, from the repo root):
 
@@ -75,6 +75,7 @@ FIXTURE = REPO / PLUGIN_REL / "tests" / "fixtures" / "scratch_home"
 API = "/api/plugins/usage-deck"
 PLUGIN_NAME = "usage-deck"
 OPENROUTER_HOST = "openrouter.ai"
+ICP_CODEX_PATH = "/backend-api/wham/usage"
 
 # --------------------------------------------------------------------------- DESIGN.md §2/§3 (independent copy)
 
@@ -104,10 +105,10 @@ ENUMS = {
     "kind": {"cloud", "self_hosted"},
     "plan_source": {"unverified_claim", "provider", "none"},
     "auth_status": {"available", "missing", "rejected"},
-    "unit": {"usd", "count", "percent", "bytes"},
+    "unit": {"usd", "count", "percent", "bytes", "credit"},
     "meter_scope": {"api_credential", "provider_account", "endpoint", "profile"},
     "series_scope": {"profile", "provider", "account"},
-    "meter_source": {"openrouter_key", "session_analytics", "prometheus", "anthropic_headers", "none"},
+    "meter_source": {"openrouter_key", "session_analytics", "prometheus", "anthropic_headers", "chatgpt_wham_usage", "none"},
     "view": {"machine", "profile"},
     "status": {"healthy", "degraded", "offline", "unknown"},
     "error_code": {"invalid_query", "provider_not_found", "auth_required", "permission_denied", "timeout",
@@ -327,26 +328,38 @@ def source_binding_violations(cards, health, series):
                           and m["unit"] == "percent" and m["scope"] == "provider_account" and m["observed_at"]
                           and m["period"]["label"] in ("rolling_5h", "rolling_7d")
                           and m["period"]["start"] is None and m["period"]["end"] is None)
-            if m["confidence"] == "exact" and not (openrouter_ok or headers_ok):
-                v.append(f"{tag}: exact meter without a verified source (openrouter_key / anthropic_headers)")
+            codex_ok = (m["source"] == "chatgpt_wham_usage" and c["provider_id"] == "openai-codex"
+                        and m["unit"] == "credit" and m["scope"] == "provider_account" and m["observed_at"]
+                        and m["id"] == "workspace_spend" and m["period"] == {"start": None, "end": None, "label": "monthly_workspace"})
+            if m["confidence"] == "exact" and not (openrouter_ok or headers_ok or codex_ok):
+                v.append(f"{tag}: exact meter without a verified source (openrouter_key / anthropic_headers / chatgpt_wham_usage)")
             if m["source"] == "openrouter_key" and c["provider_id"] != "openrouter":
                 v.append(f"{tag}: openrouter_key source on another provider")
             if m["source"] == "anthropic_headers" and c["provider_id"] != "anthropic":
                 v.append(f"{tag}: anthropic_headers source on another provider")
+            if m["source"] == "chatgpt_wham_usage" and c["provider_id"] != "openai-codex":
+                v.append(f"{tag}: chatgpt_wham_usage source on another provider")
+            if m["unit"] == "credit" and m["source"] != "chatgpt_wham_usage":
+                v.append(f"{tag}: credit unit without the spend-control source")
             if m["confidence"] == "self_hosted":
                 v.append(f"{tag}: self_hosted confidence on a billing meter")
         if c["confidence"] == "exact" and not any(m["confidence"] == "exact" for m in c["meters"]):
             v.append(f"{tag}: card exact without an exact meter")
-        if c["state"] == "ready" and not any(m["value"] is not None for m in c["meters"]):
+        if c["state"] == "ready" and not any(m["value"] is not None or m["limit"] is not None or m["remaining"] is not None
+                                             for m in c["meters"]):
             v.append(f"{tag}: ready without a measured value")
         if c["confidence"] == "self_hosted":
             h = health_by_ep.get(c["endpoint_id"])
             if c["kind"] != "self_hosted" or h is None or not h["metrics_available"]:
                 v.append(f"{tag}: self_hosted card without successful metrics")
-        if c["kind"] == "cloud" and c["provider_id"] not in ("openrouter", "anthropic") and c["confidence"] != "opaque":
+        if c["kind"] == "cloud" and c["provider_id"] not in ("openrouter", "anthropic", "openai-codex") \
+                and c["confidence"] != "opaque":
             v.append(f"{tag}: cloud card without a verified quota source must be opaque")
         if c["provider_id"] == "anthropic" and c["confidence"] != "opaque" and not c["meters"]:
             v.append(f"{tag}: anthropic card above opaque without a header meter")
+        if c["provider_id"] == "openai-codex" and (c["confidence"] != "opaque" or c["meters"]) \
+                and not any(m["source"] == "chatgpt_wham_usage" for m in c["meters"]):
+            v.append(f"{tag}: codex card above opaque without a workspace spend meter")
         if c["auth_status"] == "available" and c["state"] == "error" and c["error"] is None:
             v.append(f"{tag}: error state without error")
     for h in health:
@@ -467,12 +480,24 @@ class FakeEndpoint:
 
 
 class OpenRouterInterceptor:
-    """CONNECT proxy: terminates TLS for openrouter.ai:443 with a throw-away CA; refuses every other target."""
+    """CONNECT proxy: terminates TLS for the two approved origins with a throw-away CA; refuses every other target.
+
+    ``openrouter.ai:443`` serves the OpenRouter key endpoint (recorded in ``rec``). ``chatgpt.com:443`` serves the one
+    ratified Codex route ``GET /backend-api/wham/usage`` (DESIGN.md §9.2) with a synthetic body (recorded, with every
+    request header, in ``codex_rec``). Nothing here is a real provider response.
+    """
 
     PAYLOAD_USAGE, PAYLOAD_LIMIT, PAYLOAD_REMAINING = 1.5, 5, 3.5
+    CODEX_HOST = "chatgpt.com"
+    CODEX_PATH = "/backend-api/wham/usage"
+    CODEX_USED, CODEX_LIMIT, CODEX_REMAINING = "864.5", "1500", "635.5"
+    CODEX_ECHO_EMAIL = "udsyn-upstream-echo@example.invalid"
+    CODEX_ECHO_USER = "UDSYN-upstream-user-echo-5e07"
+    CODEX_RESET_DAYS = 20
 
     def __init__(self, workdir: Path):
         self.rec = _Recorder()
+        self.codex_rec = _Recorder()
         self.connects = []
         self.ca_pem = workdir / "ca.pem"
         srv_pem, srv_key = workdir / "srv.pem", workdir / "srv.key"
@@ -490,8 +515,8 @@ class OpenRouterInterceptor:
         def sh(*args):
             subprocess.run(["openssl", *args], cwd=wd, check=True, capture_output=True)
 
-        (wd / "ext.cnf").write_text("subjectAltName=DNS:%s\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature\n"
-                                    "extendedKeyUsage=serverAuth\n" % OPENROUTER_HOST)
+        (wd / "ext.cnf").write_text("subjectAltName=DNS:%s,DNS:%s\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature\n"
+                                    "extendedKeyUsage=serverAuth\n" % (OPENROUTER_HOST, self.CODEX_HOST))
         sh("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", "ca.key",
            "-out", "ca.pem", "-days", "2", "-subj", "/CN=usage-deck-acceptance-throwaway-ca",
            "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign")
@@ -528,7 +553,7 @@ class OpenRouterInterceptor:
                 conn.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
                 return
             target = first[1]
-            allowed = target == f"{OPENROUTER_HOST}:443"
+            allowed = target in (f"{OPENROUTER_HOST}:443", f"{self.CODEX_HOST}:443")
             self.connects.append((target, allowed))
             if not allowed:
                 conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
@@ -539,16 +564,34 @@ class OpenRouterInterceptor:
             line = request.split("\r\n", 1)[0].split()
             headers = {k.lower(): v for k, v in (h.split(": ", 1) for h in request.split("\r\n")[1:] if ": " in h)}
             auth = headers.get("authorization", "")
-            self.rec.add(method=line[0], path=line[1], authorization=auth)
-            if line[0] == "GET" and line[1] == "/api/v1/key":
-                body = json.dumps({"data": {
-                    "label": auth.replace("Bearer ", ""),            # upstream text echoing the credential
-                    "usage": self.PAYLOAD_USAGE, "limit": self.PAYLOAD_LIMIT,
-                    "limit_remaining": self.PAYLOAD_REMAINING, "is_free_tier": False,
-                    "hash": "UDSYN-upstream-echo-91ac4e"}}).encode()
-                status = b"200 OK"
+            if target == f"{self.CODEX_HOST}:443":
+                self.codex_rec.add(method=line[0], path=line[1], authorization=auth, headers=headers)
+                if line[0] == "GET" and line[1] == self.CODEX_PATH:
+                    reset = int(time.time()) + self.CODEX_RESET_DAYS * 86400
+                    body = json.dumps({
+                        "user_id": self.CODEX_ECHO_USER,                       # upstream identity echoes: never rendered
+                        "account_id": headers.get("chatgpt-account-id", ""),
+                        "email": self.CODEX_ECHO_EMAIL, "plan_type": "business",
+                        "credits": {"balance": "635.5151499509811", "has_credits": True},
+                        "spend_control": {"reached": False, "individual_limit": {
+                            "source": "workspace_spend_controls", "unit": "credit", "limit": self.CODEX_LIMIT,
+                            "used": self.CODEX_USED, "remaining": self.CODEX_REMAINING, "used_percent": 58,
+                            "remaining_percent": 42, "reset_after_seconds": reset - int(time.time()),
+                            "reset_at": reset}}}).encode()
+                    status = b"200 OK"
+                else:
+                    body, status = b"{}", b"404 Not Found"
             else:
-                body, status = b"{}", b"404 Not Found"
+                self.rec.add(method=line[0], path=line[1], authorization=auth)
+                if line[0] == "GET" and line[1] == "/api/v1/key":
+                    body = json.dumps({"data": {
+                        "label": auth.replace("Bearer ", ""),            # upstream text echoing the credential
+                        "usage": self.PAYLOAD_USAGE, "limit": self.PAYLOAD_LIMIT,
+                        "limit_remaining": self.PAYLOAD_REMAINING, "is_free_tier": False,
+                        "hash": "UDSYN-upstream-echo-91ac4e"}}).encode()
+                    status = b"200 OK"
+                else:
+                    body, status = b"{}", b"404 Not Found"
             tls.sendall(b"HTTP/1.1 " + status + b"\r\nContent-Type: application/json\r\nContent-Length: "
                         + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
             tls.close()
@@ -894,6 +937,32 @@ def free_text_has(card, needle):
     return [k for k in ("provider_label", "account_label", "plan_name") if card.get(k) and needle in card[k]]
 
 
+def codex_fixture_identity(auth):
+    """(account, user) claims of the fixture's synthetic Codex JWT (invented ``udsyn-*`` values)."""
+    token = auth["credential_pool"]["openai-codex"][0]["access_token"]
+    claims = json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "=="))["https://api.openai.com/auth"]
+    return claims["chatgpt_account_id"], claims["chatgpt_user_id"]
+
+
+def codex_spend_ok(card):
+    """A Codex card is the ratified shape (DESIGN.md §9.2): ready/exact with the one credit meter and nothing else."""
+    meters = card["meters"]
+    if len(meters) != 1:
+        return False
+    m = meters[0]
+    return ((card["state"], card["confidence"], card["reason"], card["error"], card["kind"], card["auth_status"])
+            == ("ready", "exact", None, None, "cloud", "available")
+            and {k: m[k] for k in ("id", "label", "value", "limit", "remaining", "unit", "scope", "period",
+                                   "confidence", "source")} == {
+                "id": "workspace_spend", "label": "Workspace spend limit (monthly)",
+                "value": float(OpenRouterInterceptor.CODEX_USED), "limit": float(OpenRouterInterceptor.CODEX_LIMIT),
+                "remaining": float(OpenRouterInterceptor.CODEX_REMAINING), "unit": "credit", "scope": "provider_account",
+                "period": {"start": None, "end": None, "label": "monthly_workspace"}, "confidence": "exact",
+                "source": "chatgpt_wham_usage"}
+            and m["observed_at"] == card["checked_at"] and bool(TS_RE.match(str(m["resets_at"])))
+            and m["resets_at"] > card["checked_at"] and card["debug"]["source"] == "chatgpt_wham_usage")
+
+
 # --------------------------------------------------------------------------- scenarios
 
 def scenario_isolation(ctx: Context):
@@ -1055,10 +1124,10 @@ def machine_checks(R, host, bodies, capture):
     if len(mcards) == 7:
         codex = pv["openai-codex"][0]
         R.check("machine dedupe: root + verifier hold the same JWT account identity under different tokens -> one "
-                "card listing both holders (global first); plan stays an unverified claim; still opaque",
+                "card listing both holders (global first); plan stays an unverified claim; one exact credit meter",
                 held(codex) == [("global", True), ("verifier", False)]
-                and (codex["plan_name"], codex["plan_source"], codex["state"], codex["confidence"]) ==
-                ("plus", "unverified_claim", "opaque", "opaque"), json.dumps(codex)[:300])
+                and (codex["plan_name"], codex["plan_source"]) == ("plus", "unverified_claim")
+                and codex_spend_ok(codex), json.dumps(codex)[:300])
         by_holder = {tuple(held(c)): c for c in pv["openrouter"]}
         R.check("machine view: the two openrouter rows stay separate accounts, each held by exactly its own home; "
                 "only the launch home's (root) effective credential is probed live (ready/exact), profile work's "
@@ -1197,10 +1266,12 @@ def scenario_main(ctx: Context):
                         "unit": "usd", "scope": "api_credential", "confidence": "exact", "source": "openrouter_key"}
                     and orc["meters"][0]["period"] == {"start": None, "end": None, "label": "unknown"}
                     and orc["meters"][0]["observed_at"] == orc["checked_at"], json.dumps(orc["meters"])[:300])
-            for name, c in (("nous", nous), ("openai-codex", codex)):
-                R.check(f"{name}: opaque / unsupported, no meters (no verified quota source; credential presence != quota)",
-                        (c["state"], c["confidence"], c["reason"], c["meters"], c["kind"], c["auth_status"]) ==
-                        ("opaque", "opaque", "unsupported", [], "cloud", "available"), json.dumps(c)[:300])
+            R.check("nous: opaque / unsupported, no meters (no verified quota source; credential presence != quota)",
+                    (nous["state"], nous["confidence"], nous["reason"], nous["meters"], nous["kind"], nous["auth_status"]) ==
+                    ("opaque", "opaque", "unsupported", [], "cloud", "available"), json.dumps(nous)[:300])
+            R.check("openai-codex: ready / exact, single workspace_spend meter in credits bound to source "
+                    "chatgpt_wham_usage (synthetic payload); only the spend control is mapped", codex_spend_ok(codex),
+                    json.dumps(codex)[:400])
             R.check("openai-codex plan 'plus' is an unverified local JWT claim (never an entitlement)",
                     (codex["plan_name"], codex["plan_source"]) == ("plus", "unverified_claim")
                     and (nous["plan_name"], nous["plan_source"]) == (None, "none"))
@@ -1242,8 +1313,9 @@ def scenario_main(ctx: Context):
         R.check("source binding: exact only with openrouter_key; self_hosted only with metrics; series never exact",
                 bool(cards) and not source_binding_violations(cards, entries, series),
                 "; ".join(source_binding_violations(cards, entries, series)))
-        R.check("no 'estimated'/'exact' label on any subscription card except the openrouter meter",
-                {c["confidence"] for c in cards if c["provider_id"] != "openrouter"} <= {"opaque", "self_hosted"})
+        R.check("no 'estimated'/'exact' label on any subscription card except the openrouter and codex meters",
+                {c["confidence"] for c in cards if c["provider_id"] not in ("openrouter", "openai-codex")}
+                <= {"opaque", "self_hosted"})
 
         for w in ("7", "90"):
             r = host.api("usage", f"window={w}")
@@ -1310,9 +1382,26 @@ def scenario_main(ctx: Context):
 
         # ---- egress: what did the plugin talk to?
         new_connects = ctx.icp.connects[plug_before:]
-        R.check("plugin egress: only CONNECT openrouter.ai:443 (no other origin, no refresh/billing endpoints)",
-                {t for t, _ in new_connects} <= {"openrouter.ai:443"} and any(t == "openrouter.ai:443" for t, _ in new_connects),
-                str(new_connects))
+        R.check("plugin egress: only CONNECT openrouter.ai:443 and chatgpt.com:443 (no other origin, no refresh/billing endpoints)",
+                {t for t, _ in new_connects} <= {"openrouter.ai:443", "chatgpt.com:443"}
+                and {t for t, _ in new_connects} == {"openrouter.ai:443", "chatgpt.com:443"}
+                and all(ok for _, ok in new_connects), str(new_connects))
+        cx_reqs = ctx.icp.codex_rec.requests
+        codex_tokens = {ctx.fixture_auth["credential_pool"]["openai-codex"][0]["access_token"],
+                        ctx.fixture_verifier_auth["credential_pool"]["openai-codex"][0]["access_token"]}
+        codex_account, _codex_user = codex_fixture_identity(ctx.fixture_auth)
+        approved = {"host", "authorization", "accept", "user-agent", "originator", "chatgpt-account-id",
+                    "x-openai-internal-codex-residency", "accept-encoding", "connection"}
+        R.check("chatgpt.com saw only GET /backend-api/wham/usage with an approved credential, the same token's account "
+                "claim, an honest HermesAgent/usage-deck UA, and no cookie/refresh/id-token/extra header",
+                bool(cx_reqs) and all((q["method"], q["path"]) == ("GET", ICP_CODEX_PATH) for q in cx_reqs)
+                and {q["authorization"] for q in cx_reqs} <= {"Bearer " + t for t in codex_tokens}
+                and all(q["headers"].get("chatgpt-account-id") == codex_account
+                        and q["headers"].get("user-agent") == "HermesAgent/usage-deck"
+                        and q["headers"].get("originator") == "hermes-agent"
+                        and q["headers"].get("host") == "chatgpt.com"
+                        and set(q["headers"]) <= approved and "cookie" not in q["headers"] for q in cx_reqs),
+                str([(q["method"], q["path"], sorted(q["headers"])) for q in cx_reqs])[:400])
         or_reqs = ctx.icp.rec.requests
         root_token = ctx.fixture_auth["credential_pool"]["openrouter"][0]["access_token"]
         work_token = ctx.fixture_work_auth["credential_pool"]["openrouter"][0]["access_token"]
@@ -1335,9 +1424,11 @@ def scenario_main(ctx: Context):
 
     # ---- secrets + immutability + real-home tripwire
     log = host.log_text()
-    scan_texts(R, "responses (subscriptions/usage/health/errors/profile probes)", bodies, ctx.long_secrets
-               | {"UDSYN-upstream-echo-91ac4e"})
-    scan_texts(R, "dashboard process log", [log], ctx.long_secrets)
+    codex_account, codex_user = codex_fixture_identity(ctx.fixture_auth)
+    codex_private = {codex_account, codex_user, ctx.icp.CODEX_ECHO_EMAIL, ctx.icp.CODEX_ECHO_USER, "635.5151499509811"}
+    scan_texts(R, "responses (subscriptions/usage/health/errors/profile probes) incl. Codex routing claims and upstream "
+                  "identity echoes", bodies, ctx.long_secrets | {"UDSYN-upstream-echo-91ac4e"} | codex_private)
+    scan_texts(R, "dashboard process log", [log], ctx.long_secrets | codex_private)
     final = s.watched()
     R.check("config/auth immutability: auth.json, config.yaml, .env, profile files unchanged (hash, mtime, inode) "
             "across all plugin requests", final == after_start,
@@ -1557,6 +1648,17 @@ def self_check(R):
     exact_wrong = dict(card, provider_id="nous", meters=[meter], confidence="exact", state="ready")
     R.check("source-binding validator rejects an exact meter whose source is not openrouter_key",
             bool(source_binding_violations([exact_wrong], [], [])))
+    credit = dict(meter, id="workspace_spend", unit="credit", scope="provider_account", source="chatgpt_wham_usage",
+                  period={"start": None, "end": None, "label": "monthly_workspace"}, limit=10.0, resets_at=now)
+    codex_card = dict(card, provider_id="openai-codex", meters=[credit], confidence="exact", state="ready")
+    R.check("source-binding validator accepts the ratified Codex credit meter (limit-only readings are ready too)",
+            not source_binding_violations([codex_card], [], [])
+            and not source_binding_violations([dict(codex_card, meters=[dict(credit, value=None)])], [], []))
+    R.check("source-binding validator rejects a credit meter on another provider / source, and a wham source off Codex",
+            all(source_binding_violations([c], [], []) for c in (
+                dict(codex_card, provider_id="nous"), dict(codex_card, meters=[dict(credit, source="openrouter_key")]),
+                dict(codex_card, meters=[dict(credit, unit="usd")]),
+                dict(codex_card, meters=[dict(credit, period={"start": None, "end": None, "label": "unknown"})]))))
     R.check("source-binding validator rejects a self_hosted card without successful metrics",
             bool(source_binding_violations([dict(card, kind="self_hosted", confidence="self_hosted", endpoint_id="ep_" + "1" * 24)],
                                            [], [])))

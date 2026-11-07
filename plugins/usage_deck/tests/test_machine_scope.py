@@ -284,7 +284,9 @@ class CredentialUseIsolation(MachineBase, SchemaAsserts):
         self.assertEqual(len(item.holders), 2)
         self.assertEqual((item.credential, item.health_credential, item.live_source, item.auth_status),
                          (None, None, False, "available"))
-        self.assertEqual(len(item.secrets), 2)  # secrets are still unioned for masking
+        # secrets are still unioned for masking: both tokens plus the private account routing claim (§9.2 term 2)
+        self.assertEqual(len(item.secrets), 3)
+        self.assertIn("acct-1", item.secrets)
 
     def test_selected_profile_config_endpoints_stay_live(self):
         self.custom = [{"name": "box", "base_url": GPU + "/v1"}]

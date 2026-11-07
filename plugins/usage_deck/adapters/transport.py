@@ -109,7 +109,10 @@ class AllowedTarget:
 
 
 def _effective_port(scheme: str, port: Optional[int]) -> int:
-    return port if port else (443 if scheme == "https" else 80)
+    # Absent (None) takes the scheme default; an explicit 0 stays 0 and never matches a target.
+    if port is None:
+        return 443 if scheme == "https" else 80
+    return port
 
 
 class GuardedTransport:
@@ -127,7 +130,7 @@ class GuardedTransport:
             raise TransportError(TransportError.FORBIDDEN_URL) from None
         scheme = (parts.scheme or "").lower()
         host = (parts.hostname or "").lower()
-        if "@" in parts.netloc or parts.fragment or scheme not in ("http", "https") or not host:
+        if port == 0 or "@" in parts.netloc or "#" in url or scheme not in ("http", "https") or not host:
             raise TransportError(TransportError.FORBIDDEN_URL)
         for target in self._allowed:
             if (target.scheme, target.host) != (scheme, host):
@@ -136,7 +139,7 @@ class GuardedTransport:
                 continue
             if target.paths is not None and parts.path not in target.paths:
                 continue
-            if parts.query and target.paths is not None:
-                continue
+            if (parts.query or "?" in url) and target.paths is not None:
+                continue  # exact-path targets take no query (not even an empty one)
             return self._inner.get(url, headers, timeout, max_bytes)
         raise TransportError(TransportError.FORBIDDEN_URL)

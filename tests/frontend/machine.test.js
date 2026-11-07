@@ -127,17 +127,13 @@ test("opaque Codex/Anthropic cards explain why there is no meter; no number, bar
   const codex = m.$("[data-card-id=acct_go]");
   assert.equal(codex.dataset.view, "unavailable");
   const note = codex.querySelector("[data-opaque-note=openai-codex]");
-  assert.match(note.textContent, /recon t_7dce2222/);
-  assert.match(note.textContent, /source-derived candidate endpoint/);
-  assert.match(note.textContent, /not live-verified/);
-  assert.match(note.textContent, /makes no request to it/);
-  assert.match(note.textContent, /DESIGN\.md §12\.4/);
-  // corrected source-only claim (DESIGN §12.4): the default candidate keeps /backend-api, NOT /wham/usage alone
-  assert.match(note.textContent, /chatgpt\.com\/backend-api\/wham\/usage/);
-  assert.ok(!/chatgpt\.com\/wham\/usage/.test(note.textContent));
+  // Source-aware (DESIGN.md §9.2): the superseded blanket "never read, no live response" text is gone.
+  assert.match(note.textContent, /No Codex spend meter for this account/);
+  assert.match(note.textContent, /Nothing is estimated/);
+  assert.doesNotMatch(note.textContent, /t_7dce2222|no live response|§1\.3|§12\.4|not live-verified|makes no request to it/);
   const badge = codex.querySelector(".ud-card-head .ud-badge");
   assert.equal(badge.dataset.confidence, "opaque");
-  assert.match(badge.getAttribute("title"), /not live-verified/);
+  assert.doesNotMatch(badge.getAttribute("title"), /t_7dce2222|no live response|not live-verified/);
   assert.equal(codex.querySelectorAll("[role=progressbar], .ud-meter").length, 0);
   const ant = m.$("[data-card-id=acct_ant2]");
   const antNote = ant.querySelector("[data-opaque-note=anthropic]").textContent;
@@ -187,11 +183,11 @@ test("a not-probed machine health row says so; the profile view does not", async
   await m.unmount();
 });
 
-test("a provider without a recon note (Nous) and self-hosted cards get no note", async () => {
+test("a provider without a note (Nous) and self-hosted cards get no note", async () => {
   assert.equal(mod.opaqueNote(F.opaqueNous), null);
   assert.equal(mod.opaqueNote(F.selfHosted), null);
   assert.equal(mod.opaqueNote(anthropicReady), null, "a card with measured meters needs no explanation");
-  assert.match(mod.opaqueNote(codexGo), /t_7dce2222/);
+  assert.match(mod.opaqueNote(codexGo), /No Codex spend meter/);
   assert.match(mod.opaqueNote(anthropicOpaque), /No usable capture; enable the optional observer/);
   assert.equal(mod.opaqueNote(null), null);
 });

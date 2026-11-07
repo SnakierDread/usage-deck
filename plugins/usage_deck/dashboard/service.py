@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .adapters import create_adapter
 from .adapters.analytics import HostAnalyticsReader, MemoAnalyticsReader
 from .adapters.base import AdapterContext, AnalyticsReader, EndpointCache
-from .adapters.cloud import OPENROUTER_TARGET
+from .adapters.cloud import CODEX_PROVIDER_ID, CODEX_TARGET, OPENROUTER_TARGET
 from .adapters.fallback import SessionAnalyticsAdapter
 from .adapters.transport import AllowedTarget, GuardedTransport, UrllibTransport
 from .captures import CaptureStore
@@ -344,6 +344,8 @@ class UsageDeckService:
         if item.live_source:  # machine-only inventory never gets an outbound target (DESIGN.md §12.5)
             if item.provider_id.lower() == "openrouter":
                 targets.append(OPENROUTER_TARGET)
+            if item.provider_id.strip().lower() == CODEX_PROVIDER_ID:
+                targets.append(CODEX_TARGET)  # DESIGN.md §9.2: fixed, never derived from claims/config/response
             if item.endpoint is not None and item.endpoint.safe:
                 targets.append(AllowedTarget(item.endpoint.scheme, item.endpoint.host, item.endpoint.port, None))
         return AdapterContext(
@@ -386,8 +388,8 @@ class UsageDeckService:
         if error is not None:
             state, confidence, reason = "error", "opaque", usage.reason or probe.reason
             meters = ()
-        elif any(m.value is not None for m in meters):
-            state, reason = "ready", None
+        elif any(m.value is not None or m.limit is not None or m.remaining is not None for m in meters):
+            state, reason = "ready", None  # any non-null observation (e.g. limit-only) is a reading
         elif usage.reason == "no_observations":
             state, reason = "empty", "no_observations"
         else:
