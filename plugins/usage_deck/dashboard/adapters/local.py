@@ -50,6 +50,11 @@ class _Snapshot:
 _NOT_RUN = _Attempt(False, "")
 
 
+def _denied(attempt: _Attempt) -> bool:
+    """The endpoint answered 401/403 (an access refusal, as opposed to an outage or a bad payload)."""
+    return attempt.failure == "status" and attempt.status in (401, 403)
+
+
 def _health_paths(endpoint, provider_id: str) -> Tuple[str, ...]:
     ollama_like = provider_id.lower() == "ollama" or endpoint.port == 11434
     if ollama_like and not endpoint.path.endswith("/v1"):
@@ -144,20 +149,27 @@ class SelfHostedAdapter(BaseAdapter):
         credential_sent = bool(ctx.credential)
         unauthorized = (not h_ok) and any(a.failure == "status" and a.status == 401 for a in tried)
         # A 401 means "credential rejected" only if one was sent; anonymously it means none was.
-        anonymous_401 = unauthorized and not credential_sent
+        # An anonymous 403 is the same gateway refusing an unidentified caller (llama-swap/nginx style),
+        # so any anonymous 401/403 is "credential missing", never a rejection and never an outage.
+        anonymous = not credential_sent
+        anonymous_denied = anonymous and (not h_ok) and any(_denied(a) for a in tried)
+        metrics_denied = anonymous and not ctx.health_credential and _denied(metrics_attempt)
         error_code = "auth_required" if unauthorized and credential_sent else None
         if m_ok and h_ok:
             status, confidence, reason = "healthy", "self_hosted", None
         elif h_ok:
-            status, confidence, reason = "degraded", "opaque", "metrics_unavailable"
+            status, confidence = "degraded", "opaque"
+            reason = "credentials_missing" if metrics_denied else "metrics_unavailable"
         elif m_ok:
             status, confidence = "degraded", "self_hosted"
-            reason = "credentials_missing" if anonymous_401 else "source_unavailable"
+            reason = "credentials_missing" if anonymous_denied else "source_unavailable"
         elif all(a.failure in ("connection", "timeout") for a in all_attempts):
             status, confidence, reason = "offline", "opaque", "source_unavailable"
             error_code = "timeout" if all(a.failure == "timeout" for a in all_attempts) else "upstream_unavailable"
-        elif anonymous_401:
-            status, confidence, reason = "unknown", "opaque", "credentials_missing"
+        elif anonymous_denied:
+            # The host answered but refuses an anonymous caller: reachable and degraded, credential missing.
+            # No metrics, no estimation, no fabricated credential, and no auth_required error.
+            status, confidence, reason = "degraded", "opaque", "credentials_missing"
         else:
             status, confidence, reason = "unknown", "opaque", "source_unavailable"
             if error_code is None:

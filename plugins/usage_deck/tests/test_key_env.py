@@ -202,7 +202,7 @@ class KeyEnvServiceTests(Base):
         (card,), (entry,) = cards, health
         self.assertEqual(card["auth_status"], "missing")
         self.assertEqual((card["reason"], card["error"]), ("credentials_missing", None))
-        self.assertEqual((entry["status"], entry["reason"], entry["error"]), ("unknown", "credentials_missing", None))
+        self.assertEqual((entry["status"], entry["reason"], entry["error"]), ("degraded", "credentials_missing", None))
         self.assertNotIn(REJECTED_TEXT, json.dumps(envelopes))
 
     def test_anonymous_401_with_working_metrics_is_credentials_missing_not_rejected(self):
