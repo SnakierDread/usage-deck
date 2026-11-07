@@ -6,6 +6,7 @@ against an independent, hand-written copy of the contract rather than only scann
 """
 
 import json
+import re
 import unittest
 from unittest import mock
 
@@ -20,9 +21,10 @@ from .test_service import GPU, METRICS, ServiceBase
 # Independent copy of DESIGN.md §2 field lists (deliberately not derived from dto.py).
 CARD_KEYS = {"id", "provider_id", "account_id", "provider_label", "account_label", "kind", "plan_name",
              "plan_source", "auth_status", "endpoint_id", "state", "confidence", "reason", "meters",
-             "checked_at", "stale", "error", "debug"}
+             "checked_at", "stale", "error", "debug", "holders"}
+HOLDER_KEYS = {"profile", "is_global"}
 METER_KEYS = {"id", "label", "value", "limit", "remaining", "unit", "scope", "period", "confidence",
-              "source", "observed_at"}
+              "source", "observed_at", "resets_at"}
 PERIOD_KEYS = {"start", "end", "label"}
 ERROR_KEYS = {"code", "message", "retryable", "provider_id", "account_id"}
 DEBUG_KEYS = {"adapter", "capabilities", "source", "sanitized"}
@@ -42,7 +44,8 @@ ENUMS = {
     "auth_status": {"available", "missing"},
     "unit": {"usd", "count", "percent", "bytes"},
     "scope": {"api_credential", "provider_account", "endpoint", "profile", "provider", "account"},
-    "source": {"openrouter_key", "session_analytics", "prometheus", "none"},
+    "source": {"openrouter_key", "session_analytics", "prometheus", "anthropic_headers", "none"},
+    "view": {"machine", "profile"},
     "status": {"healthy", "degraded", "offline", "unknown"},
     "inventory_state": {"empty", "detected"},
     "bucket": {"day"}, "timezone": {"server_local"}, "coverage": {"partial", "complete"},
@@ -83,6 +86,10 @@ class SchemaAsserts(unittest.TestCase):
         for m in c["meters"]:
             self.assertEqual(set(m), METER_KEYS)
             self.assertEqual(set(m["period"]), PERIOD_KEYS)
+            self.assertTrue(m["resets_at"] is None or re.match(ISO_Z, m["resets_at"]))
+        for holder in c["holders"]:
+            self.assertEqual(set(holder), HOLDER_KEYS)
+            self.assertIsInstance(holder["is_global"], bool)
         if c["error"] is not None:
             self.assertEqual(set(c["error"]), ERROR_KEYS)
         for k in ("kind", "plan_source", "auth_status", "state", "confidence", "reason"):
@@ -123,8 +130,9 @@ class SchemaAsserts(unittest.TestCase):
         self.assertRegex(body["meta"]["request_id"], r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
         data = body["data"]
         if endpoint == "subscriptions":
-            self.assertEqual(set(data), {"cards", "inventory_state"})
+            self.assertEqual(set(data), {"cards", "inventory_state", "view"})
             self.assertIn(data["inventory_state"], ENUMS["inventory_state"])
+            self.assertIn(data["view"], ENUMS["view"])
             for c in data["cards"]:
                 self.assert_exact_card(c)
         elif endpoint == "health":
@@ -169,8 +177,9 @@ class SanitizeSchemaTests(unittest.TestCase):
 
     def test_wire_keys_cover_contract_and_none_are_sensitive(self):
         contract = (CARD_KEYS | METER_KEYS | PERIOD_KEYS | ERROR_KEYS | DEBUG_KEYS | POINT_KEYS | SERIES_KEYS
-                    | HEALTH_KEYS | META_KEYS | {"ok", "data", "error", "meta", "cards", "inventory_state",
-                                                 "entries", "window_days", "series", "reason", "provider_id"})
+                    | HEALTH_KEYS | META_KEYS | HOLDER_KEYS
+                    | {"ok", "data", "error", "meta", "cards", "inventory_state", "view",
+                       "entries", "window_days", "series", "reason", "provider_id"})
         self.assertEqual(set(dto.WIRE_KEYS), contract)
         self.assertEqual([k for k in dto.WIRE_KEYS if is_sensitive_name(k)], [])
 
@@ -178,7 +187,9 @@ class SanitizeSchemaTests(unittest.TestCase):
         sample = {"confidence": "self_hosted", "state": "opaque", "reason": "unsupported", "kind": "self_hosted",
                   "plan_source": "unverified_claim", "auth_status": "available", "status": "degraded",
                   "unit": "usd", "scope": "api_credential", "source": "openrouter_key",
-                  "inventory_state": "detected", "bucket": "day", "timezone": "server_local",
+                  "inventory_state": "detected", "view": "machine", "bucket": "day", "timezone": "server_local",
+                  "resets_at": "2026-11-06T17:00:00Z",
+                  "holders": [{"profile": "verifier", "is_global": False}, {"profile": "global", "is_global": True}],
                   "coverage": "partial", "code": "upstream_unavailable",
                   "message": dto.ERROR_MESSAGES["upstream_unavailable"],
                   "checked_at": "2026-11-06T12:00:00Z", "observed_at": "2026-11-06T12:00:00Z",
@@ -203,7 +214,8 @@ class SchemaGuardTests(unittest.TestCase):
                 "account_label": "Account 1", "kind": "cloud", "plan_name": None, "plan_source": "none",
                 "auth_status": "missing", "endpoint_id": None, "state": "opaque", "confidence": "opaque",
                 "reason": "unsupported", "meters": [], "checked_at": "2026-11-06T12:00:00Z", "stale": False,
-                "error": None, "debug": {"adapter": "a", "capabilities": [], "source": "s", "sanitized": True}}
+                "error": None, "debug": {"adapter": "a", "capabilities": [], "source": "s", "sanitized": True},
+                "holders": [{"profile": "work", "is_global": False}]}
         self.assertIs(check_wire("card", card), card)
         for mutate in (
             lambda c: c.pop("reason"),                        # omitted != null
@@ -212,6 +224,9 @@ class SchemaGuardTests(unittest.TestCase):
             lambda c: c.update(confidence="opa[REDACTED]e"),  # invalid enum
             lambda c: c.update(checked_at="[REDACTED]-11-06T12:00:00Z"),
             lambda c: c["debug"].update(sanitized=False),
+            lambda c: c.pop("holders"),
+            lambda c: c["holders"].append({"profile": "p"}),   # holder missing is_global
+            lambda c: c["holders"].append({"profile": "[REDACTED]", "is_global": False}),
         ):
             bad = json.loads(json.dumps(card))
             mutate(bad)
@@ -239,9 +254,11 @@ class ServiceSchemaTests(ServiceBase, SchemaAsserts):
             GPU + "/v1/models": json_response({"data": []}, latency=6.0),
         })
 
+    VIEW = "machine"
+
     def fetch_all(self):
         svc = self.make()
-        return {e: self.call(svc, e) for e in ("subscriptions", "health", "usage")}
+        return {e: self.call(svc, e, [("view", self.VIEW)]) for e in ("subscriptions", "health", "usage")}
 
     def test_control_run_matches_the_contract_exactly(self):
         self.seed_for("ctl-0000-none")
@@ -318,6 +335,19 @@ class ServiceSchemaTests(ServiceBase, SchemaAsserts):
         status, body = self.call(self.make(), "subscriptions")
         self.assert_exact_envelope("subscriptions", status, body)
         self.assertEqual(body["data"]["cards"][0]["plan_source"], "unverified_claim")
+
+
+class ServiceSchemaProfileViewTests(ServiceSchemaTests):
+    """The same exact-schema and masking-collision checks against the profile-scoped view."""
+
+    VIEW = "profile"
+
+    def test_profile_view_cards_have_no_holders(self):
+        self.seed_for("ctl-0000-none")
+        _, body = self.fetch_all()["subscriptions"]
+        self.assertEqual(body["data"]["view"], "profile")
+        self.assertTrue(body["data"]["cards"])
+        self.assertTrue(all(c["holders"] == [] for c in body["data"]["cards"]))
 
 
 if __name__ == "__main__":
