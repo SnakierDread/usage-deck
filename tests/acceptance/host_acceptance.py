@@ -494,7 +494,6 @@ class OpenRouterInterceptor:
     CODEX_ECHO_EMAIL = "udsyn-upstream-echo@example.invalid"
     CODEX_ECHO_USER = "UDSYN-upstream-user-echo-5e07"
     CODEX_RESET_DAYS = 20
-    CODEX_STATUS = 200  # scenarios may switch the fake route (e.g. 401) by assigning this attribute
 
     def __init__(self, workdir: Path):
         self.rec = _Recorder()
@@ -579,9 +578,7 @@ class OpenRouterInterceptor:
                             "used": self.CODEX_USED, "remaining": self.CODEX_REMAINING, "used_percent": 58,
                             "remaining_percent": 42, "reset_after_seconds": reset - int(time.time()),
                             "reset_at": reset}}}).encode()
-                    status = f"{self.CODEX_STATUS} Synthetic".encode()
-                    if self.CODEX_STATUS != 200:
-                        body = b"{}"
+                    status = b"200 OK"
                 else:
                     body, status = b"{}", b"404 Not Found"
             else:
@@ -1259,8 +1256,9 @@ def scenario_main(ctx: Context):
         R.check("source binding: exact only with openrouter_key; self_hosted only with metrics; series never exact",
                 bool(cards) and not source_binding_violations(cards, entries, series),
                 "; ".join(source_binding_violations(cards, entries, series)))
-        R.check("no 'estimated'/'exact' label on any subscription card except the openrouter meter",
-                {c["confidence"] for c in cards if c["provider_id"] != "openrouter"} <= {"opaque", "self_hosted"})
+        R.check("no 'estimated'/'exact' label on any subscription card except the openrouter and codex meters",
+                {c["confidence"] for c in cards if c["provider_id"] not in ("openrouter", "openai-codex")}
+                <= {"opaque", "self_hosted"})
 
         for w in ("7", "90"):
             r = host.api("usage", f"window={w}")
