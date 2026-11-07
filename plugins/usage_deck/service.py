@@ -367,6 +367,7 @@ class UsageDeckService:
             credential_refs=item.credential_refs,
             captures=captures,
             live_source=item.live_source,
+            credential_expected=item.credential_expected,
         )
 
     def _run_item(self, item: InventoryItem, reader: AnalyticsReader, now: datetime,
@@ -401,7 +402,7 @@ class UsageDeckService:
             kind=item.kind,
             plan_name=item.plan_name,
             plan_source=item.plan_source,
-            auth_status=item.auth_status,
+            auth_status="rejected" if adapter.credential_rejected() else item.auth_status,
             endpoint_id=item.endpoint_id,
             state=state,
             confidence=confidence,

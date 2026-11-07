@@ -74,7 +74,7 @@
   // Fixed local copy for Reason codes — upstream text never reaches the UI.
   const REASON_TEXT = {
     unsupported: "No verified usage source exists for this provider.",
-    credentials_missing: "No credential was found for this account.",
+    credentials_missing: "No credential was sent for this account (none was found).",
     permission_denied: "The available credential does not permit reading this data.",
     attribution_unavailable: "Provider attribution unavailable from session analytics.",
     no_observations: "No observations for this period.",
@@ -86,6 +86,20 @@
     timeout: 1, upstream_unavailable: 1, malformed_response: 1, inventory_unavailable: 1,
     analytics_unavailable: 1, internal_error: 1,
   };
+  // Credential state of a card. Three distinct truths, never conflated: a credential was found
+  // (presence only), none was found so none was sent, or one was sent and the provider refused it.
+  const AUTH_INFO = {
+    available: { text: "Credential present (not validated)",
+      tip: "A credential was found and is used for requests to this provider. It has not been confirmed to work." },
+    missing: { text: "No credential found",
+      tip: "No credential was found, so none was sent. A provider that answers 401 to an unauthenticated request does not mean the credential is wrong." },
+    rejected: { text: "Credential rejected",
+      tip: "A credential was sent and the provider answered 401 (unauthorized). The stored credential is probably wrong or expired." },
+  };
+  function authInfo(status) {
+    const key = Object.prototype.hasOwnProperty.call(AUTH_INFO, status) ? status : "missing";
+    return { key: key, text: AUTH_INFO[key].text, tip: AUTH_INFO[key].tip };
+  }
   const CARD_STATES = { ready: 1, error: 1, opaque: 1, empty: 1 };
   const HEALTH_META = {
     healthy: { icon: "●", text: "Healthy" },
@@ -707,7 +721,8 @@
             h(Badge, { conf: conf, tip: "Primary source for this card. Checked: " + fmtTime(card.checked_at) + "." + (note && conf === "opaque" ? " " + note : "") + (machineNote ? " " + machineNote : "") }))),
         h("div", { className: "ud-card-meta ud-small" },
           h("span", null, planText), " · ",
-          h("span", null, card.auth_status === "available" ? "Credential present (not validated)" : "No credential found"),
+          h("span", { "data-auth-status": authInfo(card.auth_status).key, title: authInfo(card.auth_status).tip },
+            authInfo(card.auth_status).text),
           stale ? h("span", null, " · ", h(StaleTag, { stale: true })) : null),
         h("div", { className: "ud-card-body" }, body),
         h("footer", { className: "ud-card-foot" },
@@ -1077,6 +1092,7 @@
     fmtTime: fmtTime,
     splitSegments: splitSegments,
     classifyError: classifyError,
+    authInfo: authInfo,
     unwrapEnvelope: unwrapEnvelope,
     niceMax: niceMax,
     holderNames: holderNames,

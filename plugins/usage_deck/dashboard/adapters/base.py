@@ -114,6 +114,8 @@ class AdapterContext:
     #: False for machine-only inventory (no member belongs to the selected profile's effective
     #: credentials/config): adapters must make NO outbound request (DESIGN.md §12.5).
     live_source: bool = True
+    # key_env named an env var with no value: a credential is expected but absent.
+    credential_expected: bool = False
 
     def __repr__(self) -> str:
         return f"AdapterContext(provider_id={self.provider_id!r}, account_id={self.account_id!r})"
@@ -133,6 +135,8 @@ class ProviderAdapter(Protocol):
     def get_health(self) -> Optional[HealthStripEntry]: ...
 
     def get_confidence(self) -> str: ...
+
+    def credential_rejected(self) -> bool: ...
 
 
 def error_for_status(status: int, provider_id: str, account_id: str) -> Optional[DeckError]:
@@ -223,6 +227,10 @@ class BaseAdapter:
         if not self._usage:
             self.get_usage(30)  # callable independently: reuse/produce the snapshot
         return self._confidence
+
+    def credential_rejected(self) -> bool:
+        """True only when a credential was actually sent and the provider answered 401."""
+        return False
 
     # -- helpers ---------------------------------------------------------
     def _probe_result(self, supported, reachable=None, capabilities=(), reason=None, error=None) -> ProbeResult:
