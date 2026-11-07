@@ -103,8 +103,9 @@ class SubscriptionsTests(ServiceBase):
         self.assertEqual(orc["id"], orc["account_id"])
         codex = sorted(by["openai-codex"], key=lambda c: c["account_label"])
         self.assertEqual([c["account_label"] for c in codex], ["Account 1", "Account 2"])
+        # These test tokens carry a plan claim but no account claim: no usable routing, so no request (§9.2).
         self.assertEqual([(c["state"], c["confidence"], c["reason"], c["meters"]) for c in codex],
-                         [("opaque", "opaque", "unsupported", [])] * 2)
+                         [("opaque", "opaque", "source_unavailable", [])] * 2)
         self.assertEqual(sorted(c["plan_name"] for c in codex), ["business", "go"])
         self.assertEqual(by["mystery-cloud"][0]["state"], "opaque")
         self.assertEqual(by["mystery-cloud"][0]["debug"]["adapter"], "SessionAnalyticsAdapter")

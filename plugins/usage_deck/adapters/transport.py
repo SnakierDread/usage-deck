@@ -136,7 +136,7 @@ class GuardedTransport:
                 continue
             if target.paths is not None and parts.path not in target.paths:
                 continue
-            if parts.query and target.paths is not None:
-                continue
+            if (parts.query or "?" in url) and target.paths is not None:
+                continue  # exact-path targets take no query (not even an empty one)
             return self._inner.get(url, headers, timeout, max_bytes)
         raise TransportError(TransportError.FORBIDDEN_URL)
