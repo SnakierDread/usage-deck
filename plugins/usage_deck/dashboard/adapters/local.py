@@ -9,7 +9,7 @@ operational numbers; it never becomes a token quota.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from ..models.dto import (
     HealthStripEntry,
@@ -64,7 +64,7 @@ class SelfHostedAdapter(BaseAdapter):
         self._snapshot: Optional[_Snapshot] = None
 
     # -- snapshot --------------------------------------------------------
-    def _attempt(self, path: str, validator, credential) -> Tuple[_Attempt, object]:
+    def _attempt(self, path: str, validator, credential) -> Tuple[_Attempt, Any]:
         ctx = self.ctx
         headers = {"Accept": "application/json, text/plain"}
         if credential:
@@ -109,7 +109,7 @@ class SelfHostedAdapter(BaseAdapter):
         ctx = self.ctx
         if ctx.endpoint_cache is not None and ctx.endpoint_id:
             # A machine-only (no live source) card must never poison, or reuse, a live card's result.
-            snap = ctx.endpoint_cache.get_or_compute(f"{ctx.endpoint_id}|{int(ctx.live_source)}", self._compute)
+            snap = ctx.endpoint_cache.get_or_compute(f"{ctx.endpoint_id}|{int(ctx.live_source)}|{int(ctx.cross_profile)}", self._compute)
         else:
             snap = self._compute()
         self._snapshot = snap
@@ -129,6 +129,8 @@ class SelfHostedAdapter(BaseAdapter):
                              "credentials_missing", None, None)
 
         metrics_attempt, metrics_values = self._attempt("/metrics", self._metrics_validator, ctx.health_credential)
+        if ctx.cross_profile:
+            return self._compute_metrics_only(metrics_attempt, metrics_values)
         health_attempt = _Attempt(False, "")
         tried: List[_Attempt] = []
         for path in _health_paths(endpoint, ctx.provider_id):
@@ -172,6 +174,22 @@ class SelfHostedAdapter(BaseAdapter):
         return snap
 
     # -- protocol --------------------------------------------------------
+    def _compute_metrics_only(self, metrics_attempt: _Attempt, values: Optional[Metrics]) -> _Snapshot:
+        """Machine-view cross-profile card (DESIGN.md §13): the one ``/metrics`` scrape was the only request.
+
+        The models/tags probes carry an inference credential and are not a usage probe, so they are not
+        sent; a valid exposition proves the endpoint is up, anything else is honestly "unknown"/offline.
+        """
+        if metrics_attempt.ok:
+            return _Snapshot(True, metrics_attempt, _NOT_RUN, values, "healthy", "self_hosted", None, None,
+                             metrics_attempt.latency_ms)
+        if metrics_attempt.failure in ("connection", "timeout"):
+            code = "timeout" if metrics_attempt.failure == "timeout" else "upstream_unavailable"
+            return _Snapshot(True, metrics_attempt, _NOT_RUN, None, "offline", "opaque", "source_unavailable",
+                             code, None)
+        return _Snapshot(True, metrics_attempt, _NOT_RUN, None, "unknown", "opaque", "source_unavailable",
+                         None, None)
+
     def _do_probe(self) -> ProbeResult:
         snap = self._check()
         if not snap.configured:

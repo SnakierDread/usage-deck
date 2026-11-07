@@ -150,20 +150,20 @@ const machineOnlyOr = F.card({
   holders: holders("verifier"), debug: { adapter: "OpenRouterAdapter", capabilities: [], source: "openrouter_key", sanitized: true },
 });
 
-test("a machine-only account explains it has no live source and is never probed with its credentials", async () => {
+test("an account with no ratified read-only probe explains it has no live source", async () => {
   const m = await mount({ routes: routes({ subs: (url) => envelope({ cards: [machineOnlyOr, F.readyOpenRouter], inventory_state: "detected",
     view: new URL(url, "http://x").searchParams.get("view") }) }) });
   const card = m.$("[data-card-id=acct_other_or]");
   const note = card.querySelector("[data-machine-only-note]");
-  assert.match(note.textContent, /No live source from this profile/);
-  assert.match(note.textContent, /never uses another profile's credentials for outbound requests/);
-  assert.match(card.querySelector(".ud-card-head .ud-badge").getAttribute("title"), /No live source from this profile/);
+  assert.match(note.textContent, /No live source for this account/);
+  assert.match(note.textContent, /any local profile.s credential only through the documented read-only usage probes/);
+  assert.match(card.querySelector(".ud-card-head .ud-badge").getAttribute("title"), /No live source for this account/);
   assert.equal(m.$("[data-card-id=acct_or] [data-machine-only-note]"), null, "a measured card needs no such note");
   await m.unmount();
 });
 
 test("machineOnlyNote only fires for unavailable source_unavailable cards held by a home, not captured Anthropic windows", () => {
-  assert.match(mod.machineOnlyNote(machineOnlyOr), /No live source/);
+  assert.match(mod.machineOnlyNote(machineOnlyOr), /No live source for this account/);
   assert.equal(mod.machineOnlyNote(Object.assign({}, machineOnlyOr, { holders: [] })), null);
   assert.equal(mod.machineOnlyNote(Object.assign({}, machineOnlyOr, { reason: "unsupported" })), null);
   const rolled = Object.assign({}, anthropicOpaque, { reason: "source_unavailable", debug: { adapter: "a", capabilities: [], source: "anthropic_headers", sanitized: true } });
@@ -176,7 +176,7 @@ test("a not-probed machine health row says so; the profile view does not", async
   const entry = F.healthEntry({ status: "unknown", confidence: "opaque", metrics_available: false, latency_ms: null,
     cpu_percent: null, memory_bytes: null, reason: "source_unavailable" });
   const m = await mount({ routes: routes({ health: () => envelope({ entries: [entry] }) }) });
-  assert.match(m.$("[data-endpoint-id=ep_1] [data-machine-only-note]").textContent, /Not probed from this profile/);
+  assert.match(m.$("[data-endpoint-id=ep_1] [data-machine-only-note]").textContent, /^Not probed$/);
   await m.click(m.$("[data-view=profile]"));
   await m.flush(5);
   assert.equal(m.$("[data-endpoint-id=ep_1] [data-machine-only-note]"), null);

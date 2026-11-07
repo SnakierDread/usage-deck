@@ -105,6 +105,9 @@ class InventoryItem:
     #: False when no member belongs to the SELECTED profile's effective credentials/config: such an
     #: item is local inventory only and must never trigger an outbound request (§12.5).
     live_source: bool = True
+    #: Machine view only (DESIGN.md §13): the card's credential (Codex) or endpoint (self-hosted) belongs
+    #: to a profile other than the selected one and may be used for read-only usage probes alone.
+    cross_profile: bool = False
     # The entry points at an env var (``key_env``) that holds no value: a credential is
     # expected but absent, so nothing may be probed anonymously on its behalf.
     credential_expected: bool = False
@@ -629,6 +632,35 @@ def _machine_identity(holder: Holder, item: InventoryItem) -> str:
     return identity_json(["row", holder.is_global, holder.profile, item.provider_id, normalized, item.row_ref])
 
 
+def _token_expiry(item: InventoryItem) -> float:
+    """``exp`` claim of the item's JWT (0 when absent): local ordering hint only, never validated."""
+    payload = _jwt_payload(item.credential.reveal() if item.credential else None)
+    exp = payload.get("exp") if payload else None
+    return float(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else 0.0
+
+
+def _cross_profile_member(members: List[Tuple[Holder, InventoryItem, bool]]) -> Optional[InventoryItem]:
+    """Member of ANOTHER profile's store that may supply a read-only meter probe credential (§13).
+
+    Only canonical ``openai-codex`` qualifies (its wham usage GET is a ratified probe) and only with a
+    token that yields usable routing claims. Among several holders of one seat the latest-expiring token
+    wins (a stale refreshed copy would only earn a 401); ties keep inventory order. Everything else
+    (OpenRouter, Nous, custom inference keys) has no ratified cross-profile probe and stays inventory.
+    """
+    candidates = [item for _holder, item, selected in members
+                  if not selected and item.credential is not None
+                  and item.provider_id.strip().lower() == CODEX_PROVIDER_ID
+                  and codex_routing(item.credential.reveal()) is not None]
+    if not candidates:
+        return None
+    return max(candidates, key=_token_expiry)  # max() keeps the first of equal keys
+
+
+def _metrics_scrapable(item: InventoryItem) -> bool:
+    """A self-hosted card with a safe endpoint: its ``/metrics`` may be scraped anonymously (§13)."""
+    return item.kind == "self_hosted" and item.endpoint is not None and item.endpoint.safe
+
+
 def discover_machine(source: Any) -> List[InventoryItem]:
     """Machine-wide inventory: global + every profile credential pool, deduped for display only.
 
@@ -696,6 +728,11 @@ def discover_machine(source: Any) -> List[InventoryItem]:
         usable = next((item for _holder, item, selected in members if selected and item.credential is not None), None)
         health_usable = next((item for _holder, item, selected in members
                               if selected and item.health_credential is not None), None)
+        selected_any = any(selected for _holder, _item, selected in members)
+        # DESIGN.md §13 exemption: no selected member can supply a credential, so a member of ANOTHER
+        # profile's store may, but only where a documented read-only usage probe exists for the provider.
+        cross = None if usable is not None else _cross_profile_member(members)
+        cross_live = cross is not None or (not selected_any and _metrics_scrapable(first))
         plan = next((i for i in items if i.plan_name), None)
         secrets = frozenset().union(*(i.secrets for i in items))
         refs = tuple(dict.fromkeys(r for i in items for r in i.credential_refs))
@@ -705,12 +742,13 @@ def discover_machine(source: Any) -> List[InventoryItem]:
             continue
         seen_ids.add(account_id)
         per_provider[first.provider_id] = per_provider.get(first.provider_id, 0) + 1
+        credential = usable.credential if usable else (cross.credential if cross else None)
         merged.append(replace(
             first,
             account_id=account_id,
             account_label=f"Account {per_provider[first.provider_id]}",
             auth_status="available" if any(i.credential is not None for i in items) else "missing",
-            credential=usable.credential if usable else None,
+            credential=credential,
             health_credential=health_usable.health_credential if health_usable else None,
             plan_name=plan.plan_name if plan else None,
             plan_source=plan.plan_source if plan else "none",
@@ -720,7 +758,8 @@ def discover_machine(source: Any) -> List[InventoryItem]:
             credential_expected=usable is None and any(
                 i.credential_expected for _holder, i, selected in members if selected),
             holders=tuple(holders),
-            live_source=any(selected for _holder, _item, selected in members),
+            live_source=selected_any or cross_live,
+            cross_profile=cross_live,
         ))
     merged.sort(key=lambda i: (i.provider_id, i.account_id))
     return merged

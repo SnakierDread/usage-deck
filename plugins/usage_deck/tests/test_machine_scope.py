@@ -225,32 +225,39 @@ class CredentialUseIsolation(MachineBase, SchemaAsserts):
         self.assertEqual(cards["global"]["state"], "ready")
         self.assertEqual(cards["verifier"]["reason"], "source_unavailable")
 
-    def test_machine_only_world_makes_no_request_at_all_even_on_a_real_transport(self):
+    def test_machine_only_world_only_scrapes_metrics_anonymously_on_a_real_transport(self):
         from .test_observer import NetworkSpy
         self.s.write_auth({"credential_pool": {}})
         self.s.write_profile("verifier", pool("openrouter", {"id": "or-v", "access_token": KEY_VERI}))
         self.s.write_profile("other", pool("custom:gpu", {"id": "g", "base_url": GPU + "/v1", "access_token": "k"}))
         src = self.source()
         svc = UsageDeckService(inventory_factory=lambda: src, analytics_factory=lambda p: FakeAnalytics(), clock=lambda: NOW)
-        with NetworkSpy() as spy:  # default UrllibTransport: any attempt would reach socket.connect
+        with NetworkSpy() as spy:  # default UrllibTransport: any attempt would reach OpenerDirector.open
             body, _ = svc.handle("subscriptions", [("view", "machine")])[1], None
             health = svc.handle("health", [("view", "machine")])[1]
-        self.assertEqual(spy.calls, [])
+        # OpenRouter (no ratified cross-profile probe) stays inventory: no attempt. The self-hosted endpoint
+        # of the other profile gets exactly one anonymous /metrics scrape per snapshot (cache-shared), never /v1/models.
+        self.assertEqual(spy.calls, ["connect"])
         self.assertEqual(len(body["data"]["cards"]), 2)
-        self.assertTrue(all(c["state"] != "error" for c in body["data"]["cards"]))
-        self.assertTrue(all(e["status"] == "unknown" for e in health["data"]["entries"]))
+        or_card = next(c for c in body["data"]["cards"] if c["provider_id"] == "openrouter")
+        self.assertEqual((or_card["state"], or_card["reason"], or_card["meters"]), ("opaque", "source_unavailable", []))
 
-    def test_another_profiles_self_hosted_endpoint_is_not_probed_but_the_selected_one_is(self):
+    def test_another_profiles_self_hosted_endpoint_gets_only_an_anonymous_metrics_scrape(self):
         other = "http://other-box.lan:9000"
         self.s.write_profile("verifier", pool("custom:other", {"id": "o1", "base_url": other + "/v1", "access_token": "k-v"}))
         self.s.write_auth(pool("custom:gpu", {"id": "g1", "base_url": GPU + "/v1", "access_token": "k-w"}))
         self.transport.routes.update({GPU + "/metrics": raw_response(METRICS), GPU + "/v1/models": json_response({"data": []}),
                                       other + "/metrics": raw_response(METRICS), other + "/v1/models": json_response({"data": []})})
         _body, health = self.call(self.make(), "health", [("view", "machine")])
-        hosts = {u.split("/")[2] for u in self.transport.urls()}
-        self.assertEqual(hosts, {GPU.split("/")[2]})
+        by_host = {}
+        for url, headers, _t in self.transport.requests:
+            by_host.setdefault(url.split("/")[2], []).append((url.split("/", 3)[3], "Authorization" in headers))
+        # the selected profile's endpoint is probed as before (metrics anonymous + credentialed models) ...
+        self.assertEqual(sorted(by_host[GPU.split("/")[2]]), [("metrics", False), ("v1/models", True)])
+        # ... the other profile's endpoint: one /metrics GET, no credential, no models/tags request
+        self.assertEqual(by_host[other.split("/")[2]], [("metrics", False)])
         by = {e["provider_id"]: e["status"] for e in health["data"]["entries"]}
-        self.assertEqual(by, {"custom:gpu": "healthy", "custom:other": "unknown"})
+        self.assertEqual(by, {"custom:gpu": "healthy", "custom:other": "healthy"})
         for _url, headers, _t in self.transport.requests:
             self.assertNotIn("k-v", json.dumps(headers))
 
@@ -276,17 +283,48 @@ class CredentialUseIsolation(MachineBase, SchemaAsserts):
         self.assertTrue(item.live_source)
         self.assertEqual(item.plan_name, "business")
 
-    def test_merged_card_with_only_machine_only_members_has_no_usable_credential(self):
+    def test_merged_card_with_only_other_profile_members_uses_one_of_their_credentials(self):
         self.s.write_auth({"credential_pool": {}})
-        self.s.write_profile("a", codex_rows(("a1", codex_token("acct-1", "user-1", "go", "a"))))
-        self.s.write_profile("b", codex_rows(("b1", codex_token("acct-1", "user-1", "go", "b"))))
+        ta, tb = codex_token("acct-1", "user-1", "go", "a"), codex_token("acct-1", "user-1", "go", "b")
+        self.s.write_profile("a", codex_rows(("a1", ta)))
+        self.s.write_profile("b", codex_rows(("b1", tb)))
         (item,) = only(self.machine(), "openai-codex")
         self.assertEqual(len(item.holders), 2)
-        self.assertEqual((item.credential, item.health_credential, item.live_source, item.auth_status),
-                         (None, None, False, "available"))
+        self.assertEqual((item.credential.reveal(), item.health_credential, item.live_source, item.cross_profile,
+                          item.auth_status), (ta, None, True, True, "available"))  # equal expiry: first holder wins
         # secrets are still unioned for masking: both tokens plus the private account routing claim (§9.2 term 2)
         self.assertEqual(len(item.secrets), 3)
         self.assertIn("acct-1", item.secrets)
+
+    def test_cross_profile_holder_with_the_latest_expiring_token_supplies_the_credential(self):
+        self.s.write_auth({"credential_pool": {}})
+        claims = lambda tag, exp: make_jwt({AUTH: {"chatgpt_account_id": "acct-1", "chatgpt_user_id": "user-1"},  # noqa: E731
+                                            "jti": tag, "exp": exp})
+        stale, fresh = claims("old", 1_000), claims("new", 2_000)
+        self.s.write_profile("a", codex_rows(("a1", stale)))
+        self.s.write_profile("b", codex_rows(("b1", fresh)))
+        (item,) = only(self.machine(), "openai-codex")
+        self.assertEqual(item.credential.reveal(), fresh)
+
+    def test_selected_credential_always_beats_another_profiles(self):
+        self.s.write_auth({"credential_pool": {}})
+        mine = make_jwt({AUTH: {"chatgpt_account_id": "acct-1", "chatgpt_user_id": "user-1"}, "jti": "m", "exp": 10})
+        theirs = make_jwt({AUTH: {"chatgpt_account_id": "acct-1", "chatgpt_user_id": "user-1"}, "jti": "t", "exp": 99999})
+        self.s.write_auth(codex_rows(("w1", mine)))
+        self.s.write_profile("verifier", codex_rows(("v1", theirs)))
+        (item,) = only(self.machine(), "openai-codex")
+        self.assertEqual((item.credential.reveal(), item.cross_profile), (mine, False))
+
+    def test_only_providers_with_a_ratified_probe_use_another_profiles_credential(self):
+        self.s.write_auth({"credential_pool": {}})
+        self.s.write_profile("verifier", {"credential_pool": {
+            "openrouter": [{"id": "or-v", "access_token": KEY_VERI}],
+            "nous": [{"id": "n1", "access_token": "nous-tok"}],
+            "anthropic": [{"id": "a1", "access_token": "sk-ant-v"}],
+            "openai-codex": [{"id": "c1", "access_token": make_jwt({"plan": "go"})}],   # no routing claims: unusable
+        }})
+        for item in self.machine():
+            self.assertEqual((item.credential, item.live_source, item.cross_profile), (None, False, False), item.provider_id)
 
     def test_selected_profile_config_endpoints_stay_live(self):
         self.custom = [{"name": "box", "base_url": GPU + "/v1"}]

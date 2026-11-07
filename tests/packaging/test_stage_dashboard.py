@@ -131,9 +131,13 @@ class RepoPackagingTests(unittest.TestCase):
         self.assertIn("chatgpt_wham_usage", js)
         self.assertIn('credit: "credits"', js)
         self.assertNotIn("no live response was verified", js)
-        # nothing else was granted the Codex target: it appears exactly once in the staged backend
+        # nothing else was granted the Codex target: AllowedTarget appears once in the staged backend; the only other
+        # mention is the read-only probe ceiling of DESIGN.md §13 (a ProbeShape, which grants nothing by itself)
         hits = [p.relative_to(staged).as_posix() for p in staged.rglob("*.py") if "chatgpt.com" in p.read_text()]
-        self.assertEqual(sorted(hits), ["adapters/cloud.py"])
+        self.assertEqual(sorted(hits), ["adapters/cloud.py", "adapters/transport.py"])
+        transport_src = (staged / "adapters" / "transport.py").read_text()
+        self.assertIn('ProbeShape("GET", "https", "chatgpt.com", 443, "/backend-api/wham/usage")', transport_src)
+        self.assertNotIn('AllowedTarget("https", "chatgpt.com"', transport_src)
 
     def test_no_symlinks_in_package(self):
         plugin = REPO / "plugins" / "usage_deck"
