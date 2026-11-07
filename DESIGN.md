@@ -1,6 +1,6 @@
 # UsageDeck MVP contract — v1
 
-Status: **ratified; backend and frontend implementation released**. Amended by card `t_04a4354d` (builder-authored, pending architect ratification): §9 source upgrade, §10 machine view, §11 badges; in-place pointers below.
+Status: **ratified; backend and frontend implementation released**. Amended by card `t_04a4354d` (builder-authored): §9 source upgrade, §10 machine view, §11 badges; **§12 (ratified design decision `t_64a95086`, implemented by `t_3e2434b4` on top of PR #6) supersedes every conflicting statement in §1.1 and §§9–11**. Superseded text is kept below as historical context and carries an explicit `Superseded by §12.x` pointer. §12 ratifies a design; it is not a code-review PASS of PR #6 and grants no merge/install permission.
 Owner: architect. Branch: `t_22e02c08`. Wire version: `1`.
 This document governs backend and frontend together. Examples below are contract examples, not live probe results. `docs/recon-providers.md` is evidence, not an API specification.
 
@@ -20,7 +20,7 @@ A second grounding correction is settled here, not left to workers: the CLI inst
 
 Discovery is local, read-only, scoped to the dashboard-selected profile using the host's request-scoped profile helper. Never mutate process environment per request. Resolve the active home through Hermes helpers, not `~/.hermes` string concatenation. Allow only host-validated profile names; no arbitrary filesystem paths in request parameters.
 
-Read credential pools profile-first, with global fallback **per provider only when the profile has zero pool entries for that provider**. A nonempty profile pool replaces the global provider pool; do not combine their accounts. This matches `hermes_cli/auth.py:934–958`. Legacy `providers` entries are used only when no effective pool exists for that provider. Add configured primary/custom providers even without credentials. Use the host's configuration loader (including its YAML support), never a hand-written YAML parser. Do not scan other profiles or read `.env` wholesale (the **machine view** of §10 is the one exception: it reads other profiles' `auth.json` only). Resolve only the credential references required by a discovered adapter, through host helpers. Never refresh OAuth, rotate credentials, persist pool health, or invoke an inference request.
+Read credential pools profile-first, with global fallback **per provider only when the profile has zero pool entries for that provider**. A nonempty profile pool replaces the global provider pool; do not combine their accounts. This matches `hermes_cli/auth.py:934–958`. Legacy `providers` entries are used only when no effective pool exists for that provider. Add configured primary/custom providers even without credentials. Use the host's configuration loader (including its YAML support), never a hand-written YAML parser. Do not scan other profiles or read `.env` wholesale (the **machine view** of §10 is the one exception: it reads other profiles' `auth.json` only; **bounded and clarified by §12.5**: same-OS-owner inventory only, never another home's config/`.env`/analytics, never another home's credentials for any outbound request, symlinked `profiles/` parents refused). Resolve only the credential references required by a discovered adapter, through host helpers. Never refresh OAuth, rotate credentials, persist pool health, or invoke an inference request.
 
 One SubscriptionCard per effective pool account; one per configured endpoint without a pool account. A configured endpoint and pool row referring to the same provider/base URL are one inventory item, not two. Dedupe exact duplicate stored row IDs and normalized endpoints, not different accounts just because their provider matches. Do not dedupe different stored row IDs by hashing their secret values.
 
@@ -28,7 +28,7 @@ Preserve stored `provider_id` literally (including case/punctuation for custom n
 
 `account_id` = `acct_` plus first 24 lowercase hexadecimal characters of SHA-256 over UTF-8 JSON of `[provider_id, normalized_endpoint, public_row_id_or_ordinal]` (compact separators, ensure_ascii=True). Public row ID is a stored non-secret row `id`; otherwise a one-based source-order ordinal. Endpoint normalization removes trailing `/`, userinfo, query and fragment; lowercase scheme and hostname, preserve path/port. IDs may change if an anonymous account's source order changes; never derive them from tokens, emails or JWT subjects. `endpoint_id` uses the same algorithm with `ep_` and `[provider_id, normalized_endpoint]`. Card `id` equals `account_id`. No secrets appear in ID inputs.
 
-Display account labels as `Account 1`, `Account 2`, etc. in source order, not emails or provider account IDs. Plan metadata may be extracted from known plan-name claims in existing JWTs locally, without verifying their authority; allowlist short strings and set `plan_source=unverified_claim`. Never send JWTs anywhere, and never use a plan claim to infer a quota, billing cycle, account identity or entitlement. Unsupported claims yield null plan. No live fleet addresses or credential assumptions in code.
+Display account labels as `Account 1`, `Account 2`, etc. in source order, not emails or provider account IDs. Plan metadata may be extracted from known plan-name claims in existing JWTs locally, without verifying their authority; allowlist short strings and set `plan_source=unverified_claim`. Never send JWTs anywhere, and never use a plan claim to infer a quota, billing cycle, account identity or entitlement. *(Narrowed by §12.5: the unverified JWT account+user claims of canonical `openai-codex` are used as a private display-dedup heuristic only; plan claims still never imply entitlement.)* Unsupported claims yield null plan. No live fleet addresses or credential assumptions in code.
 
 ### 1.2 Protocol and orchestration
 
@@ -214,7 +214,7 @@ Per-provider partial failures are HTTP 200, `meta.partial=true`, `meta.errors` p
 
 Return all inventory cards/health rows without pagination; sort cards by `(provider_id, account_id)`, health by `(provider_id, endpoint_id)`, series by id and points by day ascending. No cursor/count/has_more fields. No cross-account provider-total meter unless source proves disjoint identity and periods; MVP does not. Provider filtering may match several accounts but does not sum duplicated account-wide balances. No account filter in v1.
 
-Example empty success: `data={"cards":[],"inventory_state":"empty"}`. Example unknown adapter card: `state=opaque`, `confidence=opaque`, `reason=unsupported`, `meters=[]`, `error=null`; the profile chart is separately estimated. Source-specific units or missing limits are never filled from UI guesses.
+Example empty success: `data={"cards":[],"inventory_state":"empty","view":"machine"}` (`view` is always serialized, §10/§12.5). Example unknown adapter card: `state=opaque`, `confidence=opaque`, `reason=unsupported`, `meters=[]`, `error=null`; the profile chart is separately estimated. Source-specific units or missing limits are never filled from UI guesses.
 
 ## 4. UI State Machine
 
@@ -258,7 +258,8 @@ DESIGN.md                              architect only
  plugins/usage_deck/adapters/            backend; protocol, registry, cloud/local/fallback
  plugins/usage_deck/models/              backend; DTOs, validators, redaction
  plugins/usage_deck/discovery.py         backend (machine view: `discover_machine`, §10)
- plugins/usage_deck/captures.py          backend; read-only header-capture store + write seam (§9.1)
+ plugins/usage_deck/captures.py          backend; capture schema 2: scoped reader + locked, confined writer (§9.1 → §12.3)
+ plugins/usage_deck/observer.py          backend; opt-in agent observer subscribed to provider_ratelimit_headers (§12.1)
  plugins/usage_deck/service.py           backend; snapshots/orchestration
  plugins/usage_deck/tests/               backend tests; QA may add new test files
  plugins/usage_deck/manifest.json         frontend; canonical dashboard manifest
@@ -290,6 +291,8 @@ Status: implemented; the delta text is builder-authored and **pending architect 
 
 ### 9.1 Anthropic: session and weekly utilization from captured headers
 
+> **Superseded by §12.1–§12.3 where it conflicts.** A Hermes hook and an opt-in UsageDeck observer now exist (§12.2); the capture file is **schema 2**, scoped by holder; v1 files are refused; "nothing records these headers" and "the plugin itself never calls `record_headers`" below describe the original PR #6 state only. The meter mapping table below is **ratified unchanged** (§12.5).
+
 Evidence: recon `t_7dce2222` (`recon_report.md`). Anthropic OAuth responses carry `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset,status}` plus `-representative-claim`, `-fallback-percentage`, `-reset`, `-overage-*`. Utilization is a fraction (`0.0184` = 1.84 %, may exceed `1.0`); `*-reset` is epoch seconds. The recon cites public issues (anthropics/claude-code #12829, #55333) for the header names, not a live capture from this fleet.
 
 Finding that shapes the design: **nothing in the Hermes source tree records these headers** (searched at revision `b200f5bc60e31588ba2cb60e288029c4a54ba5fa`). The seams the recon cites (`_VENDOR_RESET_HEADERS`, `nous_rate_guard._parse_buckets_from_headers`, `rate_limit_tracker.parse_rate_limit_headers`) read `x-ratelimit-*` and the per-bucket `anthropic-ratelimit-requests/tokens-reset` headers only, and the `post_api_request` hook payload carries no response headers. UsageDeck therefore does **not** make a request to obtain them (no inference call, no spend; §1.1/§1.5 unchanged) and only reads a capture file:
@@ -316,9 +319,13 @@ UI: each meter carries its own `Exact` badge; the tooltip names the source ("Ant
 
 ### 9.2 Codex: stays opaque (decision)
 
-The card asked for backend usage data only "IF recon proved reachable". It did not: the recon read `agent/account_usage.py` and described the request (`GET https://chatgpt.com/wham/usage` or `/api/codex/usage`, `Authorization`, `ChatGPT-Account-ID`, residency header) but recorded **no live response, HTTP status or real response body**; the "sample response shape" is two fields inferred from `_codex_banked_resets`. Sending a Codex OAuth bearer to a new endpoint on that evidence would also contradict §1.3 ("never send Codex OAuth to OpenAI billing endpoints") and §1.5's fixed origin allowlist, and the plan windows' field names are unverified. Codex cards therefore keep `opaque`/`unsupported`, make no network call, and the UI explains why (recon `t_7dce2222`, no live response verified, §1.3) in the card body and badge tooltip. Reopening this needs an architect decision plus a read-only live probe whose status and sanitized body are recorded.
+> **Corrected by §12.4:** the source-derived default candidate keeps `/backend-api`: `https://chatgpt.com/backend-api/wham/usage`, NOT the `https://chatgpt.com/wham/usage` the recon wrote. Neither URL is approved or proven reachable; no live probe and no allowlist exception are ratified.
+
+The card asked for backend usage data only "IF recon proved reachable". It did not: the recon read `agent/account_usage.py` and described the request (`GET https://chatgpt.com/wham/usage` *[incorrect: §12.4 gives `https://chatgpt.com/backend-api/wham/usage` as the source-derived candidate; not live-verified]* or `/api/codex/usage`, `Authorization`, `ChatGPT-Account-ID`, residency header) but recorded **no live response, HTTP status or real response body**; the "sample response shape" is two fields inferred from `_codex_banked_resets`. Sending a Codex OAuth bearer to a new endpoint on that evidence would also contradict §1.3 ("never send Codex OAuth to OpenAI billing endpoints") and §1.5's fixed origin allowlist, and the plan windows' field names are unverified. Codex cards therefore keep `opaque`/`unsupported`, make no network call, and the UI explains why (recon `t_7dce2222`, no live response verified, §1.3) in the card body and badge tooltip. Reopening this needs an architect decision plus a read-only live probe whose status and sanitized body are recorded.
 
 ## 10. Machine view: aggregation across Hermes homes (delta, card t_04a4354d)
+
+> **Amended by §12.5.** The *Identity* and *Card identity* bullets and *Merged card* below are superseded: JWT grouping needs BOTH account and user claims under `https://api.openai.com/auth` and applies only to canonical `openai-codex`; identical public row ids across different homes never merge; identity is compact ASCII JSON; capture references are scoped `(is_global, profile, row id)` tuples; another home's credentials are never used for outbound requests; a profile-restricted host principal is forced to the profile view.
 
 The subscriptions grid and health strip now default to a **machine view**; the profile-scoped view of §1.1 remains behind a toggle.
 
@@ -343,11 +350,13 @@ Example title: `OpenAI Codex [go] — verifier` (plan claim is an unverified cla
 
 ## 11. Confidence badges for the new claims
 
+> **Wording updated by §12.5:** the Anthropic row now reads "No usable capture; enable the optional observer and use this account normally." (never promising an observation before an ordinary request returns eligible headers); the Codex row cites a *source-derived candidate endpoint; not live-verified* (§12.4).
+
 | Rendered claim | Badge / treatment |
 |---|---|
 | Anthropic `Used`, `Resets`, `As of` | per-meter `Exact` (source `anthropic_headers`, ceiling `exact`; the UI lowers it to the lesser of claimed confidence and source ceiling) |
-| Anthropic without a usable capture | card `Opaque`; tooltip and body say no unified headers are captured and Hermes does not record them today (recon `t_7dce2222`); nothing estimated |
-| Codex | card `Opaque`; tooltip and body cite recon `t_7dce2222` (endpoint found by source reading only, no live response, §1.3) |
+| Anthropic without a usable capture | card `Opaque`; tooltip and body say "No usable capture; enable the optional observer and use this account normally." (§12.5); nothing estimated |
+| Codex | card `Opaque`; tooltip and body cite recon `t_7dce2222` (a source-derived candidate endpoint, not live-verified, §12.4) |
 | Plan `[go]` | unchanged: unverified claim, tooltip says so; not a measurement |
 | Holders `— verifier` | local inventory fact: tooltip says "read from auth.json; presence only, not validated"; not a usage claim, so no confidence tier applies |
 
@@ -362,3 +371,119 @@ Local Hermes checkout inspected for this design:
 - `docs/recon-providers.md`: upstream observations; not proof of entitlement or automatic admin API access.
 
 Official Hermes documentation index was retrieved and identifies “Extending the Dashboard” as the authoritative topic. Its page and the OpenRouter current-key reference were downloaded, but this run could not reliably extract their body text (extract backend unavailable; browser lacks libglib). Accordingly, the decisions above are grounded in the inspected local source and the upstream recon, not claimed as newly verified provider documentation. No new Anthropic analytics endpoint or SDK assertion is adopted. Local Hermes source revision inspected: `b200f5bc60e31588ba2cb60e288029c4a54ba5fa`.
+
+## 12. Ratified amendment: opt-in Anthropic capture observer, scoped capture schema 2, scoped machine inventory (t_64a95086)
+
+Status: RATIFIED design decision, November 6, 2026 (owner: architect). Applies to PR #6 at `30bc686811bfb634923f6743e5ec1ad56dc3602b`. Supersedes conflicting text in §1.1 and §§9–11; it is not a code-review PASS or permission to merge/install.
+
+### 12.1 Decision and ownership
+
+Choose **(b): opt-in agent-side plugin observer**, supported by a small Hermes core hook exposing only sanitized quota headers. Hermes owns extracting headers and binding request-local credential provenance; UsageDeck's agent plugin owns optional persistence through `captures.record_headers`. The dashboard remains a read-only consumer. Core must not import UsageDeck, know its storage schema, or write its files. No monkeypatching SDKs, wrapping globally shared clients, scraping logs, or adding inference requests.
+
+The core addition is necessary infrastructure for (b), not option (a)'s direct core-to-UsageDeck writer. Existing `post_api_request` remains unchanged: do not expose arbitrary response headers or response objects there. A new narrowly typed hook avoids accidentally publishing cookies, request IDs, or authorization metadata to generic observers.
+
+Consent: new profile-local setting `usage_deck.capture_anthropic_headers: true` explicitly enables the UsageDeck observer; absent/false disables it. Resolve it through the originating agent profile's host config loader, never the currently displayed dashboard profile or process-global environment mutation. Installing/opening the dashboard alone does not enable capture. No setting is changed on this host by this card. Opt-in permits storing quota observations from **already-authorized ordinary requests only**, not making additional requests, changing request headers/betas, refreshing credentials, or retrying. Opt-out stops writes; existing observations remain subject to reader freshness/reset rules. Explain local storage location and manual deletion in README.
+
+### 12.2 Core/plugin interface (new, not claimed to exist today)
+
+Hook name: `provider_ratelimit_headers`. Synchronous, observational, return value ignored, subscriber exceptions isolated. Register it in the host's hook name/dispatch metadata and document it alongside plugin lifecycle hooks. Do not forward this internal hook to shell hooks, outbound webhooks, UI events or generic payload logging.
+
+Keyword payload, all fields required:
+
+```text
+schema_version: 1
+provider: "anthropic"
+hermes_root: str                 # absolute resolved root; private in-process routing only
+execution_profile: {profile: str, is_global: bool}  # originating agent home; opt-in scope
+holder: {profile: str, is_global: bool}             # selected credential's owning store
+credential_id: str               # public pool row id used by THIS HTTP attempt
+observed_at: str                 # UTC RFC3339 seconds, response headers receipt time
+headers: dict[str, str]          # lowercase, sanitized allowlist below only
+```
+
+`holder` names the auth store that owns the selected row, NOT the execution profile when that profile used global fallback. Root holder is `{profile:"global",is_global:true}`; a profile literally named global is `{profile:"global",is_global:false}` and remains distinct. Profile-name grammar is DESIGN §10's grammar; row-id grammar/64-character bound is `captures.py:_ID_RE`. `hermes_root` is never persisted, serialized in DTOs, or logged. Validate the supplied root against the originating host context; no caller-selected path or HTTP input can reach this hook.
+
+Capture actual provider/native Anthropic OAuth requests to TLS origin `https://api.anthropic.com:443` only (default port equivalent), not arbitrary custom Anthropic-compatible proxies, Bedrock, Vertex or API-key rows. Bind immutable `{root, holder, row id, OAuth/provider/origin eligibility}` when the request credentials/client are selected, before dispatch. Never read mutable `_credential_pool_entry_id` after the response arrives. Rotation, retries, nested requests and concurrent calls must retain each attempt's original provenance. If a public id or owning auth store cannot be established without guessing, **skip**; environment-only and legacy credentials without public row IDs stay opaque. No token hashing or guessed ids to fill this gap.
+
+Use the existing raw Anthropic `on_response` path for successful streaming and non-streaming requests. Emit once per actual HTTP response with eligible headers, not once per stream chunk or again on aggregation. Transport errors without headers do not emit. Error responses may emit only if the same native callback exposes their actual headers and request provenance safely; otherwise skip them (no new error-path HTTP calls). Do not alter rate-limit/credits behavior or user-visible request success/failure.
+
+Allowlist exactly the existing `captures.ALLOWED_HEADERS` suffixes under `anthropic-ratelimit-unified-`: `status`, `reset`, `representative-claim`, `fallback-percentage`, `5h-status`, `5h-reset`, `5h-utilization`, `7d-status`, `7d-reset`, `7d-utilization`, `overage-status`, `overage-disabled-reason`. Maximum 12 entries and 64 printable ASCII characters per value. Validate numeric values as finite, nonnegative numbers (resets additionally use `parse_reset_epoch`'s supported epoch range); status/claim/reason values must be bounded enum-like atoms `[A-Za-z0-9_.-]+`. Unknown names or invalid values are discarded independently; empty sanitized set means no event/write. Header validation occurs in core before dispatch and again in the sink; never persist arbitrary text merely because its header name is allowed. No authorization, cookies, body, token, email, model prompt, session ID or full request/response in this interface.
+
+### 12.3 Capture storage and errors
+
+Keep path `<hermes root>/plugin-data/usage-deck/anthropic-ratelimit.json`. **Bump capture schema to 2**, independently of HTTP wire version 1. Entry:
+
+```json
+{"provider":"anthropic","holder":{"profile":"example","is_global":false},"credential_id":"public-row-example","observed_at":"2026-11-06T19:00:00Z","headers":{"anthropic-ratelimit-unified-5h-utilization":"0.12"}}
+```
+
+Top-level shape remains `{"schema_version":2,"captures":[...]}`. Unique key is `(holder.is_global, holder.profile, provider, credential_id)`. Public row IDs are not guaranteed unique across auth stores. An entry must never supply another holder's card. Replace private inventory `row_ids` lookup with scoped references carrying this tuple; a merged card consults only the exact scoped references of its members. Profile view uses effective pool provenance, including global fallback. Machine view uses source-store provenance, not whichever store happened to be read first.
+
+Write seam becomes `record_headers(path, provider, credential_id, headers, observed_at, *, holder)`; holder is mandatory. Reader lookup becomes `latest(provider, credential_refs)`, where each reference is `(is_global, profile, credential_id)`. Scope both producer and consumer changes together. Unscoped v1 files are not trustworthy for cross-profile attribution: **refuse them**, with opaque/no-capture behavior, no automatic attribution/migration. Do not write synthetic flags through the production observer. Preserve refusal of file/entry `synthetic:true`; refuse unexpected schema versions.
+
+Maintain 256 KiB/256-entry bounds from `captures.py`; validate a bounded existing store before reuse. Serialize cross-process read-modify-write with a same-directory lock, with a maximum 100 ms lock wait then drop the observation; atomic replacement alone is insufficient. Use a standard-library platform-supported lock; if unavailable, skip writes rather than pretending thread-only locking protects multiple gateways. Hold lock through read/validate/replace, retain the newest timestamp per key, never regress on out-of-order delivery; at capacity retain the newest observations (deterministic tuple tie-break), not alphabetically first credentials. Snapshot reader never observes partial JSON. Reject timestamps in the future relative to reader clock (no fabricated observations).
+
+Create private directory/files (0700/0600 on POSIX), reject symlink traversal for store ancestors, store, lock and temporary paths, and confine them below the host-resolved root. Do not follow a symlinked `profiles` parent during machine enumeration either. Filesystem failure, malformed data, contention, unavailable config/hook, missing identity and unsupported host version all fail closed for telemetry and fail open for normal inference: no extra requests, no raw exception/header/path logging. Sink errors are swallowed with fixed path-free diagnostics; no fake zero, no overwrite of a good entry by an older response. On a malformed store the writer skips that write rather than replacing unknown content. Preserve normal card reason/error semantics from §9.1.
+
+The setting authorizes this isolated plugin-data write only; auth.json, .env, pool health, config and analytics stay read-only. No dashboard API calls `record_headers`.
+
+### 12.4 Codex decision — no live probe in this change
+
+**Do not probe Codex live. No origin/path allowlist exception is ratified.** Keep quota opaque, no new Codex network request or inference call. Reading source is not evidence that httpx succeeds or that response fields describe subscription windows. The recon artifact's success statement is explicitly not accepted as live evidence.
+
+Correct the provenance text: at inspected Hermes rev b200f5bc, `agent/account_usage.py:529–535` retains `/backend-api` in the normalized base. Its default maps to `https://chatgpt.com/backend-api/wham/usage`, NOT the recon's `https://chatgpt.com/wham/usage`. Neither URL is thereby approved or proven reachable. Update DESIGN §9.2/README/tooltips wherever they repeat the incorrect URL; prefer 'source-derived candidate endpoint; not live-verified' in UI.
+
+Future reopening requires a separate explicit authorization identifying exact GET origin/path, accounts, allowed identity headers and privacy scope; one bounded read-only attempt per approved account, TLS verification, redirects disabled, no refresh/consume/reset actions and no anti-bot bypass. Record HTTP status, time, exact nonsecret target, and allowlisted numeric/enum body or redacted shape; never full bodies containing account details. A failed/blocked probe remains opaque. Ratifying a runtime adapter requires a further schema/window/scope mapping decision after evidence, not automatic promotion upon HTTP 200. This card creates no probe task and grants no consent on the user's behalf.
+
+### 12.5 Ratification of §§9–11, with bounded amendments
+
+**Ratified:** Anthropic session_5h/weekly_7d mappings, utilization ×100 with no data clamping, independently reported resets_at, receipt-time observed_at, no extrapolation, reset-past windows dropped, per-meter Exact only for usable captured provider numbers. Exact means exact last observation, not real-time current usage. Captures with future observations or ambiguous holder/credential provenance do not qualify. Missing capture is opaque; no source still means no meter, not zero.
+
+**Ratified:** `holders`, `resets_at`, `anthropic_headers` source and `/subscriptions data.view` are additive wire-v1 fields with required serialization/nulls as in §§9–10. No raw JWT/provider identity or capture reference may appear in public DTOs/debug. The local capture schema bump does not bump wire schema. Correct the empty-success example in §3 to include `view`.
+
+**Ratified:** machine default inventory over root plus at most 64 direct valid profiles, with `view=profile` retaining existing effective profile/global shadowing; chart remains selected-profile only. Explicit exception to §1.1 permits bounded auth.json inventory reads from other homes, not their config/.env/analytics, credential refresh, or new provider endpoints. This is a same-OS-owner dashboard inventory view, **not tenant isolation**: deploy only under the existing full-trust machine-owner dashboard gate. If a host offers profile-restricted dashboard principals, force profile view for those principals; a query string cannot widen authorization. Do not add another login/credential UX.
+
+**Amended identity policy:** JWT grouping is a private display-dedup heuristic, never authenticated identity or proof of disjoint billing allowances. Use it only for canonical `openai-codex`, only when BOTH valid `chatgpt_account_id` and valid user claim (`chatgpt_user_id`, then `user_id`, then `chatgpt_account_user_id`) exist under the exact `https://api.openai.com/auth` claim. Missing either means no JWT merge. Account-only workspace identity cannot collapse different seats. Unverified JWT fields may not authorize network targets or pool mutations. This narrowly supersedes §1.1's ban on using JWT claims for display dedup identity, not its ban on inferring entitlements from plan claims. No subject/email/token fallback.
+
+**Amended fallback:** do not merge accounts across different holders solely because public pool row IDs match; they are store-local identifiers, not proof of a shared provider account. Within each store preserve exact-row dedup. For machine identity without a complete allowed JWT pair, use holder + provider + normalized endpoint + public row id/ordinal. Include endpoint in all merge grouping; self-hosted health remains one row per endpoint even when account cards stay separate. This may show duplicate opaque accounts across homes; false separation is safer than misattributed usage. For JWT-merged cards use the first credential/plan deterministically (root first, then sorted profiles), union secrets only for redaction and consult all scoped capture references; do not sum balances or infer shared windows.
+
+For stable machine card IDs, replace §10's loosely specified identity string with `identity = json.dumps(parts, separators=(",", ":"), ensure_ascii=True)`. Complete JWT parts are `["jwt", provider_id, normalized_endpoint, account_claim, user_claim]`; fallback parts are `["row", holder.is_global, holder.profile, provider_id, normalized_endpoint, public_row_id_or_ordinal]` (public id string or one-based integer ordinal). Then retain §10's existing `make_account_id(provider_id, normalized_endpoint, "machine:" + identity)` hash rule. Structured JSON prevents delimiter collisions in claims. Selected-source precedence is root, then profiles alphabetically, then each store's original row order. Scope references are private typed tuples, never DTO keys.
+
+Machine-wide auth enumeration is inventory permission, not permission to **use another profile's credentials** for outbound probes. Preserve approved OpenRouter/local health probing for the selected profile's effective credentials/config only. For machine-only holders render local inventory and eligible existing local captures; no outbound requests with their credentials. A merged card may use a selected-profile effective credential if one is among its members, not silently use whichever member was first. Tooltip must explain when machine-only inventory has no eligible live source. Profile-isolated caches must also include effective view and root/source identity; no sibling credentials in logs or DTOs.
+
+**Ratified with wording update:** §11's badge policy and presence-only holder/plan tooltips. 'Hermes does not record these today' must be version/availability-qualified once the observer ships: 'No usable capture; enable the optional observer and use this account normally.' Never promise an observation before an ordinary request returns eligible headers.
+
+### 12.6 Implementation/verification contracts
+
+Two independently reviewable changes, no production writes:
+
+1. Hermes core hook: request-local provenance and sanitized interface exactly §12.2, all normal request behavior unchanged. Tests: stream/nonstream once, duplicate prevention, rotation/concurrency/global fallback, missing owner/id, proxy/API-key/Bedrock exclusion, no subscriber and subscriber raising, invalid/secret-bearing headers filtered before dispatch. Register/document hook. No UsageDeck import or persistence. Ship PR/commit handle and test output.
+2. UsageDeck observer + alignment: §12.1 opt-in, §12.3 schema2 reader/writer/ref propagation, §12.5 identity/scope amendments, §12.4 source-text correction, README/DESIGN incorporation and deterministic dashboard staging. Test opt-out produces zero writes and network calls; eligible synthetic *test-only* callback reaches the real schema2 seam; two holders with same row id never share captures; global fallback attribution; account-only JWT/no-user does not merge; complete JWT same seat merges but separate users do not; endpoint separation; machine-only credentials never probe; symlink parent/store/lock rejection; malformed/oversize/future/synthetic/out-of-order data; actual multiprocess concurrent writers and lock timeout. Run full backend/frontend/packaging/actual-host harness with scratch credentials and **no new live inference/probe**. Fixture outputs are not live observations.
+
+Each implementer submits for independent review; the architect who authored this design must not review its own design implementation. Do not merge/install merely because this decision card is done. Original PR6 is not blanket-approved: its unscoped v1 capture, incomplete-user JWT merge, cross-holder row-id grouping and machine-only credential probing need these amendments before representing compliance with the ratified design.
+
+### 12.7 Implementation notes (card `t_3e2434b4`)
+
+Non-normative record of how this repository realises §12; the normative text is §12.1–§12.6 above.
+
+- **Observer** (`observer.py`): a plain-function subscriber `observe(**payload)` registered by the package-level `register(ctx)` (the Hermes agent-plugin convention) only when the host's `VALID_HOOKS` knows `provider_ratelimit_headers`; unknown/older hosts skip. The host adds envelope metadata of its own (`telemetry_schema_version`) to every hook call, so extra payload fields are ignored unread while every §12.2 field is required and `schema_version` must be the integer `1`. The observer re-validates the payload against the host context it runs in (root and execution profile must be exactly the running home's; the holder must be that profile or the root), reads `usage_deck.capture_anthropic_headers` (only boolean `true` opts in) through `hermes_cli.config.load_config_readonly()` for that home, sanitizes headers again and writes through `captures.record_headers`. It imports nothing from the dashboard service and makes no request.
+- **Capture store** (`captures.py`): schema 2 as §12.3. Reads and writes use `openat`-style descriptors with `O_NOFOLLOW` at every path component below the host root (a symlink anywhere refuses the operation); the writer holds an `flock` on `.anthropic-ratelimit.lock` (same directory, max 100 ms wait, then the observation is dropped), validates the existing store strictly (any malformed/oversize/v1/synthetic content skips the write and leaves the file untouched), keeps the newest observation per scoped key, evicts oldest-first by `(observed_at, key tuple)` within 256 entries / 256 KiB, writes a 0600 temporary file and renames it atomically. Platforms without POSIX `dir_fd`/`flock` skip writes. A v1 store (never produced by any shipped writer) must be deleted manually to start capturing.
+- **Scoped references**: `InventoryItem.credential_refs` carries private `(is_global, profile, row id)` tuples taken from the owning store (global fallback rows are the GLOBAL store's; machine rows are their source store's). `CaptureStore.latest(provider, refs, now=)` never looks up a bare row id and refuses observations later than the refresh clock (+1 s).
+- **Machine inventory** (`discover_machine`): `identity_json` parts exactly as §12.5; a member supplies the card's credential only when it belongs to the SELECTED profile's effective pool/legacy/config (`InventoryItem.live_source`); `AdapterContext.live_source=False` makes OpenRouter and self-hosted adapters issue **no** request (card: opaque, `source_unavailable`; health row: `unknown`). Env-derived credentials attach to selected-profile items only. The service cache key includes root, home, profile and effective view.
+- **Profile-restricted principals**: the router passes `profile_only=True` when the host stamped `request.state.native_http_principal` (a grant bound to one profile); the service then clamps `view=machine` to `profile` while still validating the query.
+- **Verification**: see README "Tests"; the real core hook is exercised by `tests/test_core_seam.py` when `USAGE_DECK_CORE_CHECKOUT` points at a Hermes checkout carrying the hook (core card `t_3a6bf27f`). All capture data in tests and the host harness is synthetic and is not a live observation.
+
+### 12.8 Evidence inspected (local, pinned)
+
+UsageDeck source at 30bc686811bfb634923f6743e5ec1ad56dc3602b:
+- DESIGN.md:19–31,82–88,287–352 — original invariants and pending deltas.
+- plugins/usage_deck/captures.py:40–54,121–160,166–205 — v1 unscoped keys, bounded reader, atomic but unlocked writer.
+- plugins/usage_deck/discovery.py:177–216,338–364,500–510,551–628 — profile enumeration, missing-user JWT fallback, row-id merge and members.
+- plugins/usage_deck/service.py:128–138 and adapter orchestration — global capture reader/view selection; no opt-in producer.
+Hermes source at b200f5bc60e31588ba2cb60e288029c4a54ba5fa:
+- agent/rate_limit_credits.py:74–78 — existing raw Anthropic callback parses rate-limit/credits state only.
+- agent/client_lifecycle.py:950–959,987–998 — mutable selected row field and stream/native on_response seam.
+- agent/turn_response_intake.py:66–108 — post_api_request has no headers.
+- agent/account_usage.py:529–535 — source-derived URL correction (no live success proof).
+Recon attachment t_7dce2222/recon_report.md:61–67,97–114 — source-only derivation, unsupported live-success assertion; not a probe transcript.
+Official docs retrieved: Hermes docs llms.txt, user-guide/features/plugins and user-guide/features/hooks. They establish plugin registration and hook isolation patterns, not existence of the newly designed event. Local pinned source is the implementation baseline. No provider documentation or live quota response newly verified by this card.

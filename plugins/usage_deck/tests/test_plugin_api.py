@@ -119,6 +119,52 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(self.client.post(f"{API_BASE}/subscriptions").status_code, 405)
 
 
+@unittest.skipUnless(HAVE_FASTAPI, "fastapi not installed")
+class ProfileRestrictedPrincipalTests(unittest.TestCase):
+    """DESIGN.md §12.5: the machine view is a full-trust machine-owner inventory. A host principal bound to one
+    profile (a native grant: ``request.state.native_http_principal``) stays profile-only; ``?view=`` cannot widen it."""
+
+    def setUp(self):
+        self.s = ScratchHome()
+        self.addCleanup(self.s.cleanup)
+        self.s.write_auth({"credential_pool": {}})
+        self.s.write_profile("verifier", {"credential_pool": {"nous": [{"id": "n1", "access_token": SENTINEL_TOKEN}]}})
+        src = FileInventorySource(self.s.home, self.s.root, config_loader=lambda: {"model": {}},
+                                  custom_provider_loader=lambda c: [], env_lookup=lambda n: None)
+        service = UsageDeckService(inventory_factory=lambda: src, analytics_factory=lambda p: FakeAnalytics(),
+                                   transport=FakeTransport(), clock=lambda: NOW)
+        app = FastAPI()
+
+        @app.middleware("http")
+        async def stamp_principal(request, call_next):  # what the host's native-grant seam does
+            if request.headers.get("x-test-native-principal"):
+                request.state.native_http_principal = {"profile_id": str(self.s.home)}
+            return await call_next(request)
+
+        app.include_router(plugin_api.create_router(service), prefix=API_BASE)
+        self.client = TestClient(app)
+
+    def get(self, suffix, restricted):
+        headers = {"x-test-native-principal": "1"} if restricted else {}
+        return self.client.get(f"{API_BASE}/{suffix}", headers=headers)
+
+    def test_machine_owner_session_enumerates_other_homes(self):
+        body = self.get("subscriptions?view=machine", False).json()
+        self.assertEqual((body["data"]["view"], [c["provider_id"] for c in body["data"]["cards"]]), ("machine", ["nous"]))
+        self.assertEqual(self.get("subscriptions", False).json()["data"]["view"], "machine")  # default stays machine
+
+    def test_profile_restricted_principal_is_forced_to_the_profile_view(self):
+        for suffix in ("subscriptions", "subscriptions?view=machine", "subscriptions?view=profile"):
+            body = self.get(suffix, True).json()
+            self.assertEqual((body["data"]["view"], body["data"]["cards"]), ("profile", []), suffix)
+        self.assertEqual(self.get("health?view=machine", True).json()["data"]["entries"], [])
+        r = self.get("usage?provider=nous&view=machine", True)
+        self.assertEqual((r.status_code, r.json()["error"]["code"]), (404, "provider_not_found"))
+        r = self.get("subscriptions?view=bogus", True)
+        self.assertEqual((r.status_code, r.json()["error"]["code"]), (400, "invalid_query"))
+        self.assertEqual(scan_for(self.get("subscriptions?view=machine", True).json(), [SENTINEL_TOKEN]), [])
+
+
 @unittest.skipUnless(HAVE_FASTAPI and HAVE_HOST, "needs the Hermes dashboard interpreter")
 class HostScratchHomeTests(unittest.TestCase):
     """The real host helpers (home resolution, config loader, auth) on a scratch HERMES_HOME."""

@@ -1,5 +1,5 @@
 "use strict";
-// Machine view, holders, Anthropic header meters and recon-cited opaque notes (DESIGN.md §9, §10).
+// Machine view, holders, Anthropic header meters, opaque notes and machine-only tooltips (DESIGN.md §9, §10, §12).
 // All fixture data is synthetic.
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -122,21 +122,68 @@ test("a header meter can never display above what its source allows", () => {
   assert.equal(mod.meterConfidence(hdrMeter()), "exact");
 });
 
-test("opaque Codex/Anthropic cards cite recon for why there is no meter; no number, bar or zero", async () => {
+test("opaque Codex/Anthropic cards explain why there is no meter; no number, bar or zero", async () => {
   const m = await mount({ routes: routes() });
   const codex = m.$("[data-card-id=acct_go]");
   assert.equal(codex.dataset.view, "unavailable");
   const note = codex.querySelector("[data-opaque-note=openai-codex]");
   assert.match(note.textContent, /recon t_7dce2222/);
-  assert.match(note.textContent, /no live response was verified/);
-  assert.match(note.textContent, /DESIGN\.md §1\.3/);
+  assert.match(note.textContent, /source-derived candidate endpoint/);
+  assert.match(note.textContent, /not live-verified/);
+  assert.match(note.textContent, /makes no request to it/);
+  assert.match(note.textContent, /DESIGN\.md §12\.4/);
+  // corrected source-only claim (DESIGN §12.4): the default candidate keeps /backend-api, NOT /wham/usage alone
+  assert.match(note.textContent, /chatgpt\.com\/backend-api\/wham\/usage/);
+  assert.ok(!/chatgpt\.com\/wham\/usage/.test(note.textContent));
   const badge = codex.querySelector(".ud-card-head .ud-badge");
   assert.equal(badge.dataset.confidence, "opaque");
-  assert.match(badge.getAttribute("title"), /recon t_7dce2222/);
+  assert.match(badge.getAttribute("title"), /not live-verified/);
   assert.equal(codex.querySelectorAll("[role=progressbar], .ud-meter").length, 0);
   const ant = m.$("[data-card-id=acct_ant2]");
-  assert.match(ant.querySelector("[data-opaque-note=anthropic]").textContent, /no unified rate-limit headers are captured/);
-  assert.match(ant.querySelector("[data-opaque-note=anthropic]").textContent, /Nothing is estimated/);
+  const antNote = ant.querySelector("[data-opaque-note=anthropic]").textContent;
+  assert.match(antNote, /No usable capture; enable the optional observer and use this account normally\./);
+  assert.match(antNote, /only appear after an ordinary request returns eligible headers/);
+  assert.match(antNote, /Nothing is estimated/);
+  assert.ok(!/does not record/i.test(antNote), "no stale 'Hermes does not record these today' claim");
+  assert.ok(!/will appear|within|soon/i.test(antNote), "never promises an observation");
+  await m.unmount();
+});
+
+const machineOnlyOr = F.card({
+  id: "acct_other_or", account_id: "acct_other_or", state: "opaque", confidence: "opaque", reason: "source_unavailable",
+  holders: holders("verifier"), debug: { adapter: "OpenRouterAdapter", capabilities: [], source: "openrouter_key", sanitized: true },
+});
+
+test("a machine-only account explains it has no live source and is never probed with its credentials", async () => {
+  const m = await mount({ routes: routes({ subs: (url) => envelope({ cards: [machineOnlyOr, F.readyOpenRouter], inventory_state: "detected",
+    view: new URL(url, "http://x").searchParams.get("view") }) }) });
+  const card = m.$("[data-card-id=acct_other_or]");
+  const note = card.querySelector("[data-machine-only-note]");
+  assert.match(note.textContent, /No live source from this profile/);
+  assert.match(note.textContent, /never uses another profile's credentials for outbound requests/);
+  assert.match(card.querySelector(".ud-card-head .ud-badge").getAttribute("title"), /No live source from this profile/);
+  assert.equal(m.$("[data-card-id=acct_or] [data-machine-only-note]"), null, "a measured card needs no such note");
+  await m.unmount();
+});
+
+test("machineOnlyNote only fires for unavailable source_unavailable cards held by a home, not captured Anthropic windows", () => {
+  assert.match(mod.machineOnlyNote(machineOnlyOr), /No live source/);
+  assert.equal(mod.machineOnlyNote(Object.assign({}, machineOnlyOr, { holders: [] })), null);
+  assert.equal(mod.machineOnlyNote(Object.assign({}, machineOnlyOr, { reason: "unsupported" })), null);
+  const rolled = Object.assign({}, anthropicOpaque, { reason: "source_unavailable", debug: { adapter: "a", capabilities: [], source: "anthropic_headers", sanitized: true } });
+  assert.equal(mod.machineOnlyNote(rolled), null, "an expired capture is not a machine-only account");
+  assert.equal(mod.machineOnlyNote(anthropicReady), null);
+  assert.equal(mod.machineOnlyNote(null), null);
+});
+
+test("a not-probed machine health row says so; the profile view does not", async () => {
+  const entry = F.healthEntry({ status: "unknown", confidence: "opaque", metrics_available: false, latency_ms: null,
+    cpu_percent: null, memory_bytes: null, reason: "source_unavailable" });
+  const m = await mount({ routes: routes({ health: () => envelope({ entries: [entry] }) }) });
+  assert.match(m.$("[data-endpoint-id=ep_1] [data-machine-only-note]").textContent, /Not probed from this profile/);
+  await m.click(m.$("[data-view=profile]"));
+  await m.flush(5);
+  assert.equal(m.$("[data-endpoint-id=ep_1] [data-machine-only-note]"), null);
   await m.unmount();
 });
 
@@ -145,6 +192,7 @@ test("a provider without a recon note (Nous) and self-hosted cards get no note",
   assert.equal(mod.opaqueNote(F.selfHosted), null);
   assert.equal(mod.opaqueNote(anthropicReady), null, "a card with measured meters needs no explanation");
   assert.match(mod.opaqueNote(codexGo), /t_7dce2222/);
+  assert.match(mod.opaqueNote(anthropicOpaque), /No usable capture; enable the optional observer/);
   assert.equal(mod.opaqueNote(null), null);
 });
 

@@ -61,7 +61,10 @@ def create_router(service=None):
 
     def _respond(endpoint, request: Request):
         svc = service or get_service()
-        status, body = svc.handle(endpoint, list(request.query_params.multi_items()))
+        # A profile-restricted host principal (a native grant bound to one profile's home) must never see
+        # the machine-wide inventory; only the full machine-owner dashboard session can enumerate homes.
+        restricted = getattr(getattr(request, "state", None), "native_http_principal", None) is not None
+        status, body = svc.handle(endpoint, list(request.query_params.multi_items()), profile_only=restricted)
         return JSONResponse(body, status_code=status, headers={"Cache-Control": "no-store"})
 
     # Sync handlers: the host runs them in a worker thread with the request's

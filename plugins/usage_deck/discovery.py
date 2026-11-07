@@ -1,4 +1,4 @@
-"""Read-only, profile-scoped provider inventory (DESIGN.md §1.1).
+"""Read-only, profile-scoped provider inventory (DESIGN.md §1.1, amended by §12.5).
 
 The profile ``auth.json`` pool shadows the global one *per provider*, only when
 the profile has zero entries for that provider (mirrors Hermes
@@ -17,11 +17,11 @@ import logging
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple, Union
 
 from .adapters import is_self_hosted_provider
 from .adapters.base import SecretValue
-from .captures import default_store_path
+from .captures import CredentialRef, default_store_path
 from .models.dto import Holder
 from .models.identity import Endpoint, make_account_id, make_endpoint_id, parse_endpoint
 from .models.redaction import collect_secret_values, contains_secret, is_sensitive_name
@@ -58,6 +58,10 @@ class RawInventory:
     legacy: Dict[str, Dict[str, Any]]
     custom_endpoints: List[Dict[str, Any]]
     primary: Optional[Dict[str, Any]]
+    #: Owning auth store of each effective pool provider / legacy provider, as ``(is_global, profile)``.
+    #: A profile that falls back to the global pool reports the GLOBAL store as holder (§12.3).
+    pool_holders: Dict[str, Tuple[bool, str]] = field(default_factory=dict)
+    legacy_holders: Dict[str, Tuple[bool, str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -86,12 +90,19 @@ class InventoryItem:
     health_credential: Optional[SecretValue] = None
     #: ``pool`` | ``legacy`` | ``config``: where the inventory row came from.
     origin: str = "pool"
-    #: Public (non-secret) stored pool row ids behind this item; used to look up captures.
-    row_ids: Tuple[str, ...] = ()
-    #: Private merge key for the machine view (never serialized, never shown): derived from a JWT
-    #: account identity, a self-hosted endpoint or a public row id; None = never merged across homes.
+    #: Private SCOPED capture references ``(is_global, profile, public row id)`` behind this item
+    #: (never serialized, never a DTO key). A bare row id is never looked up: ids are store-local.
+    credential_refs: Tuple[CredentialRef, ...] = ()
+    #: Private machine-view merge key (compact ASCII JSON, §12.5), never serialized or shown.
     identity_key: Optional[str] = field(default=None, repr=False)
+    #: Private complete ``(account, user)`` JWT claim pair of canonical openai-codex, else None.
+    jwt_pair: Optional[Tuple[str, str]] = field(default=None, repr=False)
+    #: Public pool row id (str) or one-based ordinal (int) the account id is derived from.
+    row_ref: Union[str, int, None] = field(default=None, repr=False)
     holders: Tuple[Holder, ...] = ()
+    #: False when no member belongs to the SELECTED profile's effective credentials/config: such an
+    #: item is local inventory only and must never trigger an outbound request (§12.5).
+    live_source: bool = True
 
     def __repr__(self) -> str:
         return f"InventoryItem({self.provider_id!r}, {self.account_id!r})"
@@ -185,9 +196,13 @@ class FileInventorySource:
         root = self.root_dir()
         current = self._home.resolve()
         candidates: List[Tuple[str, bool, Path]] = [(GLOBAL_PROFILE, True, root)]
+        profiles_dir = root / "profiles"
         try:
-            names = sorted(p.name for p in (root / "profiles").iterdir()
-                           if _PROFILE_NAME_RE.match(p.name) and p.is_dir() and not p.is_symlink())
+            if profiles_dir.is_symlink():
+                names = []  # a symlinked ``profiles`` parent is never followed (§12.3)
+            else:
+                names = sorted(p.name for p in profiles_dir.iterdir()
+                               if _PROFILE_NAME_RE.match(p.name) and p.is_dir() and not p.is_symlink())
         except OSError:
             names = []
         candidates += [(name, False, root / "profiles" / name) for name in names[:MAX_PROFILES]]
@@ -213,7 +228,10 @@ class FileInventorySource:
                         pool[str(provider)] = rows
             legacy = {str(provider): entry for provider, entry in _dict_section(data, "providers").items()
                       if isinstance(entry, dict) and str(provider) not in pool}
-            stores.append(StoreRead(name, is_global, RawInventory(str(directory.resolve()), pool, legacy, [], None)))
+            holder = (is_global, name)
+            stores.append(StoreRead(name, is_global, RawInventory(
+                str(directory.resolve()), pool, legacy, [], None,
+                {provider: holder for provider in pool}, {provider: holder for provider in legacy})))
         return stores
 
     def read(self) -> RawInventory:
@@ -225,26 +243,35 @@ class FileInventorySource:
             except InventoryUnavailable:
                 global_store = None  # a malformed global store never breaks profile reads
 
+        own = self.profile_name()  # the home this source reads: its own store's holder
+        global_holder = (True, GLOBAL_PROFILE)
+        own_holder = global_holder if own[1] else (False, own[0])
         pool: Dict[str, List[Dict[str, Any]]] = {}
+        pool_holders: Dict[str, Tuple[bool, str]] = {}
         for provider, entries in _dict_section(profile, "credential_pool").items():
             if isinstance(entries, list):
                 rows = [e for e in entries if isinstance(e, dict)]
                 if rows:
                     pool[str(provider)] = rows
+                    pool_holders[str(provider)] = own_holder
         for provider, entries in _dict_section(global_store, "credential_pool").items():
             if str(provider) in pool or not isinstance(entries, list):
                 continue
             rows = [e for e in entries if isinstance(e, dict)]
             if rows:
                 pool[str(provider)] = rows  # profile has zero entries: global fallback
+                pool_holders[str(provider)] = global_holder  # ...and the GLOBAL store owns those rows
 
         legacy: Dict[str, Dict[str, Any]] = {}
+        legacy_holders: Dict[str, Tuple[bool, str]] = {}
         for provider, entry in _dict_section(global_store, "providers").items():
             if isinstance(entry, dict):
                 legacy[str(provider)] = entry
+                legacy_holders[str(provider)] = global_holder
         for provider, entry in _dict_section(profile, "providers").items():
             if isinstance(entry, dict):
                 legacy[str(provider)] = entry
+                legacy_holders[str(provider)] = own_holder
 
         custom: List[Dict[str, Any]] = []
         primary = None
@@ -266,7 +293,7 @@ class FileInventorySource:
                 provider = model.get("provider")
                 if isinstance(provider, str) and provider.strip():
                     primary = {"provider": provider.strip(), "base_url": model.get("base_url")}
-        return RawInventory(str(self._home.resolve()), pool, legacy, custom, primary)
+        return RawInventory(str(self._home.resolve()), pool, legacy, custom, primary, pool_holders, legacy_holders)
 
 
 def host_inventory_source() -> FileInventorySource:
@@ -339,13 +366,21 @@ _IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")
 _OPENAI_AUTH_CLAIM = "https://api.openai.com/auth"
 
 
-def account_identity(provider_id: str, token: Optional[str]) -> Optional[str]:
-    """Stable account identity from an existing JWT's account claims, or None.
+CODEX_PROVIDER = "openai-codex"
 
-    Used only as a private merge key for the machine view (it is hashed into the card id and never
-    displayed or serialized). The account claim alone names a *workspace*, so the user claim is
-    included: two seats of one business workspace are different accounts.
+
+def account_identity(provider_id: str, token: Optional[str]) -> Optional[Tuple[str, str]]:
+    """Private ``(account, user)`` claim pair of a canonical ``openai-codex`` JWT, or None.
+
+    DESIGN.md §12.5: a display-dedup heuristic only, never authenticated identity or proof of shared
+    billing. It applies to the canonical ``openai-codex`` provider alone and ONLY when BOTH a valid
+    ``chatgpt_account_id`` and a valid user claim (``chatgpt_user_id``, then ``user_id``, then
+    ``chatgpt_account_user_id``) sit under the exact ``https://api.openai.com/auth`` claim. The
+    account claim alone names a workspace, so it can never separate or merge seats; there is no
+    email/subject/token fallback. Never displayed, never serialized, never used to pick a network target.
     """
+    if provider_id != CODEX_PROVIDER:
+        return None
     payload = _jwt_payload(token)
     if payload is None:
         return None
@@ -355,13 +390,16 @@ def account_identity(provider_id: str, token: Optional[str]) -> Optional[str]:
     account = claims.get("chatgpt_account_id")
     if not isinstance(account, str) or not _IDENTITY_RE.match(account):
         return None
-    user = None
     for name in ("chatgpt_user_id", "user_id", "chatgpt_account_user_id"):
         candidate = claims.get(name)
         if isinstance(candidate, str) and _IDENTITY_RE.match(candidate):
-            user = candidate
-            break
-    return f"jwt:{provider_id}:{account}:{user or ''}"
+            return account, candidate
+    return None
+
+
+def identity_json(parts: list) -> str:
+    """Compact ASCII JSON of identity parts (structured, so claims cannot collide on a delimiter)."""
+    return json.dumps(parts, separators=(",", ":"), ensure_ascii=True)
 
 
 def provider_label_for(provider_id: str, secrets: FrozenSet[str]) -> str:
@@ -394,6 +432,7 @@ class _Draft:
     health_credential: Optional[str] = None
     from_pool: bool = False
     origin: str = "pool"
+    holder: Optional[Tuple[bool, str]] = None
 
 
 def _endpoint_from_entry(entry: Dict[str, Any]) -> Optional[Endpoint]:
@@ -420,7 +459,8 @@ def discover(source: Any) -> List[InventoryItem]:
                     continue  # exact duplicate stored row id
                 seen_rows.add(key)
             endpoint = _endpoint_from_entry(entry) if is_self_hosted_provider(provider_id) else None
-            drafts.append(_Draft(provider_id, endpoint, row_id, ordinal, _credential_of(entry), secrets, None, True))
+            drafts.append(_Draft(provider_id, endpoint, row_id, ordinal, _credential_of(entry), secrets, None, True,
+                                 holder=raw.pool_holders.get(provider_id)))
 
     pooled_ids = {d.provider_id for d in drafts}
     for provider_id, entry in raw.legacy.items():
@@ -497,19 +537,10 @@ def discover(source: Any) -> List[InventoryItem]:
         per_provider[provider_id] = per_provider.get(provider_id, 0) + 1
         plan = plan_from_token(provider_id, credential)
         frozen = frozenset(s for s in secrets if s)
-        jwt_identity = account_identity(provider_id, credential) if credential else None
-        if jwt_identity:
-            identity = jwt_identity
-        elif draft.row_id is not None:
-            identity = f"row:{provider_id}:{draft.row_id}"
-        elif draft.origin == "config" and normalized:
-            identity = f"cfgep:{provider_id}:{normalized}"
-        elif draft.origin == "config" and not credential:
-            identity = f"cfg:{provider_id}"
-        elif kind == "self_hosted" and normalized:
-            identity = f"ep:{provider_id}:{normalized}"
-        else:
-            identity = None
+        jwt_pair = account_identity(provider_id, credential) if credential else None
+        refs: Tuple[CredentialRef, ...] = ()
+        if draft.row_id is not None and draft.holder is not None:
+            refs = ((draft.holder[0], draft.holder[1], draft.row_id),)  # scoped to the owning store
         items.append(InventoryItem(
             provider_id=provider_id,
             provider_label=provider_label_for(provider_id, frozen),
@@ -524,8 +555,9 @@ def discover(source: Any) -> List[InventoryItem]:
             plan_source="unverified_claim" if plan else "none",
             secrets=frozen,
             origin=draft.origin,
-            row_ids=(draft.row_id,) if draft.row_id is not None else (),
-            identity_key=identity,
+            credential_refs=refs,
+            jwt_pair=jwt_pair,
+            row_ref=row_ref,
         ))
     items.sort(key=lambda i: (i.provider_id, i.account_id))
     return items
@@ -548,81 +580,119 @@ class _StaticSource:
         return self._env(name) if self._env else None
 
 
+def _is_selected_source(holder: Holder, item: InventoryItem, raw: RawInventory) -> bool:
+    """True when ``item`` (read from ``holder``'s own store) is part of the SELECTED profile's effective
+    credentials: the same store its pool resolution uses for that provider (own store when it has rows,
+    else the global fallback), or its effective legacy entry. Only such items may ever authorise an
+    outbound request (§12.5); every other store's credentials are inventory only."""
+    key = (holder.is_global, holder.profile)
+    if item.origin == "pool":
+        return raw.pool_holders.get(item.provider_id) == key
+    if item.origin == "legacy":
+        return item.provider_id not in raw.pool and raw.legacy_holders.get(item.provider_id) == key
+    return False
+
+
+def _machine_identity(holder: Holder, item: InventoryItem) -> str:
+    """Private merge key (§12.5). A complete JWT pair merges across holders; everything else is scoped to
+    its holder so identical store-local public row ids never merge distinct homes. The endpoint is part
+    of every grouping."""
+    normalized = item.endpoint.normalized if item.endpoint else None
+    if item.jwt_pair is not None:
+        return identity_json(["jwt", item.provider_id, normalized, item.jwt_pair[0], item.jwt_pair[1]])
+    return identity_json(["row", holder.is_global, holder.profile, item.provider_id, normalized, item.row_ref])
+
+
 def discover_machine(source: Any) -> List[InventoryItem]:
-    """Machine-wide inventory: global + every profile credential pool, deduped by account identity.
+    """Machine-wide inventory: global + every profile credential pool, deduped for display only.
 
     Each store is discovered on its own (a profile that merely falls back to the global pool does not
-    "hold" those accounts), then items are merged when they share a private identity key: the JWT
-    account + user claims, or an identical public pool row id for a provider (so two api-key rows to
-    one endpoint stay two accounts, as in the profile view). Anything without such an identity
-    (anonymous rows) is never merged across homes. The viewed profile's config-derived endpoints
-    (custom/primary) join the union; they are dropped when a pooled account already covers the same
-    provider (cloud) or provider + endpoint (self-hosted).
-    Raises ``InventoryUnavailable`` like the profile view; secrets never leave ``InventoryItem``.
+    "hold" those accounts) and its captures are scoped to that store. Items merge only when they share a
+    private identity: a canonical ``openai-codex`` JWT carrying BOTH account and user claims at the same
+    endpoint. Everything else is keyed by holder + provider + endpoint + public row id / ordinal, so equal
+    public row ids in different homes stay separate accounts (false separation is safer than misattributed
+    usage) and nothing is aggregated across entitlements or billing. The viewed profile's config-derived
+    endpoints (custom/primary) join the union; they are dropped when a pooled account already covers the
+    same provider (cloud) or provider + endpoint (self-hosted).
+
+    Inventory is NOT permission to use another home's credentials: only members that belong to the selected
+    profile's effective pool/legacy/config can supply the card's credential (``credential``,
+    ``health_credential``) or make it ``live_source``; machine-only cards render local inventory and
+    existing local captures without any outbound request. Raises ``InventoryUnavailable`` like the profile
+    view; secrets never leave ``InventoryItem``.
     """
     env = getattr(source, "env_secret", None)
-    groups: Dict[Any, List[Tuple[Holder, InventoryItem]]] = {}
+    raw = source.read()
+    groups: Dict[str, List[Tuple[Holder, InventoryItem, bool]]] = {}
 
-    def add(holder: Holder, item: InventoryItem) -> None:
-        key = item.identity_key or ("anonymous", holder.profile, holder.is_global, item.account_id)
-        groups.setdefault(key, []).append((holder, item))
+    def add(holder: Holder, item: InventoryItem, selected: bool) -> None:
+        groups.setdefault(_machine_identity(holder, item), []).append((holder, item, selected))
 
     for store in source.read_stores():
         holder = Holder(store.profile, store.is_global)
-        for item in discover(_StaticSource(store.raw, env)):
-            add(holder, item)
+        for item in discover(_StaticSource(store.raw, None)):  # no env fallback: it belongs to the selected profile
+            selected = _is_selected_source(holder, item, raw)
+            if selected and not item.credential and item.provider_id.lower() == "openrouter" and env:
+                secret = env("OPENROUTER_API_KEY")
+                if isinstance(secret, str) and secret:
+                    item = replace(item, credential=SecretValue(secret), auth_status="available",
+                                   secrets=item.secrets | {secret})
+            add(holder, item, selected)
 
-    raw = source.read()
     if raw.custom_endpoints or raw.primary:
         name, is_global = source.profile_name()
         config_only = RawInventory(raw.home_key, {}, {}, raw.custom_endpoints, raw.primary)
         for item in discover(_StaticSource(config_only, env)):
-            add(Holder(name, is_global), item)
+            add(Holder(name, is_global), item, True)  # the selected profile's own config
 
-    def is_config(key: Any) -> bool:
-        return isinstance(key, str) and key.startswith(("cfg:", "cfgep:"))
+    def is_config(members: List[Tuple[Holder, InventoryItem, bool]]) -> bool:
+        return members[0][1].origin == "config"
 
-    held_providers = {members[0][1].provider_id for key, members in groups.items() if not is_config(key)}
+    held_providers = {members[0][1].provider_id for members in groups.values() if not is_config(members)}
     held_endpoints = {(members[0][1].provider_id, members[0][1].endpoint.normalized)
-                      for key, members in groups.items()
-                      if not is_config(key) and members[0][1].endpoint is not None}
+                      for members in groups.values()
+                      if not is_config(members) and members[0][1].endpoint is not None}
     merged: List[InventoryItem] = []
     per_provider: Dict[str, int] = {}
     seen_ids: set = set()
-    for key, members in groups.items():
+    for identity, members in groups.items():
         first = members[0][1]
-        if isinstance(key, str) and key.startswith("cfg:") and first.provider_id in held_providers:
-            continue  # a configured cloud provider with no credential: some home already holds an account
-        if isinstance(key, str) and key.startswith("cfgep:") and first.endpoint is not None \
-                and (first.provider_id, first.endpoint.normalized) in held_endpoints:
-            continue  # the configured endpoint is already a pooled account
+        if is_config(members):
+            if first.endpoint is None and first.provider_id in held_providers:
+                continue  # a configured cloud provider with no credential: some home already holds an account
+            if first.endpoint is not None and (first.provider_id, first.endpoint.normalized) in held_endpoints:
+                continue  # the configured endpoint is already a pooled account
         holders: List[Holder] = []
-        for holder, _item in members:
+        for holder, _item, _selected in members:
             if holder not in holders:
                 holders.append(holder)
-        items = [item for _holder, item in members]
-        rep = next((i for i in items if i.credential is not None), first)
+        items = [item for _holder, item, _selected in members]
+        usable = next((item for _holder, item, selected in members if selected and item.credential is not None), None)
+        health_usable = next((item for _holder, item, selected in members
+                              if selected and item.health_credential is not None), None)
         plan = next((i for i in items if i.plan_name), None)
         secrets = frozenset().union(*(i.secrets for i in items))
-        row_ids = tuple(dict.fromkeys(r for i in items for r in i.row_ids))
-        anchor = first.identity_key or f"{holders[0].profile}:{first.account_id}"
+        refs = tuple(dict.fromkeys(r for i in items for r in i.credential_refs))
         normalized = first.endpoint.normalized if first.endpoint else None
-        account_id = make_account_id(first.provider_id, normalized, "machine:" + anchor)
+        account_id = make_account_id(first.provider_id, normalized, "machine:" + identity)
         if account_id in seen_ids:
             continue
         seen_ids.add(account_id)
         per_provider[first.provider_id] = per_provider.get(first.provider_id, 0) + 1
         merged.append(replace(
-            rep,
+            first,
             account_id=account_id,
             account_label=f"Account {per_provider[first.provider_id]}",
             auth_status="available" if any(i.credential is not None for i in items) else "missing",
+            credential=usable.credential if usable else None,
+            health_credential=health_usable.health_credential if health_usable else None,
             plan_name=plan.plan_name if plan else None,
             plan_source=plan.plan_source if plan else "none",
             secrets=secrets,
-            row_ids=row_ids,
-            identity_key=first.identity_key,
+            credential_refs=refs,
+            identity_key=identity,
             holders=tuple(holders),
+            live_source=any(selected for _holder, _item, selected in members),
         ))
     merged.sort(key=lambda i: (i.provider_id, i.account_id))
     return merged

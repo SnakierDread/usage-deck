@@ -957,25 +957,62 @@ def fmt_epoch(epoch):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
 
-def write_synthetic_capture(s):
-    """A header capture for the fixture's anthropic row, written by this harness with INVENTED values.
+def load_plugin_modules():
+    """The committed plugin's own ``captures`` / ``observer`` modules, loaded from the repo under a private
+    package name (the host venv ships its own top-level ``plugins`` package, so a plain import would clash)."""
+    import importlib
+    import importlib.util
+    name = "_usage_deck_harness_pkg"
+    if name not in sys.modules:
+        init = REPO / PLUGIN_REL / "__init__.py"
+        spec = importlib.util.spec_from_file_location(name, init, submodule_search_locations=[str(init.parent)])
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules[name] = pkg
+        spec.loader.exec_module(pkg)
+    return importlib.import_module(name + ".captures"), importlib.import_module(name + ".observer")
 
-    Nothing in Hermes records ``anthropic-ratelimit-unified-*`` headers today, so the plugin's capture file is
-    produced here, in the scratch root only. Times are relative to now so the windows are still open when the
-    host reads them. Returns the expected values for the meter checks.
+
+def write_synthetic_capture(s):
+    """A header capture for the fixture's anthropic row (held by profile ``verifier``) with INVENTED values.
+
+    It travels the REAL schema-2 seam: a synthetic test callback shaped exactly like the Hermes core hook's
+    payload goes into the plugin's opt-in observer, which validates it against a host context and persists it
+    through ``captures.record_headers`` into the scratch root only. Nothing here is a live Anthropic
+    observation; no request of any kind is made. Times are relative to now so the windows are still open when
+    the host reads them. Returns the expected values and the seam checks for the report.
     """
+    captures, observer = load_plugin_modules()
     now = int(time.time())
     observed = now - 90
     fives, sevens = now + 3 * 3600, now + 3 * 86400
-    path = s.root / "plugin-data" / "usage-deck" / "anthropic-ratelimit.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"schema_version": 1, "captures": [{
-        "provider": "anthropic", "credential_id": "syn-anthropic-1", "observed_at": fmt_epoch(observed),
-        "headers": {
-            "anthropic-ratelimit-unified-5h-utilization": "0.25", "anthropic-ratelimit-unified-5h-reset": str(fives),
-            "anthropic-ratelimit-unified-7d-utilization": "0.5", "anthropic-ratelimit-unified-7d-reset": str(sevens),
-        }}]}))
-    return {"observed_at": fmt_epoch(observed), "session_reset": fmt_epoch(fives), "weekly_reset": fmt_epoch(sevens)}
+    root = Path(os.path.realpath(s.root))
+    home = root / "profiles" / "verifier"
+    enabled = {"usage_deck": {"capture_anthropic_headers": True}}
+    headers = {
+        "anthropic-ratelimit-unified-5h-utilization": "0.25", "anthropic-ratelimit-unified-5h-reset": str(fives),
+        "anthropic-ratelimit-unified-7d-utilization": "0.5", "anthropic-ratelimit-unified-7d-reset": str(sevens),
+        "authorization": "Bearer UDSYN-must-not-persist", "set-cookie": "UDSYN-cookie=1",
+    }
+    payload = {
+        "schema_version": 1, "provider": "anthropic", "hermes_root": str(root),
+        "execution_profile": {"profile": "verifier", "is_global": False},
+        "holder": {"profile": "verifier", "is_global": False},
+        "credential_id": "syn-anthropic-1", "observed_at": fmt_epoch(observed), "headers": headers,
+    }
+    store = captures.default_store_path(root)
+    opted_out = observer.Observer(lambda: observer.HostContext(home, root, {}))
+    opted_out(**dict(payload, credential_id="syn-optout-row"))
+    off_wrote = store.exists()
+    observer.Observer(lambda: observer.HostContext(home, root, enabled))(**payload)
+    first = store.read_bytes() if store.exists() else b""
+    # an out-of-order, older delivery must not regress, and another opted-out call must not touch the store
+    observer.Observer(lambda: observer.HostContext(home, root, enabled))(
+        **dict(payload, observed_at=fmt_epoch(observed - 600), headers={"anthropic-ratelimit-unified-5h-utilization": "0.9"}))
+    opted_out(**dict(payload, credential_id="syn-optout-row-2"))
+    data = json.loads(first.decode() or "{}")
+    return {"observed_at": fmt_epoch(observed), "session_reset": fmt_epoch(fives), "weekly_reset": fmt_epoch(sevens),
+            "store": store, "off_wrote": off_wrote, "first": first, "data": data,
+            "unchanged": store.exists() and store.read_bytes() == first}
 
 
 def machine_checks(R, host, bodies, capture):
@@ -993,6 +1030,20 @@ def machine_checks(R, host, bodies, capture):
     def held(c):
         return [(h["profile"], h["is_global"]) for h in c["holders"]]
 
+    R.check("capture seam: a synthetic hook callback with the setting OFF writes nothing; with it ON the real "
+            "observer->record_headers path wrote a schema-2 entry scoped to holder 'verifier' (no secret header, "
+            "no hermes_root); an older out-of-order delivery and further opted-out calls changed nothing",
+            capture["off_wrote"] is False and capture["unchanged"]
+            and capture["data"].get("schema_version") == 2
+            and [(c["holder"], c["credential_id"]) for c in capture["data"].get("captures", [])]
+            == [({"profile": "verifier", "is_global": False}, "syn-anthropic-1")]
+            and not any(w in capture["first"].decode() for w in ("UDSYN-must-not-persist", "UDSYN-cookie", "hermes_root")),
+            json.dumps(capture["data"])[:300])
+    mode = oct(capture["store"].stat().st_mode & 0o777) if capture["store"].exists() else "absent"
+    R.check("capture store is private: file 0600, its lock file 0600, directory 0700 (POSIX)",
+            os.name != "posix" or (mode == "0o600"
+                                   and oct((capture["store"].parent / ".anthropic-ratelimit.lock").stat().st_mode & 0o777) == "0o600"
+                                   and oct(capture["store"].parent.stat().st_mode & 0o777) == "0o700"), mode)
     R.check("machine view: data.view == 'machine' and it is the default when no view is given",
             bool(mj) and mj["data"]["view"] == "machine"
             and (host.api("subscriptions", view=None).json or {}).get("data", {}).get("view") == "machine")
@@ -1008,9 +1059,15 @@ def machine_checks(R, host, bodies, capture):
                 held(codex) == [("global", True), ("verifier", False)]
                 and (codex["plan_name"], codex["plan_source"], codex["state"], codex["confidence"]) ==
                 ("plus", "unverified_claim", "opaque", "opaque"), json.dumps(codex)[:300])
-        R.check("machine view: the two openrouter rows stay separate accounts, each held by exactly its own home",
-                sorted(held(c) for c in pv["openrouter"]) == [[("global", True)], [("work", False)]]
-                and all((c["state"], c["confidence"]) == ("ready", "exact") for c in pv["openrouter"])
+        by_holder = {tuple(held(c)): c for c in pv["openrouter"]}
+        R.check("machine view: the two openrouter rows stay separate accounts, each held by exactly its own home; "
+                "only the launch home's (root) effective credential is probed live (ready/exact), profile work's "
+                "is machine-only inventory: opaque, source_unavailable, no meters and no request with its token",
+                sorted(by_holder) == [(("global", True),), (("work", False),)]
+                and (by_holder[(("global", True),)]["state"], by_holder[(("global", True),)]["confidence"]) == ("ready", "exact")
+                and (by_holder[(("work", False),)]["state"], by_holder[(("work", False),)]["reason"],
+                     by_holder[(("work", False),)]["meters"], by_holder[(("work", False),)]["error"])
+                == ("opaque", "source_unavailable", [], None)
                 and len({c["account_id"] for c in pv["openrouter"]}) == 2)
         ant = pv["anthropic"][0]
         meters = {m["id"]: m for m in ant["meters"]}
