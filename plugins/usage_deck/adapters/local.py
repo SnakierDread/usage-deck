@@ -1,7 +1,9 @@
 """Self-hosted / custom endpoint adapter: health and optional metrics only.
 
-Requests go solely to the inventory-configured origin. ``/metrics`` is tried
-without the inference credential; models/tags endpoints provide the health
+Requests go solely to the inventory-configured origin. ``/metrics`` carries only
+``ctx.health_credential`` (the endpoint's own ``key_env`` secret or a separately
+configured metrics credential, never an inline/pool inference key) and is otherwise
+anonymous; models/tags endpoints send the inference credential and provide the health
 evidence. A successful metrics exposition yields ``self_hosted`` confidence for
 operational numbers; it never becomes a token quota.
 """

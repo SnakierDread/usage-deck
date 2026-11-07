@@ -174,7 +174,8 @@ class KeyEnvServiceTests(Base):
         cards, health, envelopes = self.deck(box)
         self.assertTrue(box.auth_headers_for("/v1/models"))
         self.assertTrue(all(a == "Bearer " + ENV_VALUE for a in box.auth_headers_for("/v1/models")))
-        self.assertEqual(box.auth_headers_for("/metrics"), [None] * len(box.auth_headers_for("/metrics")))
+        # the same-origin /metrics probe carries the resolved key_env secret too (test_probe_auth.py)
+        self.assertTrue(all(a == "Bearer " + ENV_VALUE for a in box.auth_headers_for("/metrics")))
         (card,) = cards
         (entry,) = health
         self.assertEqual((entry["status"], entry["error"], entry["reason"]), ("healthy", None, None))
