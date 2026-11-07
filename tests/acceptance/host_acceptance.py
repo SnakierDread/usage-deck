@@ -31,6 +31,13 @@ Usage (host interpreter, from the repo root):
     python tests/acceptance/host_acceptance.py --self-check    # offline: fixture + validators only (no host)
 
 Stdlib only; needs the ``hermes`` CLI, ``git`` and ``openssl`` on PATH (or ``--hermes``).
+
+Interpreter for Hermes-dependent helpers. The harness itself needs only the stdlib, but the helper subprocesses that
+import Hermes modules (session seeding, the ``hermes_constants`` isolation probe) need Hermes's dependency closure,
+which only Hermes's own launcher bootstraps. They therefore run on a HERMES_PYTHON resolved once, in this order:
+(1) ``--hermes-python PATH``; (2) ``$HERMES_PYTHON``; (3) auto-detected by asking the ``hermes`` launcher what it runs
+on (the activated venv's interpreter, else its ``sys.executable``); (4) only then ``python3`` on PATH. See
+``hermes_python.py``.
 """
 
 from __future__ import annotations
@@ -58,6 +65,9 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hermes_python  # noqa: E402  (sibling module: which interpreter can import Hermes)
 
 REPO = Path(__file__).resolve().parents[2]
 PLUGIN_REL = "plugins/usage_deck"
@@ -834,7 +844,7 @@ class Context:
         return s
 
     def seed_sessions(self, s: Scratch):
-        proc = subprocess.run([sys.executable, str(REPO / "tests" / "acceptance" / "seed_sessions.py"),
+        proc = subprocess.run([self.args.hermes_python, str(REPO / "tests" / "acceptance" / "seed_sessions.py"),
                                str(self.args.hermes_agent)], env={**s.env(), "HERMES_HOME": str(s.root)},
                               capture_output=True, text=True, timeout=120)
         self.R.check("seed synthetic sessions into the scratch state.db", proc.returncode == 0,
@@ -895,7 +905,7 @@ def scenario_isolation(ctx: Context):
                      "from hermes_constants import get_default_hermes_root\nprint(get_default_hermes_root())\n")
 
     def resolve(env):
-        proc = subprocess.run([sys.executable, str(probe), str(ctx.args.hermes_agent)], env=env, capture_output=True,
+        proc = subprocess.run([ctx.args.hermes_python, str(probe), str(ctx.args.hermes_agent)], env=env, capture_output=True,
                               text=True, timeout=60)
         return Path(proc.stdout.strip()).resolve() if proc.returncode == 0 and proc.stdout.strip() else None
 
@@ -1497,9 +1507,27 @@ def self_check(R):
 
 # --------------------------------------------------------------------------- main
 
+HERMES_PYTHON_HELP = """\
+interpreter for Hermes-dependent helpers (HERMES_PYTHON):
+  Helper subprocesses that import Hermes modules (session seeding, the hermes_constants isolation probe) need Hermes's
+  dependency closure, which only the hermes launcher bootstraps; a bare python3 lacks it (ModuleNotFoundError: ruamel).
+  They all run on one interpreter, resolved once, first hit wins:
+    1. --hermes-python PATH
+    2. $HERMES_PYTHON
+    3. auto-detect: the hermes launcher (--hermes) is asked what it runs on; the activated venv's interpreter is used,
+       else the launcher's sys.executable
+    4. python3 on PATH (last resort)
+  An explicit choice (1, 2) that is not an executable aborts the run. The chosen interpreter is printed in the banner and
+  must import hermes_constants/hermes_state before any scenario runs.
+"""
+
 def parse_args(argv):
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], epilog=HERMES_PYTHON_HELP,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hermes", default=shutil.which("hermes") or "hermes", help="hermes CLI to drive")
+    ap.add_argument("--hermes-python", metavar="PATH",
+                    help="interpreter for EVERY helper subprocess that imports Hermes modules (default: $HERMES_PYTHON, "
+                         "then auto-detected via the hermes launcher, then PATH python3)")
     ap.add_argument("--workdir", help="parent directory for the managed scratch tree (default: $HERMES_KANBAN_WORKSPACE or $TMPDIR)")
     ap.add_argument("--runtime-root", default=str(account_home() / ".hermes"),
                     help="where the machine's Hermes runtime (installs/, tools/) lives; linked read-only into each scratch root")
@@ -1510,12 +1538,20 @@ def parse_args(argv):
     ap.add_argument("--only", action="append", choices=("isolation", "main", "empty", "malformed", "unknown"),
                     help="run only these scenarios")
     ap.add_argument("--json-out", help="write the machine-readable report here")
-    args = ap.parse_args(argv)
+    return ap.parse_args(argv)
+
+
+def resolve_runtime(args):
+    """Resolve HERMES_PYTHON once and the hermes-agent checkout; fills ``args.hermes_python`` / ``hermes_agent``."""
+    res = hermes_python.resolve_hermes_python(args.hermes_python, os.environ, args.hermes)
+    args.hermes_python_resolution = res
+    args.hermes_python = res.python
     if not args.hermes_agent:
         import importlib.util
         spec = importlib.util.find_spec("hermes_constants")
-        args.hermes_agent = str(Path(spec.origin).parent) if spec and spec.origin else str(Path(args.runtime_root) / "hermes-agent")
-    return args
+        args.hermes_agent = (res.agent_root or (str(Path(spec.origin).parent) if spec and spec.origin else "")
+                             or str(Path(args.runtime_root) / "hermes-agent"))
+    return res
 
 
 def main(argv=None):
@@ -1534,13 +1570,23 @@ def main(argv=None):
         if not shutil.which(tool):
             print(f"missing required tool: {tool}", file=sys.stderr)
             return 2
+    try:
+        res = resolve_runtime(args)
+    except hermes_python.HermesPythonError as exc:
+        print(f"HERMES_PYTHON: {exc}", file=sys.stderr)
+        return 2
+    broken = hermes_python.check_closure(args.hermes_python, args.hermes_agent)
+    if broken:
+        print(f"HERMES_PYTHON {res.describe()}\n  cannot import the Hermes modules the helpers need ({broken}).\n"
+              "  Pass --hermes-python PATH (or set $HERMES_PYTHON) to the interpreter Hermes's launcher runs on.", file=sys.stderr)
+        return 2
     head, dirty = committed_head()
     if dirty and not args.allow_dirty:
         print("tracked files differ from HEAD; the harness installs the COMMITTED plugin. Commit or pass --allow-dirty:\n  "
               + "\n  ".join(dirty), file=sys.stderr)
         return 2
     workdir = Path(tempfile.mkdtemp(prefix="usage-deck-acceptance-", dir=parent))
-    print(f"UsageDeck host acceptance @ {head}\n  workdir: {workdir}\n  hermes:  {args.hermes}", flush=True)
+    print(f"UsageDeck host acceptance @ {head}\n  workdir: {workdir}\n  hermes:  {args.hermes}\n  hermes python: {res.describe()}", flush=True)
     real_before = snapshot_real()
     ctx = Context(args, workdir, R)
     wanted = set(args.only or ("isolation", "main", "empty", "malformed", "unknown"))
