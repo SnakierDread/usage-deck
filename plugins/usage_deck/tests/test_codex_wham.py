@@ -601,7 +601,7 @@ class DtoSchema(unittest.TestCase):
         self.assertEqual(dto.METER_SOURCES, ("openrouter_key", "session_analytics", "prometheus", "anthropic_headers",
                                              "chatgpt_wham_usage", "none"))
         self.assertEqual(dto.SCHEMA_VERSION, 1)
-        self.assertEqual(dto.AUTH_STATUSES, ("available", "missing"))  # no "rejected"
+        self.assertEqual(dto.AUTH_STATUSES, ("available", "missing", "rejected"))  # "rejected" added by key_env fix (#7)
         self.assertTrue(dto.preserves_wire_value("unit", "credit"))
         self.assertTrue(dto.preserves_wire_value("source", "chatgpt_wham_usage"))
         self.assertFalse(dto.preserves_wire_value("unit", "credits"))
