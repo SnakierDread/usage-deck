@@ -546,8 +546,13 @@ def discover(source: Any) -> List[InventoryItem]:
         if credential is None and provider_id.lower() == "openrouter":
             credential = source.env_secret("OPENROUTER_API_KEY")
         # Precedence: an inline credential (api_key/token) beats the key_env pointer.
+        health_credential = draft.health_credential
         if credential is None and draft.key_env:
             credential = source.env_secret(draft.key_env)
+            if credential and health_credential is None:
+                # The same-origin /metrics probe authenticates with the endpoint's own key_env secret
+                # (llama-swap and friends gate every route); inline/pool credentials never reach it.
+                health_credential = credential
         if credential:
             secrets.add(credential)
             if provider_id.strip().lower() == CODEX_PROVIDER_ID:
@@ -579,6 +584,7 @@ def discover(source: Any) -> List[InventoryItem]:
             endpoint_id=make_endpoint_id(provider_id, normalized) if normalized else None,
             auth_status="available" if credential else "missing",
             credential=SecretValue(credential) if credential else None,
+            health_credential=SecretValue(health_credential) if health_credential else None,
             plan_name=plan,
             plan_source="unverified_claim" if plan else "none",
             secrets=frozen,
