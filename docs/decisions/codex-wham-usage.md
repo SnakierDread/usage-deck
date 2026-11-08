@@ -76,8 +76,10 @@ that the adapter is implemented, installed, or supported by a public API SLA.
    or create a second meter. A progress bar may use value/limit only under §5's
    same-scope/period conditions; no bar for null/zero limit. No clamp of values,
    history manufacture, account aggregation, or currency conversion.
-5. **No optional credits-balance meter in this implementation.** Ignore credits,
-   model_usage, rate_limit*, promo, response identity and plan_type. Their
+5. **No optional credits-balance meter in this implementation.** *(Amended by DESIGN §9.2.1,
+   card `t_7c3ca1dc`: `rate_limit.primary_window`/`secondary_window` are now mapped to percent meters;
+   the rest of this term stands.)* Ignore credits,
+   model_usage, rate_limit* (except as amended), promo, response identity and plan_type. Their
    accounting relation, periods and supported shapes are not established by
    this single fixture. Never emit upstream email/user_id/account_id, raw JWT,
    response plan/model fields, routing claims, or raw response/debug bags.
