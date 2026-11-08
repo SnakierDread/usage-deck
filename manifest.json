@@ -1,0 +1,7 @@
+{
+  "name": "usage-deck",
+  "version": "0.1.0",
+  "description": "UsageDeck package manifest. The installable package folder is plugins/usage_deck; its desktop half is the entry below.",
+  "package": "plugins/usage_deck",
+  "entry": "plugins/usage_deck/desktop/plugin.js"
+}

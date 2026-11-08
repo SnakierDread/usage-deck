@@ -133,12 +133,37 @@ hermes plugins remove usage-deck           # uninstall
 
 After a reinstall, run `hermes plugins list --plain --no-bundled` and re-enable if it shows `disabled`.
 
+### Desktop app half (optional)
+
+The package also carries a half for the native Hermes desktop app: `plugins/usage_deck/desktop/plugin.js` (a **Desktop** target plus a `manifest.json` that only describes it). The desktop app copies it into its own `$HERMES_HOME/desktop-plugins/usage-deck/` on the machine where the app runs. The desktop half shows nothing without the agent half (steps 2–3) on the gateway the app is connected to. There are three ways to get it, from most to least integrated. All three leave the web dashboard tab above untouched.
+
+1. **Catalog.** Not available: UsageDeck is a private repository and is not listed in any plugin catalog. Use route 2.
+2. **Install from Git** (recommended). In the app: **Capabilities → Plugins → Install from Git**, keep the **Desktop** target checked, and enter the **package folder**, not the bare repository URL:
+
+   ```text
+   https://github.com/SnakierDread/usage-deck/tree/main/plugins/usage_deck
+   ```
+
+   (`SnakierDread/usage-deck/plugins/usage_deck` and `https://github.com/SnakierDread/usage-deck.git#plugins/usage_deck` resolve to the same thing.) Review the dialog: it should list the package as `usage-deck` with a Desktop half. Confirm, then **Rescan**, then enable the Desktop half in **Plugins** (it ships disabled). This machine needs `git` and read access to the private repo (the app clones non-interactively, so sign in to GitHub with a credential helper first). The bare repository URL has no package at its root and the installer reports *No agent or desktop plugin artifacts found*; that is expected, use the folder form. To update, install again with **Force**.
+3. **Disk door** (manual standalone copy, no git needed). Copy exactly one file:
+
+   ```sh
+   mkdir -p "$HERMES_HOME/desktop-plugins/usage-deck"      # default: ~/.hermes/desktop-plugins/usage-deck
+   cp plugins/usage_deck/desktop/plugin.js "$HERMES_HOME/desktop-plugins/usage-deck/plugin.js"
+   ```
+
+   The app loads it within seconds and hot-reloads each save. Do not copy `manifest.json` or write a `.hermes-package.json` marker. A folder with a `plugin.js` and no marker is a hand-installed standalone plugin: the app never overwrites it, so it has no update or uninstall tracking. To switch to route 2 later, delete that folder first. Remote gateway: this is the route that works when the agent half lives on another machine, since the app never reads a remote filesystem.
+
+Layout rules the installer enforces, kept true by `tests/packaging/test_package_manifests.py`: no `plugin.js` at the repository root or package root (a root `plugin.js` wins and the whole folder would be published as the desktop half), no symlinks anywhere, and a tree far under the 64 MB cap. `manifest.json` (repository root) and `plugins/usage_deck/desktop/manifest.json` are metadata only: `name`, `version`, entry path. No Hermes surface reads them as an agent or dashboard manifest, because the agent half is detected from `plugin.yaml` plus `__init__.py` or `dashboard/manifest.json`.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
 | --- | --- |
 | `hermes plugins install ./plugins/usage_deck` fails | Unsupported shorthand. Use the quoted `file://$(pwd)#plugins/usage_deck` form from step 2, run from the repo root. |
 | Install fails with a clone or authentication error | The repo is private. Confirm that `git clone https://github.com/SnakierDread/usage-deck.git` works on this machine first. |
+| Desktop **Install from Git** says *No agent or desktop plugin artifacts found* | You entered the bare repository URL. Enter the package folder: `https://github.com/SnakierDread/usage-deck/tree/main/plugins/usage_deck`. See "Desktop app half". |
+| Desktop **Install from Git** still fails while staging the desktop half | Use the disk door (copy `plugins/usage_deck/desktop/plugin.js` to `$HERMES_HOME/desktop-plugins/usage-deck/plugin.js`) and report the exact error text with your app version. See "Desktop app half". |
 | Installed copy is old, or misses your edits | Only committed files are installed. Commit, then reinstall with `--force`. |
 | No **UsageDeck** tab | Run `hermes plugins list --plain --no-bundled`. If it says `disabled`, run `hermes plugins enable usage-deck`. Then restart `hermes dashboard` and reload the browser. |
 | Tab opens but says "No providers detected in this profile" | Normal when the selected profile has no credentials or custom endpoints. Switch to a profile that has them, or configure a provider in Hermes. UsageDeck will not ask for keys. |
