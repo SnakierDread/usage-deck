@@ -60,6 +60,15 @@ class ManifestAgreementTests(unittest.TestCase):
         self.assertEqual(desk["version"], root["version"])
         self.assertEqual((DESKTOP / desk["entry"]).resolve(), (REPO / root["entry"]).resolve())
 
+    def test_desktop_manifest_has_the_git_stager_field_set(self):
+        # The app git-stager requires this shape (main ab62b4c); do not downgrade to name/version/entry.
+        desk = _load(DESKTOP / "manifest.json")
+        self.assertEqual(set(desk), {"name", "label", "description", "icon", "version", "entry"})
+        for key in ("name", "label", "description", "icon", "version", "entry"):
+            self.assertIsInstance(desk[key], str, key)
+            self.assertTrue(desk[key].strip(), key)
+        self.assertEqual(desk["entry"], "plugin.js")
+
     def test_versions_match_dashboard_manifest(self):
         self.assertEqual(_load(REPO / "manifest.json")["version"], _load(PKG / "manifest.json")["version"])
 
