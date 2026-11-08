@@ -1,0 +1,8 @@
+{
+  "name": "usage-deck",
+  "label": "UsageDeck",
+  "description": "Subscription usage meters and token analytics for every provider connected to this Hermes instance — desktop half",
+  "icon": "Gauge",
+  "version": "0.1.0",
+  "entry": "plugin.js"
+}
