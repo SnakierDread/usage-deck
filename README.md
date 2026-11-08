@@ -138,13 +138,21 @@ After a reinstall, run `hermes plugins list --plain --no-bundled` and re-enable 
 The package also carries a half for the native Hermes desktop app: `plugins/usage_deck/desktop/plugin.js` (a **Desktop** target plus a `manifest.json` that only describes it). The desktop app copies it into its own `$HERMES_HOME/desktop-plugins/usage-deck/` on the machine where the app runs. The desktop half shows nothing without the agent half (steps 2–3) on the gateway the app is connected to. There are three ways to get it, from most to least integrated. All three leave the web dashboard tab above untouched.
 
 1. **Catalog.** Not available: UsageDeck is a private repository and is not listed in any plugin catalog. Use route 2.
-2. **Install from Git** (recommended). In the app: **Capabilities → Plugins → Install from Git**, keep the **Desktop** target checked, and enter the **package folder**, not the bare repository URL:
+2. **Install from Git** (recommended). In the app: **Capabilities → Plugins → Install from Git**, keep the **Desktop** target checked, and enter the **package folder** (canonical: it installs both halves as one package):
 
    ```text
    https://github.com/SnakierDread/usage-deck/tree/main/plugins/usage_deck
    ```
 
-   (`SnakierDread/usage-deck/plugins/usage_deck` and `https://github.com/SnakierDread/usage-deck.git#plugins/usage_deck` resolve to the same thing.) Review the dialog: it should list the package as `usage-deck` with a Desktop half. Confirm, then **Rescan**, then enable the Desktop half in **Plugins** (it ships disabled). This machine needs `git` and read access to the private repo (the app clones non-interactively, so sign in to GitHub with a credential helper first). The bare repository URL has no package at its root and the installer reports *No agent or desktop plugin artifacts found*; that is expected, use the folder form. To update, install again with **Force**.
+   (`SnakierDread/usage-deck/plugins/usage_deck` and `https://github.com/SnakierDread/usage-deck.git#plugins/usage_deck` resolve to the same thing.) Review the dialog: it should list the package as `usage-deck` with a Desktop half. Confirm, then **Rescan**, then enable the Desktop half in **Plugins** (it ships disabled). This machine needs `git` and read access to the private repo (the app clones non-interactively, so sign in to GitHub with a credential helper first). To update, install again with **Force**.
+
+   The **bare repository URL** is also accepted, so a copied repo link no longer dead-ends:
+
+   ```text
+   https://github.com/SnakierDread/usage-deck
+   ```
+
+   It is the **desktop half only**. The repository root carries a `plugin.js` (a generated, byte-identical copy of `plugins/usage_deck/desktop/plugin.js`) and nothing else the installer recognises, so the dialog lists a Desktop half and no agent half, and the app publishes the whole repository tree (about 2 MB; `.git` and `__pycache__` left out) as the desktop plugin `usage-deck`. Nothing is installed on the gateway: the page shows *backend unavailable* until you also install the agent half (steps 2–3 above, or the folder URL). Once the agent half is installed the app recognises the folder as that package's desktop half (the files are byte-identical) and pairs them; if the pairing does not happen, remove the `usage-deck` desktop plugin and install the folder URL with **Force**. Prefer the folder URL: one install, both halves, update/uninstall tracked.
 3. **Disk door** (manual standalone copy, no git needed). Copy exactly one file:
 
    ```sh
@@ -154,7 +162,7 @@ The package also carries a half for the native Hermes desktop app: `plugins/usag
 
    The app loads it within seconds and hot-reloads each save. Do not copy `manifest.json` or write a `.hermes-package.json` marker. A folder with a `plugin.js` and no marker is a hand-installed standalone plugin: the app never overwrites it, so it has no update or uninstall tracking. To switch to route 2 later, delete that folder first. Remote gateway: this is the route that works when the agent half lives on another machine, since the app never reads a remote filesystem.
 
-Layout rules the installer enforces, kept true by `tests/packaging/test_package_manifests.py`: no `plugin.js` at the repository root or package root (a root `plugin.js` wins and the whole folder would be published as the desktop half), no symlinks anywhere, and a tree far under the 64 MB cap. `manifest.json` (repository root) and `plugins/usage_deck/desktop/manifest.json` are metadata only: `name`, `version`, entry path. No Hermes surface reads them as an agent or dashboard manifest, because the agent half is detected from `plugin.yaml` plus `__init__.py` or `dashboard/manifest.json`.
+Layout rules the installer enforces, kept true by `tests/packaging/test_package_manifests.py`: no `plugin.js` at the package root, a repository-root `plugin.js` that is a byte-exact copy of `plugins/usage_deck/desktop/plugin.js` (the bare-URL entry above; it wins the entry search, so the whole repository is published as the desktop half; it cannot be a re-export shim because the app's loader resolves only `@hermes/plugin-sdk`, `react` and `react/jsx-runtime`), no root `plugin.yaml`/`plugin.json`/`__init__.py`/`dashboard/` (a root `plugin.json` would make the probe report an agent half that the agent installer then copies as the whole repository and rejects without an Agent Plugins schema), no symlinks anywhere, and a tree far under the 64 MB cap. `manifest.json` (repository root) and `plugins/usage_deck/desktop/manifest.json` are metadata only: `name`, `version`, entry path. No Hermes surface reads them as an agent or dashboard manifest, because the agent half is detected from `plugin.yaml` plus `__init__.py` or `dashboard/manifest.json`.
 
 ## Troubleshooting
 
@@ -162,7 +170,8 @@ Layout rules the installer enforces, kept true by `tests/packaging/test_package_
 | --- | --- |
 | `hermes plugins install ./plugins/usage_deck` fails | Unsupported shorthand. Use the quoted `file://$(pwd)#plugins/usage_deck` form from step 2, run from the repo root. |
 | Install fails with a clone or authentication error | The repo is private. Confirm that `git clone https://github.com/SnakierDread/usage-deck.git` works on this machine first. |
-| Desktop **Install from Git** says *No agent or desktop plugin artifacts found* | You entered the bare repository URL. Enter the package folder: `https://github.com/SnakierDread/usage-deck/tree/main/plugins/usage_deck`. See "Desktop app half". |
+| Desktop **Install from Git** says *No agent or desktop plugin artifacts found* | The app predates the repository-root `plugin.js`, or the URL is not this repository. Enter the package folder: `https://github.com/SnakierDread/usage-deck/tree/main/plugins/usage_deck`. See "Desktop app half". |
+| Desktop **Install from Git** with the bare repository URL installed a half that shows *backend unavailable* | The bare URL installs the desktop half only. Install the agent half too (steps 2–3, or the folder URL). |
 | Desktop **Install from Git** still fails while staging the desktop half | Use the disk door (copy `plugins/usage_deck/desktop/plugin.js` to `$HERMES_HOME/desktop-plugins/usage-deck/plugin.js`) and report the exact error text with your app version. See "Desktop app half". |
 | Installed copy is old, or misses your edits | Only committed files are installed. Commit, then reinstall with `--force`. |
 | No **UsageDeck** tab | Run `hermes plugins list --plain --no-bundled`. If it says `disabled`, run `hermes plugins enable usage-deck`. Then restart `hermes dashboard` and reload the browser. |
@@ -184,6 +193,7 @@ Run these from the repository root. They use the Python standard library, plus N
 python -m unittest discover -s plugins/usage_deck/tests -t .     # backend (machine view, capture store, observer, header meters)
 tests/run_frontend.sh                                            # frontend + packaging
 python scripts/stage_dashboard.py --check --require-backend      # staged dashboard/ is in sync
+python scripts/stage_root_entry.py --check                       # root plugin.js is in sync with desktop/plugin.js
 ```
 
 Header data in tests is **synthetic**: `plugins/usage_deck/tests/fixtures/synthetic_anthropic_capture.json` is invented, flagged `"synthetic": true` (the production reader refuses such files) and was not captured from any real response. The machine-view fixtures are temporary multi-profile homes built in `tests/test_machine_view.py` / `tests/test_machine_scope.py` plus the committed `scratch_home/` (profiles `work` and `verifier`). `tests/test_capture_store.py` covers the schema-2 writer (true multi-process contention, lock timeout, symlink/oversize/future/synthetic/out-of-order cases) and `tests/test_observer.py` the opt-in observer; `tests/test_core_seam.py` runs the REAL Hermes core hook dispatch into the loaded plugin when `USAGE_DECK_CORE_CHECKOUT` points at a Hermes checkout that carries the `provider_ratelimit_headers` hook (skipped otherwise). None of this is a live provider observation.
