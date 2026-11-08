@@ -115,6 +115,30 @@ test("Anthropic header meters: exact badge, source, observed time, provider rese
   await m.unmount();
 });
 
+test("Anthropic two-window stack: session first then weekly, labelled; a lone window renders alone with no placeholder", async () => {
+  const weekly = hdrMeter({ id: "weekly_7d", label: "Weekly (7-day window)", value: 43.21, period: rolling("rolling_7d"), resets_at: "2026-11-10T09:00:00Z" });
+  const only = (id, meters) => F.card({ id, account_id: id, provider_id: "anthropic", provider_label: "Anthropic", state: "ready",
+    confidence: "exact", reason: null, holders: holders("global"), meters });
+  const cards = [
+    only("acct_both", [hdrMeter(), weekly]),
+    only("acct_wk", [weekly]),
+    only("acct_5h", [hdrMeter()]),
+  ];
+  const m = await mount({ routes: routes({ subs: (url) => envelope({ cards, inventory_state: "detected",
+    view: new URL(url, "http://x").searchParams.get("view") }) }) });
+  const ids = (card) => Array.from(m.$(`[data-card-id=${card}]`).querySelectorAll(".ud-meter")).map((r) => r.dataset.meterId);
+  assert.deepEqual(ids("acct_both"), ["session_5h", "weekly_7d"]);
+  assert.deepEqual(ids("acct_wk"), ["weekly_7d"]);
+  assert.deepEqual(ids("acct_5h"), ["session_5h"]);
+  const rows = m.$("[data-card-id=acct_both]").querySelectorAll(".ud-meter");
+  assert.match(rows[0].querySelector(".ud-meter-label").textContent, /Session \(5-hour window\)/);
+  assert.match(rows[1].querySelector(".ud-meter-label").textContent, /Weekly \(7-day window\)/);
+  for (const r of rows) assert.equal(r.querySelector(".ud-badge").dataset.confidence, "exact");
+  assert.doesNotMatch(m.$("[data-card-id=acct_wk]").textContent, /Session/);
+  assert.doesNotMatch(m.$("[data-card-id=acct_5h]").textContent, /Weekly/);
+  await m.unmount();
+});
+
 test("a header meter can never display above what its source allows", () => {
   const lying = hdrMeter({ source: "none" });
   assert.equal(mod.meterConfidence(lying), "opaque");

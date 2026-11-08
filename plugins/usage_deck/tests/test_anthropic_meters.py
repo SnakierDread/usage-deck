@@ -248,3 +248,70 @@ class AnthropicCardThroughService(ServiceBase, SchemaAsserts):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SinkRoundtripWindows(unittest.TestCase):
+    """record_headers -> capture file -> reader -> AnthropicAdapter, for each shape of header set.
+
+    Header values are invented (SYNTHETIC). The writer is the real sink; nothing is estimated for a window whose
+    headers are absent (partial sanitizing): the card shows exactly the windows the row carries.
+    """
+
+    SESSION_RESET = int(datetime(2026, 11, 6, 15, 0, tzinfo=timezone.utc).timestamp())
+    WEEKLY_RESET = int(datetime(2026, 11, 10, 9, 0, tzinfo=timezone.utc).timestamp())
+    OBSERVED = datetime(2026, 11, 6, 11, 58, 30, tzinfo=timezone.utc)
+
+    BOTH = {
+        P5 + "utilization": "0.25", P5 + "reset": str(SESSION_RESET), P5 + "status": "allowed",
+        P7 + "utilization": "0.5", P7 + "reset": str(WEEKLY_RESET), P7 + "status": "allowed",
+    }
+    FIVE_ONLY = {k: v for k, v in BOTH.items() if k.startswith(P5)}
+    WEEK_ONLY = {k: v for k, v in BOTH.items() if k.startswith(P7)}
+
+    def roundtrip(self, headers, row="row-rt"):
+        tmp = tempfile.TemporaryDirectory(prefix="usage-deck-rt-")
+        self.addCleanup(tmp.cleanup)
+        path = default_store_path(Path(tmp.name))
+        stored = record_headers(path, "anthropic", row, headers, self.OBSERVED, holder=(False, "work"),
+                                clock=lambda: NOW)
+        self.assertIsNotNone(stored)
+        adapter, _ = adapter_for([row], CaptureStore(path, clock=lambda: NOW))
+        return adapter.get_usage(30)
+
+    def shape(self, meter):
+        return (meter.id, meter.label, meter.value, meter.limit, meter.remaining, meter.unit, meter.scope,
+                meter.period.start, meter.period.end, meter.period.label, meter.confidence, meter.source,
+                meter.observed_at, meter.resets_at)
+
+    SESSION = ("session_5h", "Session (5-hour window)", 25.0, 100.0, None, "percent", "provider_account",
+               None, None, "rolling_5h", "exact", "anthropic_headers", "2026-11-06T11:58:30Z", "2026-11-06T15:00:00Z")
+    WEEKLY = ("weekly_7d", "Weekly (7-day window)", 50.0, 100.0, None, "percent", "provider_account",
+              None, None, "rolling_7d", "exact", "anthropic_headers", "2026-11-06T11:58:30Z", "2026-11-10T09:00:00Z")
+
+    def test_both_windows_are_emitted_session_first_with_exact_shapes(self):
+        usage = self.roundtrip(self.BOTH)
+        self.assertEqual((usage.confidence, usage.reason), ("exact", None))
+        self.assertEqual([self.shape(m) for m in usage.meters], [self.SESSION, self.WEEKLY])
+
+    def test_five_hour_only_renders_just_the_session_meter(self):
+        usage = self.roundtrip(self.FIVE_ONLY)
+        self.assertEqual((usage.confidence, usage.reason), ("exact", None))
+        self.assertEqual([self.shape(m) for m in usage.meters], [self.SESSION])
+
+    def test_week_only_renders_just_the_weekly_meter(self):
+        usage = self.roundtrip(self.WEEK_ONLY)
+        self.assertEqual((usage.confidence, usage.reason), ("exact", None))
+        self.assertEqual([self.shape(m) for m in usage.meters], [self.WEEKLY])
+
+    def test_session_meter_follows_the_same_staleness_rule_as_weekly(self):
+        # Observed before the 5h reset, read after it: the session window no longer describes the current window
+        # (no guess, not zero) while the weekly one is still current. This is the live 2026-11-08 situation.
+        headers = dict(self.BOTH)
+        headers[P5 + "reset"] = str(int(datetime(2026, 11, 6, 11, 59, tzinfo=timezone.utc).timestamp()))
+        usage = self.roundtrip(headers)
+        self.assertEqual([m.id for m in usage.meters], ["weekly_7d"])
+
+    def test_missing_utilization_with_reset_present_yields_no_meter_for_that_window(self):
+        headers = {k: v for k, v in self.BOTH.items() if k != P5 + "utilization"}
+        usage = self.roundtrip(headers)
+        self.assertEqual([m.id for m in usage.meters], ["weekly_7d"])

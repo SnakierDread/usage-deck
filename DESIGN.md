@@ -326,6 +326,19 @@ Never extrapolated: a window whose reported reset is already in the past no long
 
 UI: each meter carries its own `Exact` badge; the tooltip names the source ("Anthropic unified rate-limit headers captured from the last call"), scope, observed time and the provider's reset, and says the value is as of that call and never extrapolated. The row shows `Used`, `Resets`, `As of`, plus a progress bar (the rolling window is a known period; an over-100 % value is shown as over limit).
 
+#### 9.1.1 Meter taxonomy: up to two windows per provider account (card `t_7df68287`)
+
+A provider card lists at most one meter per rate-limit window the provider itself reports, ordered **shortest window first** (the near-term cap matters most), then longer:
+
+| provider | meters, in card order | source |
+|---|---|---|
+| Anthropic | `session_5h` "Session (5-hour window)" (`rolling_5h`), then `weekly_7d` "Weekly (7-day window)" (`rolling_7d`) | `anthropic_headers` |
+| Codex (plan rate limit, §9.2.1) | `rate_limit_primary`, then `rate_limit_secondary` (labels from the reported window length) | `chatgpt_wham_usage` |
+
+Rules: (1) each window is emitted from its **own** headers only (`…-5h-utilization`/`…-5h-reset`, `…-7d-utilization`/`…-7d-reset`); a row that carries one window (partial sanitizing, §12) renders that meter alone and the missing window is never estimated, mirrored from the other or shown as zero; (2) the staleness rule is per window: a window whose own reported reset is at or before the read time yields no meter, so the short 5-hour window routinely disappears from an old capture while the weekly one remains (an idle account shows weekly only until a new call is observed); (3) a window with a utilization but no reset keeps its meter with `resets_at: null`; (4) the frontend renders `meters[]` verbatim in wire order, no placeholder for an absent window. Backend implementation: `ANTHROPIC_WINDOWS` in `adapters/cloud.py` (tuple order is card order).
+
+Operational note: capture rows exist only for calls made by a profile that has installed + enabled the plugin and set `usage_deck.capture_anthropic_headers: true` in **its own** config (§12.2); a profile that does neither (the worker profiles) never writes a row, so the Anthropic card reflects only calls from opted-in homes.
+
 ### 9.2 Codex: verified wham usage route reopened (ratified decision)
 
 Architect card `t_ad8bf9bc` supersedes the earlier opaque/no-network decision on November 7, 2026. Its required reopening evidence is now satisfied: scout `t_7dfdeb27` recorded **HTTP 200** for GET `https://chatgpt.com/backend-api/wham/usage`, response Date `2026-11-07T16:14:40Z`. The complete sanitized observed body (email/user_id/account_id replaced with `[REDACTED]`) is `docs/evidence/codex-wham-usage-200.sanitized.json`. Provenance and the **normative approval terms** are in `docs/decisions/codex-wham-usage.md`; that document is part of this contract. No new probe, production write, refresh or credential mutation is authorized by this amendment.
