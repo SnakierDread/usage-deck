@@ -1,7 +1,9 @@
 """Packaging tests for scripts/stage_root_entry.py (stdlib unittest)."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import os
 import tempfile
 import unittest
@@ -66,9 +68,11 @@ class StageRootEntryTests(unittest.TestCase):
         self.assertEqual(sre.check(self.root), ["root plugin.js is a symlink"])
 
     def test_main_exit_codes(self):
-        self.assertEqual(sre.main(["--root", str(self.root), "--check"]), 1)
-        self.assertEqual(sre.main(["--root", str(self.root)]), 0)
-        self.assertEqual(sre.main(["--root", str(self.root), "--check"]), 0)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(sre.main(["--root", str(self.root), "--check"]), 1)
+            self.assertEqual(sre.main(["--root", str(self.root)]), 0)
+            self.assertEqual(sre.main(["--root", str(self.root), "--check"]), 0)
+        self.assertIn("DRIFT:", out.getvalue())
 
 
 class RepoRootEntryTests(unittest.TestCase):
