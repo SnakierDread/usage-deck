@@ -209,6 +209,129 @@ def codex_spend_meter(payload: dict, now: datetime) -> Optional[UsageMeter]:
     )
 
 
+_MAX_WINDOW_SECONDS = 10 * 365 * 86400
+
+#: (window key, meter id, label prefix) for the two plan rate-limit windows (DESIGN.md §9.2.1).
+CODEX_RATE_WINDOWS = (
+    ("primary_window", "rate_limit_primary", "Plan usage limit"),
+    ("secondary_window", "rate_limit_secondary", "Secondary plan usage limit"),
+)
+
+
+def _window_seconds(value: Any) -> Optional[int]:
+    """``limit_window_seconds``: positive integral JSON number or decimal string; null -> None; else ValueError."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("boolean")
+    if isinstance(value, str):
+        if len(value) > 24 or not _EPOCH_RE.fullmatch(value):
+            raise ValueError("malformed window")
+        seconds = int(value.split(".", 1)[0])
+    elif isinstance(value, int):
+        seconds = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError("non-integral window")
+        seconds = int(value)
+    else:
+        raise ValueError("not a window")
+    if seconds <= 0 or seconds > _MAX_WINDOW_SECONDS:
+        raise ValueError("window out of range")
+    return seconds
+
+
+def _window_names(seconds: Optional[int]) -> Tuple[str, str]:
+    """(period label, human phrase) for a reported window length; whole units only, never rounded."""
+    if seconds is None:
+        return "unknown", "window"
+    for size, tag, word in ((86400, "d", "day"), (3600, "h", "hour"), (60, "m", "minute")):
+        if seconds % size == 0:
+            count = seconds // size
+            return f"rolling_{count}{tag}", f"{count}-{word} window"
+    return f"rolling_{seconds}s", f"{seconds}-second window"
+
+
+def codex_rate_limit_meters(payload: dict, now: datetime) -> List[UsageMeter]:
+    """Percent meters from ``rate_limit.primary_window`` / ``secondary_window`` (DESIGN.md §9.2.1).
+
+    This is the plan shape without a workspace spend control (e.g. ``go``): ``used_percent`` of a
+    fixed-length window plus the provider's ``reset_at`` instant. ``limit_reached: true`` is the
+    provider's own statement that the cap was hit: the primary meter reports ``remaining = 0`` (and
+    keeps the observed ``used_percent``: nothing is clamped or estimated up). A window whose reset
+    already passed is not presented as current. ``rate_limit`` null/absent or without any of
+    allowed/limit_reached/windows is an unsupported shape (no meters). Wrong-shaped present fields
+    raise ``ValueError`` (-> malformed_response).
+    """
+    rate = payload.get("rate_limit")
+    if rate is None:
+        return []
+    if not isinstance(rate, dict):
+        raise ValueError("rate_limit")
+    if not any(key in rate for key in ("allowed", "limit_reached", "primary_window", "secondary_window")):
+        return []
+    for flag in ("allowed", "limit_reached"):
+        if rate.get(flag) is not None and not isinstance(rate[flag], bool):
+            raise ValueError(flag)
+    reached = rate.get("limit_reached") is True
+    meters: List[UsageMeter] = []
+    for index, (key, meter_id, prefix) in enumerate(CODEX_RATE_WINDOWS):
+        window = rate.get(key)
+        if window is None:
+            continue
+        if not isinstance(window, dict):
+            raise ValueError(key)
+        used = _credit_amount(window.get("used_percent"))
+        seconds = _window_seconds(window.get("limit_window_seconds"))
+        reset = _reset_instant(window.get("reset_at"))
+        is_reached = reached and index == 0
+        if used is None and not is_reached:
+            continue  # no observation: never a zero
+        if reset is not None and reset <= now:
+            continue  # that window already ended: its current usage is unknown
+        meters.append(_rate_meter(meter_id, prefix, used, seconds, reset, is_reached, now))
+    if reached and not meters and rate.get("primary_window") is None:
+        meters.append(_rate_meter("rate_limit_primary", CODEX_RATE_WINDOWS[0][2], None, None, None, True, now))
+    return meters
+
+
+def _rate_meter(meter_id, prefix, used, seconds, reset, reached, now) -> UsageMeter:
+    period_label, phrase = _window_names(seconds)
+    return UsageMeter(
+        id=meter_id,
+        label=f"{prefix} ({phrase})" if seconds is not None else prefix,
+        value=used,
+        limit=100.0,
+        remaining=0.0 if reached else None,
+        unit="percent",
+        scope="provider_account",
+        period=Period(None, None, period_label),
+        confidence="exact",
+        source="chatgpt_wham_usage",
+        observed_at=fmt_ts(now),
+        resets_at=fmt_ts(reset),
+    )
+
+
+def codex_meters(payload: dict, now: datetime) -> List[UsageMeter]:
+    """Every supported meter of one wham/usage body; the spend-control meter always comes first.
+
+    The two shapes are disjoint per plan but may both be present: spend-control first, rate-limit
+    windows after it. When a spend meter exists, a malformed ``rate_limit`` is dropped rather than
+    discarding the good primary meter; otherwise it is a malformed response.
+    """
+    meters: List[UsageMeter] = []
+    spend = codex_spend_meter(payload, now)
+    if spend is not None:
+        meters.append(spend)
+    try:
+        meters.extend(codex_rate_limit_meters(payload, now))
+    except ValueError:
+        if spend is None:
+            raise
+    return meters
+
+
 class OpaqueCloudAdapter(BaseAdapter):
     """Local inventory + analytics only; subscription quota is opaque."""
 
@@ -232,8 +355,10 @@ class OpenAICodexAdapter(OpaqueCloudAdapter):
 
     One guarded GET per snapshot (probe is local-only and the result is memoized across windows).
     Sends only the selected access token as Bearer plus the same token's account/residency routing
-    claims; never refreshes, retries, follows redirects or tries another route. Exactly one meter,
-    ``workspace_spend``, and only for the recorded ``workspace_spend_controls``/``credit`` shape.
+    claims; never refreshes, retries, follows redirects or tries another route. Two disjoint
+    shapes are mapped (spend-control first): ``workspace_spend`` for the recorded
+    ``workspace_spend_controls``/``credit`` shape, and percent window meters from
+    ``rate_limit.primary_window``/``secondary_window`` for plans without a spend control (§9.2.1).
     """
 
     adapter_name = "OpenAICodexAdapter"
@@ -299,12 +424,12 @@ class OpenAICodexAdapter(OpaqueCloudAdapter):
         if not isinstance(payload, dict):
             return malformed
         try:
-            meter = codex_spend_meter(payload, ctx.now())
+            meters = codex_meters(payload, ctx.now())
         except ValueError:
             return malformed
-        if meter is None:
+        if not meters:
             return UsageResult(confidence="opaque", reason="source_unavailable")
-        return UsageResult(meters=(meter,), confidence="exact")
+        return UsageResult(meters=tuple(meters), confidence="exact")
 
 
 #: (header window tag, meter id, label, period label) for the two subscription windows.

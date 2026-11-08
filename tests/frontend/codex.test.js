@@ -149,3 +149,44 @@ test("the shipped bundle carries no superseded blanket Codex-opaque wording", ()
   assert.doesNotMatch(js, /OPAQUE_NOTES[\s\S]{0,400}recon t_7dce2222[\s\S]{0,200}openai-codex/);
   assert.match(js, /chatgpt_wham_usage/);
 });
+
+// --- plan rate-limit percent meters from the same wham/usage source (DESIGN.md §9.2.1) ---
+const ROLLING_30D = { start: null, end: null, label: "rolling_30d" };
+const plan = (over) => spend(Object.assign({
+  id: "rate_limit_primary", label: "Plan usage limit (30-day window)", value: 62, limit: 100, remaining: null,
+  unit: "percent", period: ROLLING_30D, resets_at: "2026-12-02T10:47:59Z",
+}, over));
+
+test("go card: percent meter shows Used %, reset and as-of, with the rate-limit tooltip (not the credits text)", async () => {
+  const m = await mount({ routes: routes([codex({ id: "acct_go", account_id: "acct_go", plan_name: "go", meters: [plan()] })]) });
+  const card = m.$("[data-card-id=acct_go]");
+  assert.equal(card.dataset.view, "meters");
+  const row = card.querySelector("[data-meter-id=rate_limit_primary]");
+  const badge = row.querySelector(".ud-badge");
+  assert.equal(badge.dataset.confidence, "exact");
+  const tip = badge.getAttribute("title");
+  assert.match(tip, /Source: ChatGPT plan rate limit \(wham\/usage\)/);
+  assert.match(tip, /Reset reported by the provider: 2026-12-02 10:47 UTC/);
+  assert.match(tip, /never extrapolated/);
+  assert.doesNotMatch(tip, /credits|workspace spend/);
+  assert.match(row.textContent, /Plan usage limit \(30-day window\)/);
+  assert.match(row.textContent, /Used62%/);
+  assert.match(row.textContent, /Resets2026-12-02 10:47 UTC/);
+  assert.doesNotMatch(row.textContent, /credits|Limit reached/);
+  assert.equal(row.querySelectorAll("[role=progressbar]").length, 1, "a known rolling window gets a bar");
+  await m.unmount();
+});
+
+test("limit_reached percent meter says Limit reached; the credit meter next to it keeps its own text", async () => {
+  const cards = [codex({ id: "acct_gr", account_id: "acct_gr", plan_name: "go",
+    meters: [spend(), plan({ value: 100, remaining: 0 })] })];
+  const m = await mount({ routes: routes(cards) });
+  const card = m.$("[data-card-id=acct_gr]");
+  const rows = card.querySelectorAll("[data-meter-id]");
+  assert.deepEqual(Array.from(rows).map((r) => r.dataset.meterId), ["workspace_spend", "rate_limit_primary"]);
+  assert.match(rows[0].textContent, /Remaining635\.52 credits/);
+  assert.match(rows[1].textContent, /StatusLimit reached/);
+  assert.match(rows[1].querySelector(".ud-badge").getAttribute("title"), /reports the limit as reached/);
+  assert.doesNotMatch(rows[0].textContent, /Limit reached/);
+  await m.unmount();
+});

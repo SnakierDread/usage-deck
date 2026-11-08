@@ -575,22 +575,29 @@
       const limit = num(m.limit);
       const remaining = num(m.remaining);
       const fromHeaders = m.source === "anthropic_headers";
-      const fromSpend = m.source === "chatgpt_wham_usage";
+      // wham/usage carries two disjoint shapes (DESIGN.md §9.2.1): credits (workspace spend control)
+      // and percent (plan rate-limit window); the unit tells them apart.
+      const fromRate = m.source === "chatgpt_wham_usage" && m.unit === "percent";
+      const fromSpend = m.source === "chatgpt_wham_usage" && !fromRate;
+      const reached = fromRate && remaining !== null && remaining <= 0;
       const resetsAt = str(m.resets_at);
-      const tip = "Source: " + (SOURCE_LABEL[m.source] || SOURCE_LABEL.none) +
+      const tip = "Source: " + (fromRate ? "ChatGPT plan rate limit (wham/usage)" : (SOURCE_LABEL[m.source] || SOURCE_LABEL.none)) +
         ". Scope: " + (SCOPE_LABEL[m.scope] || "unknown") +
         ". Observed: " + fmtTime(m.observed_at) + "." +
         (resetsAt ? " Reset reported by the provider: " + fmtTime(resetsAt) + "." : "") +
         (fromHeaders ? " Value as of that call, not live; it is never extrapolated." : "") +
+        (fromRate ? " Share of this plan's rate-limit window used, as of the last refresh; never extrapolated." +
+          (reached ? " The provider reports the limit as reached." : "") : "") +
         (fromSpend ? " Credits reported for this seat's workspace spend limit, as of the last refresh; not USD, not messages, not a fleet total." : "");
       const parts = [];
       parts.push(h("div", { key: "head", className: "ud-meter-head" },
         h("span", { className: "ud-meter-label" }, str(m.label) || "Meter"),
         h(Badge, { conf: conf, tip: tip })));
-      if (fromHeaders) {
+      if (fromHeaders || fromRate) {
         // Utilization of a rolling window: used share + provider-reported reset; no invented remaining.
         parts.push(h("dl", { key: "vals", className: "ud-vals" },
           h("div", null, h("dt", null, "Used"), h("dd", null, value === null ? "Not reported" : fmtNumber(value, unit))),
+          reached ? h("div", { "data-limit-reached": "true" }, h("dt", null, "Status"), h("dd", null, "Limit reached")) : null,
           h("div", null, h("dt", null, "Resets"), h("dd", { "data-resets-at": resetsAt || undefined }, resetsAt ? fmtTime(resetsAt) : "Not reported")),
           h("div", null, h("dt", null, "As of"), h("dd", null, fmtTime(m.observed_at)))));
       } else if (fromSpend) {

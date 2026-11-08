@@ -391,7 +391,7 @@ class SpendMeter(unittest.TestCase):
         body.update({"credits": {"balance": "635.5", "has_credits": True}, "model_usage": {"gpt-x": {"available": True}},
                      "rate_limit": {"primary": {"used_percent": 99}}, "promo": {"x": 1}, "plan_type": "enterprise"})
         usage, _, _ = usage_of(body)
-        self.assertEqual(len(usage.meters), 1)  # no credits-balance, rate-limit or model meter
+        self.assertEqual(len(usage.meters), 1)  # no credits-balance, unrecognised rate-limit or model meter
         blob = json.dumps(dto.to_plain(usage))
         for leaked in (EMAIL, USER, ACCOUNT, "enterprise", "gpt-x", "balance"):
             self.assertNotIn(leaked, blob)
@@ -515,8 +515,8 @@ class SpendMeter(unittest.TestCase):
             "count unit": limit_body(unit="count"),
             "missing unit": limit_body(unit=None),
             "case differs": limit_body(unit="Credit"),
-            "rate-limit plan": {"plan_type": "plus", "rate_limit": {"primary_window": {"used_percent": 40}},
-                                "spend_control": None},
+            "rate-limit plan without usable windows": {"plan_type": "plus", "rate_limit": {"primary": {"used_percent": 40}},
+                                                       "spend_control": None},
             "empty object": {},
         }
         for name, body in cases.items():
