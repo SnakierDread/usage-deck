@@ -108,7 +108,8 @@ ENUMS = {
     "unit": {"usd", "count", "percent", "bytes", "credit"},
     "meter_scope": {"api_credential", "provider_account", "endpoint", "profile"},
     "series_scope": {"profile", "provider", "account"},
-    "meter_source": {"openrouter_key", "session_analytics", "prometheus", "anthropic_headers", "chatgpt_wham_usage", "none"},
+    "meter_source": {"openrouter_key", "session_analytics", "prometheus", "anthropic_headers", "anthropic_oauth_usage",
+                     "chatgpt_wham_usage", "none"},
     "view": {"machine", "profile"},
     "status": {"healthy", "degraded", "offline", "unknown"},
     "error_code": {"invalid_query", "provider_not_found", "auth_required", "permission_denied", "timeout",
@@ -324,7 +325,7 @@ def source_binding_violations(cards, health, series):
         for m in c["meters"]:
             openrouter_ok = (m["source"] == "openrouter_key" and c["provider_id"] == "openrouter"
                              and m["unit"] == "usd" and m["scope"] == "api_credential" and m["observed_at"])
-            headers_ok = (m["source"] == "anthropic_headers" and c["provider_id"] == "anthropic"
+            headers_ok = (m["source"] in ("anthropic_headers", "anthropic_oauth_usage") and c["provider_id"] == "anthropic"
                           and m["unit"] == "percent" and m["scope"] == "provider_account" and m["observed_at"]
                           and m["period"]["label"] in ("rolling_5h", "rolling_7d")
                           and m["period"]["start"] is None and m["period"]["end"] is None)
@@ -332,11 +333,11 @@ def source_binding_violations(cards, health, series):
                         and m["unit"] == "credit" and m["scope"] == "provider_account" and m["observed_at"]
                         and m["id"] == "workspace_spend" and m["period"] == {"start": None, "end": None, "label": "monthly_workspace"})
             if m["confidence"] == "exact" and not (openrouter_ok or headers_ok or codex_ok):
-                v.append(f"{tag}: exact meter without a verified source (openrouter_key / anthropic_headers / chatgpt_wham_usage)")
+                v.append(f"{tag}: exact meter without a verified source (openrouter_key / anthropic_headers / anthropic_oauth_usage / chatgpt_wham_usage)")
             if m["source"] == "openrouter_key" and c["provider_id"] != "openrouter":
                 v.append(f"{tag}: openrouter_key source on another provider")
-            if m["source"] == "anthropic_headers" and c["provider_id"] != "anthropic":
-                v.append(f"{tag}: anthropic_headers source on another provider")
+            if m["source"] in ("anthropic_headers", "anthropic_oauth_usage") and c["provider_id"] != "anthropic":
+                v.append(f"{tag}: {m['source']} source on another provider")
             if m["source"] == "chatgpt_wham_usage" and c["provider_id"] != "openai-codex":
                 v.append(f"{tag}: chatgpt_wham_usage source on another provider")
             if m["unit"] == "credit" and m["source"] != "chatgpt_wham_usage":

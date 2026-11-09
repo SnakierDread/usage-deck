@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -21,7 +22,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple, Union
 
 from .adapters import is_self_hosted_provider
 from .adapters.base import SecretValue
-from .adapters.cloud import CODEX_PROVIDER_ID, codex_routing
+from .adapters.cloud import ANTHROPIC_PROVIDER_ID, CODEX_PROVIDER_ID, codex_routing
 from .captures import CredentialRef, default_store_path
 from .models.dto import Holder
 from .models.identity import Endpoint, make_account_id, make_endpoint_id, parse_endpoint
@@ -119,6 +120,12 @@ class InventoryItem:
     # The entry points at an env var (``key_env``) that holds no value: a credential is
     # expected but absent, so nothing may be probed anonymously on its behalf.
     credential_expected: bool = False
+    #: The credential is a persisted OAuth pool row (``auth_type: oauth``): the only Anthropic credential the
+    #: live ``/api/oauth/usage`` pull may use (DESIGN.md §9.1.2). Never serialized.
+    oauth_credential: bool = field(default=False, repr=False)
+    #: Local ordering hint for choosing among several holders of one seat: the row's ``expires_at_ms`` in
+    #: seconds (0 = unknown). Never validated, never sent anywhere.
+    expires_at: float = field(default=0.0, repr=False)
 
     def __repr__(self) -> str:
         return f"InventoryItem({self.provider_id!r}, {self.account_id!r})"
@@ -434,6 +441,18 @@ def _credential_of(entry: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _oauth_access_token_of(entry: Dict[str, Any]) -> Optional[str]:
+    """The persisted OAuth ``access_token`` of an ``auth_type: oauth`` pool row, else None.
+
+    Explicit field provenance (DESIGN.md §9.1.2): ``_credential_of`` may fall back to ``agent_key`` /
+    ``api_key``, but those are never OAuth bearers and must never reach the OAuth-only usage endpoint.
+    """
+    if entry.get("auth_type") != "oauth":
+        return None
+    value = entry.get("access_token")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def _jwt_payload(token: Optional[str]) -> Optional[dict]:
     """Decoded (unverified) JWT payload, or None. Local only: never validated, never sent anywhere."""
     if not token or token.count(".") != 2 or len(token) > 16384:
@@ -535,6 +554,16 @@ class _Draft:
     origin: str = "pool"
     holder: Optional[Tuple[bool, str]] = None
     key_env: Optional[str] = None
+    oauth_token: Optional[str] = None  # the row's own OAuth access_token (never a generic api/agent key)
+    expires_at: float = 0.0
+
+
+def _row_expiry(entry: Dict[str, Any]) -> float:
+    """``expires_at_ms`` of a pool row in seconds, else 0 (an ordering hint only)."""
+    value = entry.get("expires_at_ms")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        return 0.0
+    return float(value) / 1000.0
 
 
 def _key_env_of(entry: Dict[str, Any]) -> Optional[str]:
@@ -571,7 +600,8 @@ def discover(source: Any) -> List[InventoryItem]:
                 seen_rows.add(key)
             endpoint = _endpoint_from_entry(entry) if is_self_hosted_provider(provider_id) else None
             drafts.append(_Draft(provider_id, endpoint, row_id, ordinal, _credential_of(entry), secrets, None, True,
-                                 holder=raw.pool_holders.get(provider_id)))
+                                 holder=raw.pool_holders.get(provider_id),
+                                 oauth_token=_oauth_access_token_of(entry), expires_at=_row_expiry(entry)))
 
     pooled_ids = {d.provider_id for d in drafts}
     for provider_id, entry in raw.legacy.items():
@@ -686,6 +716,8 @@ def discover(source: Any) -> List[InventoryItem]:
             jwt_pair=jwt_pair,
             row_ref=row_ref,
             credential_expected=bool(draft.key_env) and credential is None,
+            oauth_credential=bool(draft.oauth_token and credential and draft.oauth_token == credential),
+            expires_at=draft.expires_at,
         ))
     items.sort(key=lambda i: (i.provider_id, i.account_id))
     return items
@@ -739,21 +771,25 @@ def _token_expiry(item: InventoryItem) -> float:
     """``exp`` claim of the item's JWT (0 when absent): local ordering hint only, never validated."""
     payload = _jwt_payload(item.credential.reveal() if item.credential else None)
     exp = payload.get("exp") if payload else None
-    return float(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else 0.0
+    if isinstance(exp, (int, float)) and not isinstance(exp, bool):
+        return float(exp)
+    return item.expires_at  # opaque (non-JWT) tokens: the pool row's own expiry stamp, else 0
 
 
 def _cross_profile_member(members: List[Tuple[Holder, InventoryItem, bool]]) -> Optional[InventoryItem]:
     """Member of ANOTHER profile's store that may supply a read-only meter probe credential (§13).
 
-    Only canonical ``openai-codex`` qualifies (its wham usage GET is a ratified probe) and only with a
-    token that yields usable routing claims. Among several holders of one seat the latest-expiring token
-    wins (a stale refreshed copy would only earn a 401); ties keep inventory order. Everything else
-    (OpenRouter, Nous, custom inference keys) has no ratified cross-profile probe and stays inventory.
+    Two providers qualify: canonical ``openai-codex`` (its wham usage GET is a ratified probe) with a
+    token that yields usable routing claims, and ``anthropic`` (``GET /api/oauth/usage``, §9.1.2) with a
+    persisted OAuth pool row. Among several holders of one seat the latest-expiring token wins (a stale
+    refreshed copy would only earn a 401); ties keep inventory order. Everything else (OpenRouter, Nous,
+    custom inference keys, Anthropic API keys) has no ratified cross-profile probe and stays inventory.
     """
     candidates = [item for _holder, item, selected in members
                   if not selected and item.credential is not None
-                  and item.provider_id.strip().lower() == CODEX_PROVIDER_ID
-                  and codex_routing(item.credential.reveal()) is not None]
+                  and ((item.provider_id.strip().lower() == CODEX_PROVIDER_ID
+                        and codex_routing(item.credential.reveal()) is not None)
+                       or (item.provider_id.strip().lower() == ANTHROPIC_PROVIDER_ID and item.oauth_credential))]
     if not candidates:
         return None
     return max(candidates, key=_token_expiry)  # max() keeps the first of equal keys
@@ -856,6 +892,7 @@ def discover_machine(source: Any) -> List[InventoryItem]:
         seen_ids.add(account_id)
         per_provider[first.provider_id] = per_provider.get(first.provider_id, 0) + 1
         credential = usable.credential if usable else (cross.credential if cross else None)
+        source_member = usable if usable else cross  # the one member whose token is the card's bearer
         merged.append(replace(
             first,
             account_id=account_id,
@@ -868,6 +905,8 @@ def discover_machine(source: Any) -> List[InventoryItem]:
             secrets=secrets,
             credential_refs=refs,
             identity_key=identity,
+            oauth_credential=bool(source_member and source_member.oauth_credential),
+            expires_at=source_member.expires_at if source_member else 0.0,
             credential_expected=usable is None and health_usable is None and any(
                 i.credential_expected for _holder, i, selected in members if selected or cross_live),
             holders=tuple(holders),

@@ -43,7 +43,8 @@ ERROR_CODES = (
 )
 UNITS = ("usd", "count", "percent", "bytes", "credit")
 METER_SCOPES = ("api_credential", "provider_account", "endpoint", "profile")
-METER_SOURCES = ("openrouter_key", "session_analytics", "prometheus", "anthropic_headers", "chatgpt_wham_usage", "none")
+METER_SOURCES = ("openrouter_key", "session_analytics", "prometheus", "anthropic_headers", "anthropic_oauth_usage",
+                 "chatgpt_wham_usage", "none")
 VIEWS = ("machine", "profile")
 PLAN_SOURCES = ("unverified_claim", "provider", "none")
 AUTH_STATUSES = ("available", "missing", "rejected")

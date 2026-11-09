@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .adapters import create_adapter
 from .adapters.analytics import HostAnalyticsReader, MemoAnalyticsReader
 from .adapters.base import AdapterContext, AnalyticsReader, EndpointCache
-from .adapters.cloud import CODEX_PROVIDER_ID, CODEX_TARGET, OPENROUTER_TARGET
+from .adapters.cloud import ANTHROPIC_PROVIDER_ID, ANTHROPIC_TARGET, CODEX_PROVIDER_ID, CODEX_TARGET, OPENROUTER_TARGET
 from .adapters.fallback import SessionAnalyticsAdapter
 from .adapters.transport import AllowedTarget, CrossProfileProbeTransport, GuardedTransport, UrllibTransport
 from .captures import CaptureStore
@@ -356,6 +356,8 @@ class UsageDeckService:
             # usage probes only (the ceiling in ``CROSS_PROFILE_PROBES`` is re-checked on every request).
             if item.provider_id.strip().lower() == CODEX_PROVIDER_ID:
                 targets.append(CODEX_TARGET)
+            elif item.provider_id.strip().lower() == ANTHROPIC_PROVIDER_ID:
+                targets.append(ANTHROPIC_TARGET)  # DESIGN.md §9.1.2: fixed, GET /api/oauth/usage only
             elif item.endpoint is not None and item.endpoint.safe:
                 targets.append(AllowedTarget(item.endpoint.scheme, item.endpoint.host, item.endpoint.port, ("/metrics",)))
             transport = CrossProfileProbeTransport(GuardedTransport(self._transport, targets))
@@ -365,6 +367,8 @@ class UsageDeckService:
                     targets.append(OPENROUTER_TARGET)
                 if item.provider_id.strip().lower() == CODEX_PROVIDER_ID:
                     targets.append(CODEX_TARGET)  # DESIGN.md §9.2: fixed, never derived from claims/config/response
+                if item.provider_id.strip().lower() == ANTHROPIC_PROVIDER_ID:
+                    targets.append(ANTHROPIC_TARGET)  # DESIGN.md §9.1.2: fixed, never derived from config/response
                 if item.endpoint is not None and item.endpoint.safe:
                     targets.append(AllowedTarget(item.endpoint.scheme, item.endpoint.host, item.endpoint.port, None))
             transport = GuardedTransport(self._transport, targets)
@@ -391,6 +395,7 @@ class UsageDeckService:
             live_source=item.live_source and not blocked,
             cross_profile=item.cross_profile and not blocked,
             credential_expected=item.credential_expected,
+            oauth_credential=item.oauth_credential and not blocked,
         )
 
     def _run_item(self, item: InventoryItem, reader: AnalyticsReader, now: datetime,

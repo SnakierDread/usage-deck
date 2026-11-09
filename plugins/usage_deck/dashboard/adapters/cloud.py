@@ -4,8 +4,9 @@ Nous has no verified quota capability: it is opaque by policy, never probed over
 and never sends credentials anywhere. OpenAI Codex reads exactly one route, the ratified
 ChatGPT-backend workspace spend control (DESIGN.md §9.2, docs/decisions/codex-wham-usage.md):
 the selected OAuth access token and its same-token routing claims go to that one guarded GET
-target and nowhere else. Anthropic reads *previously captured* unified rate-limit headers from
-a local file (never a request). OpenRouter reads exactly one documented endpoint.
+target and nowhere else. Anthropic pulls its meters live from one OAuth usage route (DESIGN.md
+§9.1.2) and falls back to *previously captured* unified rate-limit headers (a local file, never a
+request). OpenRouter reads exactly one documented endpoint.
 """
 
 from __future__ import annotations
@@ -28,6 +29,12 @@ from .base import (
     parse_json_body,
 )
 from .transport import AllowedTarget, TransportError
+
+# DESIGN.md §9.1.2: the sole Anthropic egress (live OAuth usage pull). Granted only to the anthropic context.
+ANTHROPIC_PROVIDER_ID = "anthropic"
+ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+ANTHROPIC_TARGET = AllowedTarget("https", "api.anthropic.com", 443, ("/api/oauth/usage",))
+ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20"
 
 OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
 OPENROUTER_TARGET = AllowedTarget("https", "openrouter.ai", 443, ("/api/v1/key",))
@@ -472,18 +479,119 @@ def anthropic_meters(capture: Capture, now) -> List[UsageMeter]:
     return meters
 
 
-class AnthropicAdapter(OpaqueCloudAdapter):
-    """Session / weekly utilization from captured ``anthropic-ratelimit-unified-*`` headers.
+#: (response window key(s), meter id, label, period label) for the live ``/api/oauth/usage`` body. The
+#: recorded body (DESIGN.md §9.1.2) names the windows ``five_hour`` / ``seven_day``; ``week`` is accepted as
+#: the alias the ratifying card used. Tuple order is card order (shortest window first).
+ANTHROPIC_USAGE_WINDOWS = (
+    (("five_hour",), "session_5h", "Session (5-hour window)", "rolling_5h"),
+    (("seven_day", "week"), "weekly_7d", "Weekly (7-day window)", "rolling_7d"),
+)
 
-    No request is made. Without a capture for this credential the card is opaque, exactly as
-    before. Freshness is the capture's own call timestamp.
+
+def _oauth_utilization(value: Any) -> Optional[float]:
+    """``utilization`` of a live window: a finite nonnegative JSON number already in PERCENT (7.0 = 7 %).
+
+    null -> None (no observation); a boolean, string or negative/non-finite number raises ValueError.
+    The header capture reports a fraction; this endpoint does not, so nothing is multiplied here.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("utilization")
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise ValueError("utilization")
+    return number + 0.0
+
+
+def _oauth_reset(value: Any) -> Optional[datetime]:
+    """``resets_at``: RFC 3339 / ISO 8601 instant string (offset or Z; naive = UTC); null -> None."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not 0 < len(value) <= 64:
+        raise ValueError("resets_at")
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError("resets_at") from None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+def anthropic_usage_meters(payload: dict, now: datetime) -> List[UsageMeter]:
+    """Meters from one live ``/api/oauth/usage`` body: ``five_hour`` then ``seven_day`` (DESIGN.md §9.1.2).
+
+    ``value`` is the reported ``utilization`` percent (may exceed 100, never clamped); ``observed_at`` is the
+    poll time; ``resets_at`` the provider's own reset instant. A window that is null, carries no
+    utilization (never a zero) or whose reset is at/before ``now`` yields NO meter. A present
+    wrong-shaped field raises ``ValueError`` (-> malformed_response). Every other field of the body
+    (``extra_usage``, ``limits``, scoped/promotional windows, dollars) is ignored.
+    """
+    meters: List[UsageMeter] = []
+    for keys, meter_id, label, period_label in ANTHROPIC_USAGE_WINDOWS:
+        window = next((payload[k] for k in keys if payload.get(k) is not None), None)
+        if window is None:
+            continue
+        if not isinstance(window, dict):
+            raise ValueError(keys[0])
+        utilization = _oauth_utilization(window.get("utilization"))
+        reset = _oauth_reset(window.get("resets_at"))
+        if utilization is None:
+            continue
+        if reset is not None and reset <= now:
+            continue  # that window already ended: its current usage is unknown, never shown as zero
+        meters.append(UsageMeter(
+            id=meter_id,
+            label=label,
+            value=utilization,
+            limit=100.0,
+            remaining=None,
+            unit="percent",
+            scope="provider_account",
+            period=Period(None, None, period_label),
+            confidence="exact",
+            source="anthropic_oauth_usage",
+            observed_at=fmt_ts(now),
+            resets_at=fmt_ts(reset),
+        ))
+    return meters
+
+
+class AnthropicAdapter(OpaqueCloudAdapter):
+    """Session / weekly utilization: live OAuth usage pull first, captured headers as the fallback.
+
+    Pull (DESIGN.md §9.1.2): one guarded ``GET https://api.anthropic.com/api/oauth/usage`` per snapshot
+    with the selected persisted OAuth access token (``Authorization: Bearer`` + the OAuth beta header and
+    nothing else); read on every ``/subscriptions`` build, never from a timer. No refresh, no retry, no
+    redirects, no other route. Fallback: previously captured ``anthropic-ratelimit-unified-*`` headers
+    (§9.1), used only when the pull is unavailable (transport failure, 429/5xx, 403/404, unreadable body)
+    and only for windows that are still current by the capture's own reset; otherwise the window is hidden
+    (never estimated). A 401 is the credential's verdict: ``auth_status: rejected`` and no fallback.
     """
 
     adapter_name = "AnthropicAdapter"
 
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self._snapshot: Optional[UsageResult] = None
+        self._rejected = False
+        self._verdict = False  # the endpoint itself answered (401 / 403 / 404 / 200): provenance of a meterless card
+
     @property
     def source_label(self) -> str:  # type: ignore[override]
+        snapshot = self._snapshot
+        if snapshot is not None and snapshot.meters:
+            return snapshot.meters[0].source  # the one source that produced the meters (never mixed)
+        if self._verdict:
+            return "anthropic_oauth_usage"  # the live endpoint answered with no meter: it is still the source
         return "anthropic_headers" if self._capture() is not None else "local_inventory"
+
+    def credential_rejected(self) -> bool:
+        return self._rejected
 
     def _capture(self) -> Optional[Capture]:
         store = self.ctx.captures
@@ -491,21 +599,83 @@ class AnthropicAdapter(OpaqueCloudAdapter):
             return None
         return store.latest("anthropic", self.ctx.credential_refs, now=self.ctx.now())
 
+    def _can_pull(self) -> bool:
+        ctx = self.ctx
+        # Machine-only inventory (not the selected profile's credential, no §13 exemption) makes no request.
+        return bool(ctx.live_source and ctx.credential and ctx.oauth_credential)
+
     def _do_probe(self) -> ProbeResult:
-        capture = self._capture()
-        if capture is None:
-            return self._probe_result(False, None, self._capabilities(), reason="unsupported")
-        return self._probe_result(True, None, self._capabilities("quota"))
+        # Local-only: no request is spent to obtain a badge; get_usage makes the one request.
+        if self._can_pull() or self._capture() is not None:
+            return self._probe_result(True, None, self._capabilities("quota"))
+        return self._probe_result(False, None, self._capabilities(), reason="unsupported")
 
     def _do_usage(self, window: int) -> UsageResult:
+        if self._snapshot is None:
+            self._snapshot = self._resolve()
+        return self._snapshot
+
+    def _resolve(self) -> UsageResult:
+        pulled, unavailable = self._pull() if self._can_pull() else (None, False)
+        if pulled is not None and (pulled.meters or not unavailable):
+            return pulled  # live meters, or a definitive live verdict (401 / no current window): never overridden
+        fallback = self._from_capture()
+        if fallback is not None:
+            return fallback
+        if pulled is not None:
+            return pulled  # endpoint unavailable and no current captured window: honest error, never an estimate
+        reason = "unsupported" if self._capture() is None else "source_unavailable"
+        return UsageResult(meters=(), series=(), confidence="opaque", reason=reason)
+
+    def _from_capture(self) -> Optional[UsageResult]:
         capture = self._capture()
         if capture is None:
-            return UsageResult(meters=(), series=(), confidence="opaque", reason="unsupported")
+            return None
         meters = anthropic_meters(capture, self.ctx.now())
         if not meters:
-            # Capture exists but carries no current-window utilization (expired window / no unified headers).
-            return UsageResult(meters=(), series=(), confidence="opaque", reason="source_unavailable")
+            return None
         return UsageResult(meters=tuple(meters), series=(), confidence="exact")
+
+    def _pull(self) -> Tuple[UsageResult, bool]:
+        """One guarded GET. Returns ``(result, unavailable)``; ``unavailable`` allows the header fallback."""
+        ctx = self.ctx
+        headers = {
+            "Authorization": "Bearer " + ctx.credential.reveal(),
+            "anthropic-beta": ANTHROPIC_OAUTH_BETA,
+            "Accept": "application/json",
+            "User-Agent": CODEX_USER_AGENT,
+        }
+        try:
+            response = ctx.transport.get(ANTHROPIC_USAGE_URL, headers=headers)
+        except TransportError as exc:
+            return UsageResult(error=error_for_transport(exc, ctx.provider_id, ctx.account_id)), True
+        if response.status == 401:
+            # The bearer was sent and refused: no refresh, no retry, no older data in its place (§9.1.2).
+            self._rejected = True
+            self._verdict = True
+            return UsageResult(error=make_error("auth_required", ctx.provider_id, ctx.account_id),
+                               reason="permission_denied"), False
+        if response.status in (403, 404):
+            self._verdict = True
+            return UsageResult(reason="permission_denied"), True  # e.g. a token without the profile scope
+        failure = error_for_status(response.status, ctx.provider_id, ctx.account_id)
+        if failure is not None:
+            return UsageResult(error=failure), True
+        malformed = (UsageResult(error=make_error("malformed_response", ctx.provider_id, ctx.account_id)), True)
+        try:
+            payload = parse_json_body(response)
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            return malformed
+        if not isinstance(payload, dict):
+            return malformed
+        try:
+            meters = anthropic_usage_meters(payload, ctx.now())
+        except ValueError:
+            return malformed
+        if not meters:
+            self._verdict = True  # a definitive 200 that names no current window
+            return UsageResult(confidence="opaque", reason="source_unavailable"), False
+        return UsageResult(meters=tuple(meters), confidence="exact"), False
 
 
 class OpenRouterAdapter(BaseAdapter):
