@@ -41,6 +41,7 @@ const SOURCE_CEILING = {
   session_analytics: 'estimated',
   prometheus: 'self_hosted',
   anthropic_headers: 'exact',
+  anthropic_oauth_usage: 'exact',
   chatgpt_wham_usage: 'exact',
   none: 'opaque'
 }
@@ -49,6 +50,7 @@ const SOURCE_LABEL = {
   session_analytics: 'Hermes session analytics',
   prometheus: 'Endpoint metrics',
   anthropic_headers: 'Anthropic unified rate-limit headers captured from the last call',
+  anthropic_oauth_usage: 'Anthropic OAuth usage endpoint (read live)',
   chatgpt_wham_usage: 'ChatGPT workspace spend control (wham/usage)',
   none: 'No verified source'
 }
@@ -68,7 +70,7 @@ const OPAQUE_NOTES = {
     'No Anthropic session/weekly meter: no usable capture for this credential. Enable the optional observer and use this account normally; a meter can only appear after an ordinary request returns eligible headers. Nothing is estimated.'
 }
 const MACHINE_ONLY_NOTE =
-  "No live source for this account: the machine view reads meters with any local profile's credential only through the documented read-only usage probes (Codex spend control, endpoint /metrics), and none exists for this account, so it is local inventory. Nothing is estimated."
+  "No live source for this account: the machine view reads meters with any local profile's credential only through the documented read-only usage probes (Codex spend control, Anthropic OAuth usage, endpoint /metrics), and none exists for this account, so it is local inventory. Nothing is estimated."
 
 // Fixed local copy for Reason codes: upstream text never reaches the UI.
 const REASON_TEXT = {
@@ -450,8 +452,12 @@ function machineOnlyNote(card) {
     return null
   }
 
-  if (card.provider_id === 'anthropic' && isObj(card.debug) && card.debug.source === 'anthropic_headers') {
-    return null // had a capture
+  if (
+    card.provider_id === 'anthropic' &&
+    isObj(card.debug) &&
+    (card.debug.source === 'anthropic_headers' || card.debug.source === 'anthropic_oauth_usage')
+  ) {
+    return null // had a source
   }
 
   return holderNames(card).length > 0 ? MACHINE_ONLY_NOTE : null
@@ -1003,7 +1009,9 @@ function MeterRow(props) {
   const value = num(m.value)
   const limit = num(m.limit)
   const remaining = num(m.remaining)
-  const fromHeaders = m.source === 'anthropic_headers'
+  // Live pull (DESIGN.md §9.1.2): same used/resets/as-of rows as headers, but read at refresh time.
+  const fromOauth = m.source === 'anthropic_oauth_usage'
+  const fromHeaders = m.source === 'anthropic_headers' || fromOauth
   const fromSpend = m.source === 'chatgpt_wham_usage'
   const resetsAt = str(m.resets_at)
   const label = str(m.label) || 'Meter'
@@ -1016,7 +1024,8 @@ function MeterRow(props) {
     fmtTime(m.observed_at) +
     '.' +
     (resetsAt ? ' Reset reported by the provider: ' + fmtTime(resetsAt) + '.' : '') +
-    (fromHeaders ? ' Value as of that call, not live; it is never extrapolated.' : '') +
+    (m.source === 'anthropic_headers' ? ' Value as of that call, not live; it is never extrapolated.' : '') +
+    (fromOauth ? ' Read live from Anthropic when this view last refreshed; it is never extrapolated.' : '') +
     (fromSpend && unit === 'credit'
       ? " Credits reported for this seat's workspace spend limit, as of the last refresh; not USD, not messages, not a fleet total."
       : '')

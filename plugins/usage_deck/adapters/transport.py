@@ -165,7 +165,7 @@ class ProbeShape:
 
 CROSS_PROFILE_PROBES: Tuple[ProbeShape, ...] = (
     ProbeShape("GET", "https", "chatgpt.com", 443, "/backend-api/wham/usage"),
-    # Reserved ceiling entry: no adapter issues this request today; adding the probe needs its own decision.
+    # Anthropic OAuth usage (DESIGN.md §9.1.2): issued by AnthropicAdapter with an OAuth pool-row bearer; GET only.
     ProbeShape("GET", "https", "api.anthropic.com", 443, "/api/oauth/usage"),
     ProbeShape("GET", None, None, None, "/metrics"),
 )

@@ -238,3 +238,37 @@ test("machine empty inventory says so on the machine, with no credential input",
   assert.equal(m.$$("input, textarea, [type=password]").length, 0);
   await m.unmount();
 });
+
+// Live Anthropic pull (DESIGN.md §9.1.2): same rows as the header meter, but the source is the live endpoint.
+test("anthropic_oauth_usage meters render Used/Resets/As of with a live tooltip; no invented limit/remaining", async () => {
+  const live = (over) => hdrMeter(Object.assign({ source: "anthropic_oauth_usage", observed_at: T, value: 0 }, over));
+  const card = F.card({ id: "acct_live", account_id: "acct_live", provider_id: "anthropic", provider_label: "Anthropic",
+    state: "ready", confidence: "exact", reason: null, holders: holders("global"),
+    debug: { adapter: "AnthropicAdapter", capabilities: ["quota"], source: "anthropic_oauth_usage", sanitized: true },
+    meters: [live(), live({ id: "weekly_7d", label: "Weekly (7-day window)", value: 7, period: rolling("rolling_7d"), resets_at: "2026-11-10T12:00:00Z" })] });
+  const m = await mount({ routes: routes({ subs: (url) => envelope({ cards: [card], inventory_state: "detected",
+    view: new URL(url, "http://x").searchParams.get("view") }) }) });
+  const rows = m.$("[data-card-id=acct_live]").querySelectorAll(".ud-meter");
+  assert.deepEqual(Array.from(rows).map((r) => r.dataset.meterId), ["session_5h", "weekly_7d"]);
+  const session = rows[0];
+  assert.match(session.textContent, /Used0%/);  // a fresh window at 0 % is shown as a reading, not hidden
+  assert.match(session.textContent, /Resets2026-11-06 15:00 UTC/);
+  assert.match(session.textContent, /As of2026-11-06 12:00 UTC/);
+  assert.ok(!/Remaining|Limit/.test(session.textContent), "no invented remaining/limit rows");
+  assert.equal(session.querySelectorAll("[role=progressbar]").length, 1);
+  const badge = session.querySelector(".ud-badge");
+  assert.equal(badge.dataset.confidence, "exact");
+  assert.match(badge.getAttribute("title"), /Anthropic OAuth usage endpoint \(read live\)/);
+  assert.match(badge.getAttribute("title"), /Read live from Anthropic when this view last refreshed; it is never extrapolated\./);
+  assert.doesNotMatch(badge.getAttribute("title"), /not live/);
+  assert.equal(m.$("[data-card-id=acct_live]").dataset.view !== "unavailable", true);
+  await m.unmount();
+});
+
+test("an oauth-usage source ceiling is exact and machineOnlyNote ignores a live-sourced Anthropic card", () => {
+  assert.equal(mod.meterConfidence(hdrMeter({ source: "anthropic_oauth_usage" })), "exact");
+  assert.equal(mod.meterConfidence(hdrMeter({ source: "anthropic_oauth_usage", confidence: "estimated" })), "estimated");
+  const live = Object.assign({}, anthropicOpaque, { reason: "source_unavailable",
+    debug: { adapter: "a", capabilities: [], source: "anthropic_oauth_usage", sanitized: true } });
+  assert.equal(mod.machineOnlyNote(live), null);
+});

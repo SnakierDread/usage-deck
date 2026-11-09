@@ -120,6 +120,9 @@ class AdapterContext:
     cross_profile: bool = False
     # key_env named an env var with no value: a credential is expected but absent.
     credential_expected: bool = False
+    #: The credential is a persisted OAuth pool row (``auth_type: oauth``): the only kind the Anthropic
+    #: live usage pull may send (DESIGN.md §9.1.2). An API key never goes to the OAuth usage route.
+    oauth_credential: bool = False
 
     def __repr__(self) -> str:
         return f"AdapterContext(provider_id={self.provider_id!r}, account_id={self.account_id!r})"

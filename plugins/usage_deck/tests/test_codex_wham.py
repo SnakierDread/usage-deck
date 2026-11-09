@@ -599,11 +599,12 @@ class DtoSchema(unittest.TestCase):
     def test_enums_gain_credit_and_the_wham_source_only(self):
         self.assertEqual(dto.UNITS, ("usd", "count", "percent", "bytes", "credit"))
         self.assertEqual(dto.METER_SOURCES, ("openrouter_key", "session_analytics", "prometheus", "anthropic_headers",
-                                             "chatgpt_wham_usage", "none"))
+                                             "anthropic_oauth_usage", "chatgpt_wham_usage", "none"))  # oauth: §9.1.2
         self.assertEqual(dto.SCHEMA_VERSION, 1)
         self.assertEqual(dto.AUTH_STATUSES, ("available", "missing", "rejected"))  # "rejected" added by key_env fix (#7)
         self.assertTrue(dto.preserves_wire_value("unit", "credit"))
         self.assertTrue(dto.preserves_wire_value("source", "chatgpt_wham_usage"))
+        self.assertTrue(dto.preserves_wire_value("source", "anthropic_oauth_usage"))
         self.assertFalse(dto.preserves_wire_value("unit", "credits"))
         self.assertTrue(dto.preserves_wire_value("label", "monthly_workspace", ("start", "end", "label")))
 
