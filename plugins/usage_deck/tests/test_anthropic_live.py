@@ -31,7 +31,7 @@ from plugins.usage_deck.adapters.transport import (
 from plugins.usage_deck.captures import CaptureStore, default_store_path
 from plugins.usage_deck.discovery import FileInventorySource, discover, discover_machine
 
-from .helpers import NOW, FakeTransport, json_response, make_ctx, raw_response, scan_for
+from .helpers import NOW, FakeTransport, PassthroughResolver, json_response, make_ctx, raw_response, scan_for
 from .test_anthropic_meters import FIXTURE, refs, store
 from .test_cross_profile_meters import tree
 from .test_schema_preservation import SchemaAsserts
@@ -78,6 +78,7 @@ WEEKLY_LIVE = ("weekly_7d", "Weekly (7-day window)", 7.0, 100.0, None, "percent"
 
 def live_ctx(transport, captures=None, row=ROW, token=TOKEN, **kw):
     kw.setdefault("oauth_credential", True)
+    kw.setdefault("token_resolver", PassthroughResolver())
     return make_ctx("anthropic", credential=token, transport=transport, captures=captures,
                     credential_refs=tuple(refs(row)) if captures is not None else (), **kw)
 
@@ -284,7 +285,11 @@ class FallbackMatrix(unittest.TestCase):
                 fallback = adapter(routed(raw_response("{}", status=status)), store()).get_usage(30)
                 self.assertEqual([m.source for m in fallback.meters], ["anthropic_headers"] * 2)
                 bare = adapter(routed(raw_response("{}", status=status))).get_usage(30)
-                self.assertEqual((bare.meters, bare.reason, bare.error), ((), "permission_denied", None))
+                self.assertEqual((bare.meters, bare.reason), ((), "permission_denied"))
+                if status == 403:  # no profile scope: a quiet opaque card
+                    self.assertIsNone(bare.error)
+                else:  # 404 is a credential/endpoint ERROR (§9.1.2)
+                    self.assertEqual(bare.error.code, "permission_denied")
 
     def test_unavailable_endpoint_and_no_capture_is_an_error_with_no_meters(self):
         for name, outcome, code in UNAVAILABLE:
@@ -745,10 +750,10 @@ class LiveNoMeterProvenance(ServiceBase, SchemaAsserts):
                     self.assertNotIn(claim, notes["opaque"])
 
     def test_permission_denied_without_a_capture_is_also_live_provenance(self):
-        for status in (403, 404):
+        for status, state in ((403, "opaque"), (404, "error")):  # 404 is a credential/endpoint error card (§9.1.2)
             with self.subTest(status=status):
                 card = self.card(raw_response("{}", status=status))
-                self.assertEqual((card["state"], card["reason"], card["meters"]), ("opaque", "permission_denied", []))
+                self.assertEqual((card["state"], card["reason"], card["meters"]), (state, "permission_denied", []))
                 self.assertEqual(card["debug"]["source"], "anthropic_oauth_usage")
 
     def test_a_403_with_a_current_capture_still_falls_back_to_the_header_meters(self):

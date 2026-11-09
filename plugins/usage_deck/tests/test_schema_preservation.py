@@ -204,6 +204,14 @@ class SanitizeSchemaTests(unittest.TestCase):
             with self.subTest(secret=secret):
                 self.assertEqual(sanitize(sample, {secret}), sample)
 
+    def test_error_variant_messages_survive_every_colliding_secret(self):
+        # DESIGN.md §9.1.1/§9.1.2: the 401 / 404 / 429 / re-auth card messages are fixed wire vocabulary.
+        for variant, (code, message, _retryable) in dto.ERROR_VARIANTS.items():
+            sample = {"code": code, "message": message}
+            for secret in sorted({c for c in message} | {"hermes", "Anthropic", "login", "401", "retry"}):
+                with self.subTest(variant=variant, secret=secret):
+                    self.assertEqual(sanitize(sample, {secret}), sample)
+
     def test_free_text_label_in_non_period_mapping_is_masked(self):
         out = sanitize({"label": "rolling_30d", "id": "m"}, {"rolling"})  # not Period-shaped: free text
         self.assertEqual(out["label"], f"{REDACTED}_30d")

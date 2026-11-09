@@ -126,6 +126,8 @@ class InventoryItem:
     #: Local ordering hint for choosing among several holders of one seat: the row's ``expires_at_ms`` in
     #: seconds (0 = unknown). Never validated, never sent anywhere.
     expires_at: float = field(default=0.0, repr=False)
+    #: Public pool row id of the OAuth credential (the key core's pool finds the row by); None otherwise.
+    credential_row_id: Optional[str] = field(default=None, repr=False)
 
     def __repr__(self) -> str:
         return f"InventoryItem({self.provider_id!r}, {self.account_id!r})"
@@ -718,6 +720,7 @@ def discover(source: Any) -> List[InventoryItem]:
             credential_expected=bool(draft.key_env) and credential is None,
             oauth_credential=bool(draft.oauth_token and credential and draft.oauth_token == credential),
             expires_at=draft.expires_at,
+            credential_row_id=draft.row_id if (draft.oauth_token and credential == draft.oauth_token) else None,
         ))
     items.sort(key=lambda i: (i.provider_id, i.account_id))
     return items
@@ -907,6 +910,7 @@ def discover_machine(source: Any) -> List[InventoryItem]:
             identity_key=identity,
             oauth_credential=bool(source_member and source_member.oauth_credential),
             expires_at=source_member.expires_at if source_member else 0.0,
+            credential_row_id=source_member.credential_row_id if source_member else None,
             credential_expected=usable is None and health_usable is None and any(
                 i.credential_expected for _holder, i, selected in members if selected or cross_live),
             holders=tuple(holders),
