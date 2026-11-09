@@ -23,6 +23,7 @@ from .adapters import create_adapter
 from .adapters.analytics import HostAnalyticsReader, MemoAnalyticsReader
 from .adapters.base import AdapterContext, AnalyticsReader, EndpointCache
 from .adapters.cloud import ANTHROPIC_PROVIDER_ID, ANTHROPIC_TARGET, CODEX_PROVIDER_ID, CODEX_TARGET, OPENROUTER_TARGET
+from .adapters.credentials import default_resolver
 from .adapters.fallback import SessionAnalyticsAdapter
 from .adapters.transport import AllowedTarget, CrossProfileProbeTransport, GuardedTransport, UrllibTransport
 from .captures import CaptureStore
@@ -150,8 +151,12 @@ class UsageDeckService:
         cache_ttl: float = CACHE_TTL_S,
         max_workers: int = MAX_WORKERS,
         deadline: float = REFRESH_DEADLINE_S,
+        token_resolver: Any = None,
     ):
         self._inventory_factory = inventory_factory or host_inventory_source
+        # §9.1.1: the Anthropic bearer is resolved through core's credential pool (refreshing an expiring row);
+        # one resolver per service so its failure backoff outlives a single snapshot.
+        self._token_resolver = token_resolver if token_resolver is not None else default_resolver()
         self._analytics_factory = analytics_factory or HostAnalyticsReader
         self._transport = transport or UrllibTransport()
         self._capture_factory = capture_factory or _default_captures
@@ -396,6 +401,9 @@ class UsageDeckService:
             cross_profile=item.cross_profile and not blocked,
             credential_expected=item.credential_expected,
             oauth_credential=item.oauth_credential and not blocked,
+            credential_row_id=None if blocked else item.credential_row_id,
+            credential_expires_at=item.expires_at,
+            token_resolver=self._token_resolver,
         )
 
     def _run_item(self, item: InventoryItem, reader: AnalyticsReader, now: datetime,

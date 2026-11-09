@@ -136,3 +136,20 @@ def scan_for(obj, needles):
     """Return the needles found anywhere in the JSON text of ``obj``."""
     text = json.dumps(obj)
     return [n for n in needles if n in text]
+
+
+class PassthroughResolver:
+    """Hermetic stand-in for core's credential machinery: hands back the stored token untouched.
+
+    The production resolver drives Hermes' real credential pool (and would refresh/write the real auth
+    store), so the test package installs this one as the service default (``tests/__init__.py``).
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def resolve(self, row, now):
+        from plugins.usage_deck.adapters.credentials import OK, TokenResolution
+
+        self.calls.append(row)
+        return TokenResolution(OK, row.token)

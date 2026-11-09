@@ -7,7 +7,7 @@ import math
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Dict, FrozenSet, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Optional, Protocol, Tuple
 
 from ..captures import CaptureStore, CredentialRef
 from ..models.dto import (
@@ -123,6 +123,13 @@ class AdapterContext:
     #: The credential is a persisted OAuth pool row (``auth_type: oauth``): the only kind the Anthropic
     #: live usage pull may send (DESIGN.md §9.1.2). An API key never goes to the OAuth usage route.
     oauth_credential: bool = False
+    #: Private pool row id and ``expires_at_ms`` (seconds) behind the OAuth credential: the inputs the token
+    #: resolver needs to find the row in core's pool and judge expiry (never serialized, never a DTO key).
+    credential_row_id: Optional[str] = None
+    credential_expires_at: float = 0.0
+    #: Resolves the Anthropic bearer through core's credential machinery (``adapters.credentials``). Without
+    #: one the Anthropic adapter makes NO live request: it never reads the stored token itself.
+    token_resolver: Optional[Any] = None
 
     def __repr__(self) -> str:
         return f"AdapterContext(provider_id={self.provider_id!r}, account_id={self.account_id!r})"

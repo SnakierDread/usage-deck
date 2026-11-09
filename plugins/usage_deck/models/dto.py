@@ -79,6 +79,23 @@ ERROR_RETRYABLE = {
     "internal_error": False,
 }
 
+#: Status-specific wording for an error whose ``code`` is already one of ERROR_CODES (DESIGN.md §9.1.1/§9.1.2
+#: taxonomy): variant -> (code, fixed message, retryable). The wire vocabulary stays closed: a variant adds NO new
+#: code, only a fixed message, so 401 / 404 / 429 and a dead stored login can be told apart on the card.
+REAUTH_HINT = "stored login needs re-auth: run hermes auth add anthropic"
+ERROR_VARIANTS = {
+    "anthropic_reauth": ("auth_required", REAUTH_HINT, False),
+    "anthropic_http_401": ("auth_required",
+                           "Anthropic usage answered HTTP 401 (credential refused); " + REAUTH_HINT, False),
+    "anthropic_http_404": ("permission_denied",
+                           "Anthropic usage answered HTTP 404 (credential or endpoint not valid for this read); "
+                           "no reading is estimated.", False),
+    "anthropic_http_429": ("upstream_unavailable",
+                           "Anthropic usage answered HTTP 429 (rate limited); retry later.", True),
+    "anthropic_refresh_unavailable": ("upstream_unavailable",
+                                      "The stored login could not be refreshed right now; retry later.", True),
+}
+
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
@@ -184,8 +201,14 @@ class DeckError:
         _str("account_id", self.account_id, nullable=True)
 
 
-def make_error(code: str, provider_id: Optional[str] = None, account_id: Optional[str] = None) -> DeckError:
-    """Build an error from the fixed message table only."""
+def make_error(code: str, provider_id: Optional[str] = None, account_id: Optional[str] = None,
+               variant: Optional[str] = None) -> DeckError:
+    """Build an error from the fixed message tables only (``ERROR_MESSAGES`` or one ``ERROR_VARIANTS`` entry)."""
+    if variant is not None:
+        if variant not in ERROR_VARIANTS:
+            raise DtoError("variant")
+        v_code, message, retryable = ERROR_VARIANTS[variant]
+        return DeckError(v_code, message, retryable, provider_id, account_id)
     _enum("code", code, ERROR_CODES)
     return DeckError(code, ERROR_MESSAGES[code], ERROR_RETRYABLE[code], provider_id, account_id)
 
@@ -513,7 +536,7 @@ WIRE_VALUE_RULES = {
     "state": _in(CARD_STATES),
     "reason": _in(REASONS),
     "code": _in(ERROR_CODES),
-    "message": _in(ERROR_MESSAGES.values()),
+    "message": _in(set(ERROR_MESSAGES.values()) | {v[1] for v in ERROR_VARIANTS.values()}),
     "unit": _in(UNITS),
     "scope": _in(set(METER_SCOPES) | set(SERIES_SCOPES)),
     "source": _in(METER_SOURCES),

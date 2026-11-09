@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass
@@ -28,7 +29,10 @@ from .base import (
     finite_number,
     parse_json_body,
 )
+from .credentials import OK, REAUTH, UNAVAILABLE, StoredRow, TokenResolution
 from .transport import AllowedTarget, TransportError
+
+log = logging.getLogger("usage_deck.adapters.cloud")
 
 # DESIGN.md §9.1.2: the sole Anthropic egress (live OAuth usage pull). Granted only to the anthropic context.
 ANTHROPIC_PROVIDER_ID = "anthropic"
@@ -566,11 +570,16 @@ class AnthropicAdapter(OpaqueCloudAdapter):
 
     Pull (DESIGN.md §9.1.2): one guarded ``GET https://api.anthropic.com/api/oauth/usage`` per snapshot
     with the selected persisted OAuth access token (``Authorization: Bearer`` + the OAuth beta header and
-    nothing else); read on every ``/subscriptions`` build, never from a timer. No refresh, no retry, no
-    redirects, no other route. Fallback: previously captured ``anthropic-ratelimit-unified-*`` headers
-    (§9.1), used only when the pull is unavailable (transport failure, 429/5xx, 403/404, unreadable body)
-    and only for windows that are still current by the capture's own reset; otherwise the window is hidden
-    (never estimated). A 401 is the credential's verdict: ``auth_status: rejected`` and no fallback.
+    nothing else); read on every ``/subscriptions`` build, never from a timer. The bearer is never read
+    off the stored row by this adapter: it comes from the token resolver (``adapters.credentials``), which
+    asks Hermes' own credential pool and so refreshes an expired/expiring access token exactly as
+    ``hermes auth refresh`` does (§9.1.1 credential lifecycle). One request, no retry, no redirects, no other
+    route. A dead stored login (refresh refused) is ``auth_status: rejected`` + the re-auth hint, no request.
+    Fallback: previously captured ``anthropic-ratelimit-unified-*`` headers
+    (§9.1), used only when the pull is unavailable (transport failure, 429/5xx, 403/404, unreadable body,
+    a transient refresh failure) and only for windows that are still current by the capture's own reset;
+    otherwise the window is hidden (never estimated). A 401 is the credential's verdict:
+    ``auth_status: rejected`` and no fallback.
     """
 
     adapter_name = "AnthropicAdapter"
@@ -602,7 +611,8 @@ class AnthropicAdapter(OpaqueCloudAdapter):
     def _can_pull(self) -> bool:
         ctx = self.ctx
         # Machine-only inventory (not the selected profile's credential, no §13 exemption) makes no request.
-        return bool(ctx.live_source and ctx.credential and ctx.oauth_credential)
+        # No resolver = no way to obtain a bearer: the adapter never reads the stored token itself (§9.1.1).
+        return bool(ctx.live_source and ctx.credential and ctx.oauth_credential and ctx.token_resolver is not None)
 
     def _do_probe(self) -> ProbeResult:
         # Local-only: no request is spent to obtain a badge; get_usage makes the one request.
@@ -636,11 +646,33 @@ class AnthropicAdapter(OpaqueCloudAdapter):
             return None
         return UsageResult(meters=tuple(meters), series=(), confidence="exact")
 
+    def _bearer(self) -> TokenResolution:
+        """The one door to the OAuth bearer: core's credential machinery (refreshes an expiring row)."""
+        ctx = self.ctx
+        row = StoredRow(token=ctx.credential, expires_at=ctx.credential_expires_at, row_id=ctx.credential_row_id,
+                        may_refresh=not ctx.cross_profile)
+        try:
+            return ctx.token_resolver.resolve(row, ctx.now())
+        except Exception as exc:  # noqa: BLE001 - a resolver bug is "cannot resolve", never a crash or a raw read
+            log.warning("usage_deck: anthropic token resolver failed (%s)", type(exc).__name__)
+            return TokenResolution(UNAVAILABLE)
+
     def _pull(self) -> Tuple[UsageResult, bool]:
         """One guarded GET. Returns ``(result, unavailable)``; ``unavailable`` allows the header fallback."""
         ctx = self.ctx
+        resolution = self._bearer()
+        if resolution.status == REAUTH:
+            # The stored login is dead (refresh refused / nothing to refresh with): no request is made, the
+            # card says so with the repair command. Definitive, like a 401: no older data in its place.
+            self._rejected = True
+            return UsageResult(error=make_error("auth_required", ctx.provider_id, ctx.account_id,
+                                                variant="anthropic_reauth"), reason="permission_denied"), False
+        if resolution.status != OK or resolution.token is None:
+            return UsageResult(error=make_error("upstream_unavailable", ctx.provider_id, ctx.account_id,
+                                                variant="anthropic_refresh_unavailable"),
+                               reason="source_unavailable"), True
         headers = {
-            "Authorization": "Bearer " + ctx.credential.reveal(),
+            "Authorization": "Bearer " + resolution.token.reveal(),
             "anthropic-beta": ANTHROPIC_OAUTH_BETA,
             "Accept": "application/json",
             "User-Agent": CODEX_USER_AGENT,
@@ -650,14 +682,26 @@ class AnthropicAdapter(OpaqueCloudAdapter):
         except TransportError as exc:
             return UsageResult(error=error_for_transport(exc, ctx.provider_id, ctx.account_id)), True
         if response.status == 401:
-            # The bearer was sent and refused: no refresh, no retry, no older data in its place (§9.1.2).
+            # The bearer was sent and refused (after core had the chance to refresh it): no retry, no older
+            # data in its place (§9.1.2). The repair is a new login.
             self._rejected = True
             self._verdict = True
-            return UsageResult(error=make_error("auth_required", ctx.provider_id, ctx.account_id),
+            return UsageResult(error=make_error("auth_required", ctx.provider_id, ctx.account_id,
+                                                variant="anthropic_http_401"),
                                reason="permission_denied"), False
-        if response.status in (403, 404):
+        if response.status == 404:
+            # Credential/endpoint error, told apart from 401 and 429 (§9.1.2 taxonomy). A current capture may
+            # still answer for the card (the provider's own number); otherwise this error is the card.
+            self._verdict = True
+            return UsageResult(error=make_error("permission_denied", ctx.provider_id, ctx.account_id,
+                                                variant="anthropic_http_404"), reason="permission_denied"), True
+        if response.status == 403:
             self._verdict = True
             return UsageResult(reason="permission_denied"), True  # e.g. a token without the profile scope
+        if response.status == 429:
+            # Retry later: the source is unavailable, the credential is NOT rejected.
+            return UsageResult(error=make_error("upstream_unavailable", ctx.provider_id, ctx.account_id,
+                                                variant="anthropic_http_429"), reason="source_unavailable"), True
         failure = error_for_status(response.status, ctx.provider_id, ctx.account_id)
         if failure is not None:
             return UsageResult(error=failure), True
