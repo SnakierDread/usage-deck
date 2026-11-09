@@ -161,7 +161,7 @@ test("opaque Codex/Anthropic cards explain why there is no meter; no number, bar
   assert.equal(codex.querySelectorAll("[role=progressbar], .ud-meter").length, 0);
   const ant = m.$("[data-card-id=acct_ant2]");
   const antNote = ant.querySelector("[data-opaque-note=anthropic]").textContent;
-  assert.match(antNote, /No usable capture; enable the optional observer and use this account normally\./);
+  assert.match(antNote, /no usable capture; enable the optional observer and use this account normally\./);
   assert.match(antNote, /only appear after an ordinary request returns eligible headers/);
   assert.match(antNote, /Nothing is estimated/);
   assert.ok(!/does not record/i.test(antNote), "no stale 'Hermes does not record these today' claim");
@@ -212,7 +212,7 @@ test("a provider without a note (Nous) and self-hosted cards get no note", async
   assert.equal(mod.opaqueNote(F.selfHosted), null);
   assert.equal(mod.opaqueNote(anthropicReady), null, "a card with measured meters needs no explanation");
   assert.match(mod.opaqueNote(codexGo), /No Codex spend meter/);
-  assert.match(mod.opaqueNote(anthropicOpaque), /No usable capture; enable the optional observer/);
+  assert.match(mod.opaqueNote(anthropicOpaque), /no usable capture; enable the optional observer/);
   assert.equal(mod.opaqueNote(null), null);
 });
 
@@ -271,4 +271,20 @@ test("an oauth-usage source ceiling is exact and machineOnlyNote ignores a live-
   const live = Object.assign({}, anthropicOpaque, { reason: "source_unavailable",
     debug: { adapter: "a", capabilities: [], source: "anthropic_oauth_usage", sanitized: true } });
   assert.equal(mod.machineOnlyNote(live), null);
+});
+
+test("a live-empty Anthropic card (endpoint answered, no current window) says so, never 'no live source' or capture-only guidance", async () => {
+  const liveEmpty = Object.assign({}, anthropicOpaque, { id: "acct_live_empty", account_id: "acct_live_empty", reason: "source_unavailable",
+    debug: { adapter: "AnthropicAdapter", capabilities: ["quota"], source: "anthropic_oauth_usage", sanitized: true } });
+  assert.equal(mod.machineOnlyNote(liveEmpty), null);
+  const note = mod.opaqueNote(liveEmpty);
+  assert.match(note, /read live for this credential and reported no current session or weekly window/);
+  assert.match(note, /Nothing is estimated and no older captured reading is shown in its place/);
+  assert.doesNotMatch(note, /no usable capture|No live source|ordinary request returns eligible headers/);
+  const m = await mount({ routes: routes({ subs: (url) => envelope({ cards: [liveEmpty], inventory_state: "detected",
+    view: new URL(url, "http://x").searchParams.get("view") }) }) });
+  const card = m.$("[data-card-id=acct_live_empty]");
+  assert.match(card.querySelector("[data-opaque-note=anthropic]").textContent, /reported no current session or weekly window/);
+  assert.equal(card.querySelector("[data-machine-only-note]"), null);
+  await m.unmount();
 });

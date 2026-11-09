@@ -7,6 +7,8 @@ the real endpoint on 2026-11-09 (``five_hour`` / ``seven_day`` windows, ``utiliz
 """
 
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -565,6 +567,225 @@ class DiscoveryOauthFlag(ServiceBase):
                                   custom_provider_loader=lambda c: [], env_lookup=lambda n: None)
         flags = {i.row_ref: i.oauth_credential for i in discover(src)}
         self.assertEqual(flags, {"a1": True, "a2": False, "a3": False})
+
+
+# ---------------------------------------------------- credential provenance (review round 1, defect 1)
+
+API_KEY = "sk-ant...pikey"
+AGENT_KEY = "sk-ant...gentk"
+
+
+def key_only_oauth_rows(row_id=ROW):
+    """OAuth-tagged pool rows that carry NO usable access_token, only a generic api/agent key."""
+    rows = {}
+    for field in ("api_key", "agent_key"):
+        for label, access in (("missing", None), ("blank", ""), ("whitespace", "   "), ("non-string", 7)):
+            row = {"id": row_id, "auth_type": "oauth", "source": "manual:hermes_pkce", field: API_KEY}
+            if access is not None:
+                row["access_token"] = access
+            rows[f"{field}/{label}"] = row
+    return rows
+
+
+class OauthAccessTokenProvenance(ServiceBase, SchemaAsserts):
+    def setUp(self):
+        super().setUp()
+        self.transport.routes[ANTHROPIC_USAGE_URL] = json_response(usage_body())
+
+    def cards(self, view):
+        status, body = self.make().handle("subscriptions", [("view", view)])
+        self.assert_exact_envelope("subscriptions", status, body)
+        self.assertEqual(scan_for(body, (API_KEY, AGENT_KEY, TOKEN, OTHER_TOKEN)), [])
+        return [c for c in body["data"]["cards"] if c["provider_id"] == "anthropic"]
+
+    def seed_capture(self):
+        target = default_store_path(self.s.root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = json.loads(FIXTURE.read_text())
+        data["synthetic"] = False
+        data.pop("_note", None)
+        target.write_text(json.dumps(data))
+
+    def discovered(self, view="profile"):
+        src = FileInventorySource(self.s.home, self.s.root, config_loader=lambda: {"model": {}},
+                                  custom_provider_loader=lambda c: [], env_lookup=lambda n: None)
+        return [i for i in (discover_machine(src) if view == "machine" else discover(src)) if i.provider_id == "anthropic"]
+
+    def test_selected_profile_oauth_row_without_an_access_token_sends_nothing(self):
+        for name, row in key_only_oauth_rows().items():
+            for view in ("machine", "profile"):
+                with self.subTest(row=name, view=view):
+                    self.transport.requests.clear()
+                    self.s.write_auth(pool(row))
+                    self.assertFalse(any(i.oauth_credential for i in self.discovered(view)))
+                    (card,) = self.cards(view)
+                    self.assertEqual((card["state"], card["reason"], card["meters"]), ("opaque", "unsupported", []))
+                    self.assertEqual(self.transport.requests, [])  # the api/agent key never egresses
+
+    def test_header_fallback_still_serves_a_key_only_oauth_row_without_any_request(self):
+        self.seed_capture()
+        self.s.write_auth(pool({"id": ROW, "auth_type": "oauth", "api_key": API_KEY}))
+        for view in ("machine", "profile"):
+            with self.subTest(view=view):
+                (card,) = self.cards(view)
+                self.assertEqual([(m["source"], m["observed_at"]) for m in card["meters"]],
+                                 [("anthropic_headers", "2026-11-06T11:58:30Z")] * 2)
+                self.assertEqual(self.transport.requests, [])
+
+    def test_sibling_oauth_row_without_an_access_token_is_never_polled(self):
+        for name, row in key_only_oauth_rows("v1").items():
+            with self.subTest(row=name):
+                self.transport.requests.clear()
+                self.s.write_auth({"credential_pool": {}})
+                self.s.write_profile("verifier", pool(row))
+                self.assertFalse(any(i.oauth_credential for i in self.discovered("machine")))
+                (card,) = self.cards("machine")
+                self.assertEqual((card["state"], card["meters"]), ("opaque", []))
+                self.assertEqual(self.transport.requests, [])
+
+    def test_positive_control_the_access_token_is_the_only_bearer_even_beside_generic_keys(self):
+        row = oauth_row(ROW, api_key=API_KEY, agent_key=AGENT_KEY)
+        self.s.write_auth(pool(row))
+        for view in ("machine", "profile"):
+            with self.subTest(view=view):
+                self.transport.requests.clear()
+                (card,) = self.cards(view)
+                self.assertEqual((card["state"], card["confidence"]), ("ready", "exact"))
+                self.assertEqual([r[1]["Authorization"] for r in self.transport.requests], ["Bearer " + TOKEN])
+        self.s.write_auth({"credential_pool": {}})
+        self.s.write_profile("verifier", pool(oauth_row("v1", token=OTHER_TOKEN, api_key=API_KEY)))
+        self.transport.requests.clear()
+        (card,) = self.cards("machine")
+        self.assertEqual(card["state"], "ready")
+        self.assertEqual([r[1]["Authorization"] for r in self.transport.requests], ["Bearer " + OTHER_TOKEN])
+
+    def test_a_blank_access_token_beside_a_key_does_not_shadow_a_sibling_oauth_token(self):
+        self.s.write_auth({"credential_pool": {}})
+        self.s.write_profile("a", pool({"id": "a1", "auth_type": "oauth", "access_token": "", "api_key": API_KEY}))
+        self.s.write_profile("b", pool(oauth_row("b1", token=OTHER_TOKEN)))
+        self.transport.requests.clear()
+        self.cards("machine")
+        self.assertEqual([r[1]["Authorization"] for r in self.transport.requests], ["Bearer " + OTHER_TOKEN])
+
+
+# ------------------------------------------- live no-meter provenance (review round 1, defect 2)
+
+NODE = shutil.which("node")
+DIST = Path(__file__).resolve().parents[1] / "dist" / "index.js"
+DESKTOP = Path(__file__).resolve().parents[1] / "desktop" / "plugin.js"
+ROOT_ENTRY = Path(__file__).resolve().parents[3] / "plugin.js"
+BRIDGE = """
+const fs = require("fs");
+const mod = require(process.argv[2]);
+const cards = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+console.log(JSON.stringify(cards.map((c) => ({ machineOnly: mod.machineOnlyNote(c), opaque: mod.opaqueNote(c) }))));
+"""
+STALE_LIVE_CLAIMS = ("No live source for this account", "can only appear after an ordinary request returns eligible headers",
+                     "no usable capture")
+
+
+class LiveNoMeterProvenance(ServiceBase, SchemaAsserts):
+    def setUp(self):
+        super().setUp()
+        self.s.write_auth(pool(oauth_row(ROW)))
+
+    def seed_capture(self):
+        target = default_store_path(self.s.root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = json.loads(FIXTURE.read_text())
+        data["synthetic"] = False
+        data.pop("_note", None)
+        target.write_text(json.dumps(data))
+
+    def card(self, outcome, capture=False, row=ROW, view="machine"):
+        self.s.write_auth(pool(oauth_row(row)))
+        default_store_path(self.s.root).unlink(missing_ok=True)  # each probe starts from a known capture state
+        if capture:
+            self.seed_capture()
+        self.transport.requests.clear()
+        self.transport.routes[ANTHROPIC_USAGE_URL] = outcome
+        status, body = self.make().handle("subscriptions", [("view", view)])
+        self.assert_exact_envelope("subscriptions", status, body)
+        (card,) = [c for c in body["data"]["cards"] if c["provider_id"] == "anthropic"]
+        return card
+
+    def frontend(self, *cards):
+        if NODE is None:
+            self.skipTest("node unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            data, script = Path(tmp, "cards.json"), Path(tmp, "bridge.js")
+            data.write_text(json.dumps(list(cards)))
+            script.write_text(BRIDGE)
+            done = subprocess.run([NODE, str(script), str(DIST), str(data)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout)
+
+    def test_200_with_no_current_window_keeps_the_endpoint_as_source_with_or_without_a_capture(self):
+        empty = json_response(usage_body(five=None, week=None))
+        passed = json_response(usage_body(five=(88.0, NOW - timedelta(seconds=1)), week=(5.0, NOW - timedelta(hours=1))))
+        for name, outcome in (("null windows", empty), ("reset just passed", passed)):
+            for capture in (False, True):
+                for view in ("machine", "profile"):
+                    with self.subTest(body=name, capture=capture, view=view):
+                        card = self.card(outcome, capture=capture, view=view)
+                        self.assertEqual((card["state"], card["confidence"], card["reason"], card["meters"]),
+                                         ("opaque", "opaque", "source_unavailable", []))
+                        self.assertEqual(card["debug"]["source"], "anthropic_oauth_usage")
+                        self.assertEqual(len(self.transport.requests), 1)  # definitive: no estimate, no older fallback
+
+    def test_service_produced_live_empty_cards_get_the_live_note_not_the_capture_only_guidance(self):
+        cards = [self.card(json_response(usage_body(five=None, week=None)), capture=capture) for capture in (False, True)]
+        cards.append(self.card(raw_response("{}", status=403)))
+        for card, notes in zip(cards, self.frontend(*cards)):
+            with self.subTest(reason=card["reason"]):
+                self.assertIsNone(notes["machineOnly"])
+                self.assertRegex(notes["opaque"], r"read live .* reported no current session or weekly window")
+                self.assertRegex(notes["opaque"], r"no older captured reading is shown")
+                for claim in STALE_LIVE_CLAIMS:
+                    self.assertNotIn(claim, notes["opaque"])
+
+    def test_permission_denied_without_a_capture_is_also_live_provenance(self):
+        for status in (403, 404):
+            with self.subTest(status=status):
+                card = self.card(raw_response("{}", status=status))
+                self.assertEqual((card["state"], card["reason"], card["meters"]), ("opaque", "permission_denied", []))
+                self.assertEqual(card["debug"]["source"], "anthropic_oauth_usage")
+
+    def test_a_403_with_a_current_capture_still_falls_back_to_the_header_meters(self):
+        card = self.card(raw_response("{}", status=403), capture=True)
+        self.assertEqual([m["source"] for m in card["meters"]], ["anthropic_headers"] * 2)
+        self.assertEqual(card["debug"]["source"], "anthropic_headers")
+
+    def test_401_card_carries_the_endpoint_source_and_stays_rejected(self):
+        card = self.card(raw_response("{}", status=401), capture=True)
+        self.assertEqual((card["state"], card["auth_status"], card["debug"]["source"]),
+                         ("error", "rejected", "anthropic_oauth_usage"))
+
+    def test_an_unreachable_endpoint_is_not_live_provenance(self):
+        card = self.card(TransportError(TransportError.TIMEOUT))
+        self.assertEqual((card["state"], card["debug"]["source"]), ("error", "local_inventory"))
+        stale = self.card(TransportError(TransportError.TIMEOUT), capture=True, row="ant-syn-both-rolled")
+        self.assertEqual((stale["state"], stale["meters"], stale["debug"]["source"]), ("error", [], "anthropic_headers"))
+
+    def test_inventory_only_and_header_only_cards_keep_the_capture_guidance(self):
+        self.s.write_auth(pool({"id": "plain", "auth_type": "api_key", "access_token": API_KEY}))
+        self.transport.requests.clear()
+        status, body = self.make().handle("subscriptions", [("view", "machine")])
+        (inventory,) = [c for c in body["data"]["cards"] if c["provider_id"] == "anthropic"]
+        self.assertEqual((inventory["reason"], inventory["debug"]["source"], self.transport.requests),
+                         ("unsupported", "local_inventory", []))
+        (notes,) = self.frontend(inventory)
+        self.assertIn("no usable capture; enable the optional observer", notes["opaque"])
+        self.assertIn("can only appear after an ordinary request returns eligible headers", notes["opaque"])
+
+    def test_both_frontends_replaced_the_obsolete_capture_only_note(self):
+        for path in (DIST, DESKTOP, ROOT_ENTRY):
+            with self.subTest(path=path.name):
+                text = path.read_text()
+                self.assertNotIn("no usable capture for this credential", text)
+                self.assertIn("was read live for this credential and reported no current session or weekly window", text)
+                self.assertIn("no live usage reading for this credential", text)
+                self.assertIn("ANTHROPIC_LIVE_EMPTY_NOTE", text)
 
 
 if __name__ == "__main__":

@@ -441,6 +441,18 @@ def _credential_of(entry: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _oauth_access_token_of(entry: Dict[str, Any]) -> Optional[str]:
+    """The persisted OAuth ``access_token`` of an ``auth_type: oauth`` pool row, else None.
+
+    Explicit field provenance (DESIGN.md §9.1.2): ``_credential_of`` may fall back to ``agent_key`` /
+    ``api_key``, but those are never OAuth bearers and must never reach the OAuth-only usage endpoint.
+    """
+    if entry.get("auth_type") != "oauth":
+        return None
+    value = entry.get("access_token")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def _jwt_payload(token: Optional[str]) -> Optional[dict]:
     """Decoded (unverified) JWT payload, or None. Local only: never validated, never sent anywhere."""
     if not token or token.count(".") != 2 or len(token) > 16384:
@@ -542,7 +554,7 @@ class _Draft:
     origin: str = "pool"
     holder: Optional[Tuple[bool, str]] = None
     key_env: Optional[str] = None
-    oauth: bool = False
+    oauth_token: Optional[str] = None  # the row's own OAuth access_token (never a generic api/agent key)
     expires_at: float = 0.0
 
 
@@ -589,7 +601,7 @@ def discover(source: Any) -> List[InventoryItem]:
             endpoint = _endpoint_from_entry(entry) if is_self_hosted_provider(provider_id) else None
             drafts.append(_Draft(provider_id, endpoint, row_id, ordinal, _credential_of(entry), secrets, None, True,
                                  holder=raw.pool_holders.get(provider_id),
-                                 oauth=entry.get("auth_type") == "oauth", expires_at=_row_expiry(entry)))
+                                 oauth_token=_oauth_access_token_of(entry), expires_at=_row_expiry(entry)))
 
     pooled_ids = {d.provider_id for d in drafts}
     for provider_id, entry in raw.legacy.items():
@@ -704,7 +716,7 @@ def discover(source: Any) -> List[InventoryItem]:
             jwt_pair=jwt_pair,
             row_ref=row_ref,
             credential_expected=bool(draft.key_env) and credential is None,
-            oauth_credential=bool(draft.oauth and credential and draft.credential == credential),
+            oauth_credential=bool(draft.oauth_token and credential and draft.oauth_token == credential),
             expires_at=draft.expires_at,
         ))
     items.sort(key=lambda i: (i.provider_id, i.account_id))

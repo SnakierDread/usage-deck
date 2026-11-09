@@ -65,8 +65,11 @@
   // ratified and read, so an opaque card means this account returned nothing this meter can honestly show.
   const OPAQUE_NOTES = {
     "openai-codex": "No Codex spend meter for this account: UsageDeck reads only the ChatGPT workspace spend control, and this account has none it can show right now (no usable credential, an unrecognised or expired reading, or access was not permitted). Nothing is estimated. Any plan shown is an unverified claim from the credential.",
-    anthropic: "No Anthropic session/weekly meter: no usable capture for this credential. No usable capture; enable the optional observer and use this account normally. A meter can only appear after an ordinary request returns eligible headers (DESIGN.md §12.1). Nothing is estimated.",
+    anthropic: "No Anthropic session/weekly meter: no live usage reading for this credential (the live read needs a persisted OAuth login of the selected profile) and no usable capture; enable the optional observer and use this account normally. A captured meter can only appear after an ordinary request returns eligible headers (DESIGN.md §12.1). Nothing is estimated.",
   };
+  // Anthropic card whose live usage endpoint answered but yielded no meter (DESIGN.md §9.1.2): the live answer is
+  // definitive, so no older captured reading is shown in its place.
+  const ANTHROPIC_LIVE_EMPTY_NOTE = "No Anthropic session/weekly meter: Anthropic's usage endpoint was read live for this credential and reported no current session or weekly window (or did not permit the read). Nothing is estimated and no older captured reading is shown in its place.";
   // Machine view only (DESIGN.md §12.5, amended by §13): the machine view reads meters with any local profile's
   // credential, but only through the documented read-only usage probes; other accounts stay local inventory.
   const MACHINE_ONLY_NOTE = "No live source for this account: the machine view reads meters with any local profile's credential only through the documented read-only usage probes (Codex spend control, Anthropic OAuth usage, endpoint /metrics), and none exists for this account, so it is local inventory. Nothing is estimated.";
@@ -398,6 +401,9 @@
   function opaqueNote(card) {
     if (!isObj(card) || card.kind === "self_hosted") return null;
     if (cardView(card) !== "unavailable") return null;
+    if (card.provider_id === "anthropic" && isObj(card.debug) && card.debug.source === "anthropic_oauth_usage") {
+      return ANTHROPIC_LIVE_EMPTY_NOTE;
+    }
     return has(OPAQUE_NOTES, card.provider_id) ? OPAQUE_NOTES[card.provider_id] : null;
   }
 

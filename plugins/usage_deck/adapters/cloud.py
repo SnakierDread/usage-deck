@@ -579,12 +579,15 @@ class AnthropicAdapter(OpaqueCloudAdapter):
         super().__init__(ctx)
         self._snapshot: Optional[UsageResult] = None
         self._rejected = False
+        self._verdict = False  # the endpoint itself answered (401 / 403 / 404 / 200): provenance of a meterless card
 
     @property
     def source_label(self) -> str:  # type: ignore[override]
         snapshot = self._snapshot
         if snapshot is not None and snapshot.meters:
             return snapshot.meters[0].source  # the one source that produced the meters (never mixed)
+        if self._verdict:
+            return "anthropic_oauth_usage"  # the live endpoint answered with no meter: it is still the source
         return "anthropic_headers" if self._capture() is not None else "local_inventory"
 
     def credential_rejected(self) -> bool:
@@ -649,9 +652,11 @@ class AnthropicAdapter(OpaqueCloudAdapter):
         if response.status == 401:
             # The bearer was sent and refused: no refresh, no retry, no older data in its place (§9.1.2).
             self._rejected = True
+            self._verdict = True
             return UsageResult(error=make_error("auth_required", ctx.provider_id, ctx.account_id),
                                reason="permission_denied"), False
         if response.status in (403, 404):
+            self._verdict = True
             return UsageResult(reason="permission_denied"), True  # e.g. a token without the profile scope
         failure = error_for_status(response.status, ctx.provider_id, ctx.account_id)
         if failure is not None:
@@ -668,6 +673,7 @@ class AnthropicAdapter(OpaqueCloudAdapter):
         except ValueError:
             return malformed
         if not meters:
+            self._verdict = True  # a definitive 200 that names no current window
             return UsageResult(confidence="opaque", reason="source_unavailable"), False
         return UsageResult(meters=tuple(meters), confidence="exact"), False
 
