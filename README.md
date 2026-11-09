@@ -123,15 +123,47 @@ The plugin's API is served by the dashboard under `/api/plugins/usage-deck/`:
 
 These sit behind the dashboard's session check, so a bare `curl` or a new browser tab returns `401 Unauthorized`. Read the data through the UI.
 
-### Update or remove
+### Keeping UsageDeck up to date
+
+UsageDeck has two halves that update by different mechanisms: the **Python half** (agent plugin, dashboard tab and API) lives on the machine that runs the Hermes gateway/dashboard, and the optional **desktop half** (`plugin.js`) is a file the desktop app copies onto the machine where the *app* runs. Which of the two procedures below applies depends on where the app's backend is.
+
+#### Local backend (the desktop app and Hermes run on the same machine)
+
+Update the clone, then let Hermes refresh the package:
 
 ```sh
 git pull                                   # in your clone
-hermes plugins install "file://$(pwd)#plugins/usage_deck" --force --no-enable
-hermes plugins remove usage-deck           # uninstall
+hermes plugins update usage-deck           # or: hermes plugins install "file://$(pwd)#plugins/usage_deck" --force --no-enable
 ```
 
+Then restart `hermes dashboard` (and the gateway, if one is running) so the Python half reloads. The desktop half needs no separate step: the app refreshes its copy in `$HERMES_HOME/desktop-plugins/usage-deck/` from the installed package on **Rescan** (Capabilities → Plugins), on an app-side install/update, or on app restart, whenever the package's `plugin.js` is newer than the copy. If the desktop page looks stale, press **Rescan** first; `hermes plugins doctor usage-deck` warns when the copy differs from the source.
+
 After a reinstall, run `hermes plugins list --plain --no-bundled` and re-enable if it shows `disabled`.
+
+#### Remote backend (the desktop app is connected to a Hermes gateway on another machine)
+
+The two halves live on different machines and **only the Python half updates from the server side**:
+
+1. **Python half, on the gateway machine.** Pull and reinstall there (the commands above), then restart the dashboard and the gateway. This covers every change to the backend, the API and the web dashboard tab.
+2. **Desktop half, on the machine running the app. It never auto-updates.** The refresh hooks (`hermes plugins update`, **Rescan**) run on the machine where Hermes is installed locally, and the app never reads a remote machine's filesystem, so neither a server-side update nor **Rescan** transfers a new `plugin.js` to the app. Whenever `plugins/usage_deck/desktop/plugin.js` (or the files published with it) changed, reinstall it in the app: **Capabilities → Plugins → Install from Git**, keep the **Desktop** target checked, enter the folder URL from "Desktop app half" below, and confirm with **Force**. Then **Rescan** and check that the Desktop half is still enabled.
+
+Python-only changes (adapters, service, models) do not need step 2. To see whether a pull changed the desktop half, run this in the server clone: `git diff --stat <old-commit>..HEAD -- plugins/usage_deck/desktop plugin.js manifest.json`. Empty output means no desktop reinstall is needed.
+
+**How to tell the desktop half is out of date.** The version string (`// UsageDeck desktop 0.1.0` at the top of `plugin.js`) is not bumped between revisions and cannot tell them apart. Compare content instead, on the app machine, with an up-to-date clone of the repository there:
+
+```sh
+git hash-object --no-filters plugins/usage_deck/desktop/plugin.js "${HERMES_HOME:-$HOME/.hermes}/desktop-plugins/usage-deck/plugin.js"
+```
+
+Two different hashes mean the app is running an older copy: reinstall with **Force**. (The standalone copy made by the disk door below is compared the same way.)
+
+#### Remove
+
+```sh
+hermes plugins remove usage-deck           # uninstall the Python half
+```
+
+Removing the Python half from a remote gateway does not remove a desktop half the app cloned earlier. Remove that **Desktop** target in the app's Plugins page too, or leave it disabled (it then shows *backend unavailable*).
 
 ### Desktop app half (optional)
 
@@ -144,7 +176,7 @@ The package also carries a half for the native Hermes desktop app: `plugins/usag
    https://github.com/SnakierDread/usage-deck/tree/main/plugins/usage_deck
    ```
 
-   (`SnakierDread/usage-deck/plugins/usage_deck` and `https://github.com/SnakierDread/usage-deck.git#plugins/usage_deck` resolve to the same thing.) Review the dialog: it should list the package as `usage-deck` with a Desktop half. Confirm, then **Rescan**, then enable the Desktop half in **Plugins** (it ships disabled). This machine needs `git` and read access to the private repo (the app clones non-interactively, so sign in to GitHub with a credential helper first). To update, install again with **Force**.
+   (`SnakierDread/usage-deck/plugins/usage_deck` and `https://github.com/SnakierDread/usage-deck.git#plugins/usage_deck` resolve to the same thing.) Review the dialog: it should list the package as `usage-deck` with a Desktop half. Confirm, then **Rescan**, then enable the Desktop half in **Plugins** (it ships disabled). This machine needs `git` and read access to the private repo (the app clones non-interactively, so sign in to GitHub with a credential helper first). To update, install again with **Force**. With a local backend **Rescan** also refreshes the copy; with a remote backend only **Force** does (see "Keeping UsageDeck up to date").
 
    The **bare repository URL** is also accepted, so a copied repo link no longer dead-ends:
 
@@ -174,6 +206,7 @@ Layout rules the installer enforces, kept true by `tests/packaging/test_package_
 | Desktop **Install from Git** with the bare repository URL installed a half that shows *backend unavailable* | The bare URL installs the desktop half only. Install the agent half too (steps 2–3, or the folder URL). |
 | Desktop **Install from Git** still fails while staging the desktop half | Use the disk door (copy `plugins/usage_deck/desktop/plugin.js` to `$HERMES_HOME/desktop-plugins/usage-deck/plugin.js`) and report the exact error text with your app version. See "Desktop app half". |
 | Installed copy is old, or misses your edits | Only committed files are installed. Commit, then reinstall with `--force`. |
+| Desktop page did not change after updating the server (remote backend) | The desktop half is never refreshed from the server. Reinstall it in the app with **Install from Git → Force**; see "Keeping UsageDeck up to date". |
 | No **UsageDeck** tab | Run `hermes plugins list --plain --no-bundled`. If it says `disabled`, run `hermes plugins enable usage-deck`. Then restart `hermes dashboard` and reload the browser. |
 | Tab opens but says "No providers detected in this profile" | Normal when the selected profile has no credentials or custom endpoints. Switch to a profile that has them, or configure a provider in Hermes. UsageDeck will not ask for keys. |
 | A card is **Opaque** with no numbers | The provider exposes no usage or quota endpoint that UsageDeck can verify. This is deliberate: it shows no number rather than a guess. The card's tooltip says which case applies. |
