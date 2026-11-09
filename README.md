@@ -152,7 +152,7 @@ Python-only changes (adapters, service, models) do not need step 2. To see wheth
 **How to tell the desktop half is out of date.** The version string (`// UsageDeck desktop 0.1.0` at the top of `plugin.js`) is not bumped between revisions and cannot tell them apart. Compare content instead, on the app machine, with an up-to-date clone of the repository there:
 
 ```sh
-git hash-object --no-filters plugins/usage_deck/desktop/plugin.js "$HERMES_HOME/desktop-plugins/usage-deck/plugin.js"   # default HERMES_HOME: ~/.hermes
+git hash-object --no-filters plugins/usage_deck/desktop/plugin.js "${HERMES_HOME:-$HOME/.hermes}/desktop-plugins/usage-deck/plugin.js"
 ```
 
 Two different hashes mean the app is running an older copy: reinstall with **Force**. (The standalone copy made by the disk door below is compared the same way.)
