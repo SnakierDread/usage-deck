@@ -188,8 +188,8 @@ The package also carries a half for the native Hermes desktop app: `plugins/usag
 3. **Disk door** (manual standalone copy, no git needed). Copy exactly one file:
 
    ```sh
-   mkdir -p "$HERMES_HOME/desktop-plugins/usage-deck"      # default: ~/.hermes/desktop-plugins/usage-deck
-   cp plugins/usage_deck/desktop/plugin.js "$HERMES_HOME/desktop-plugins/usage-deck/plugin.js"
+   mkdir -p "${HERMES_HOME:-$HOME/.hermes}/desktop-plugins/usage-deck"      # default: ~/.hermes/desktop-plugins/usage-deck
+   cp plugins/usage_deck/desktop/plugin.js "${HERMES_HOME:-$HOME/.hermes}/desktop-plugins/usage-deck/plugin.js"
    ```
 
    The app loads it within seconds and hot-reloads each save. Do not copy `manifest.json` or write a `.hermes-package.json` marker. A folder with a `plugin.js` and no marker is a hand-installed standalone plugin: the app never overwrites it, so it has no update or uninstall tracking. To switch to route 2 later, delete that folder first. Remote gateway: this is the route that works when the agent half lives on another machine, since the app never reads a remote filesystem.
