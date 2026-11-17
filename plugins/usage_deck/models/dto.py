@@ -50,8 +50,17 @@ PLAN_SOURCES = ("unverified_claim", "provider", "none")
 AUTH_STATUSES = ("available", "missing", "rejected")
 KINDS = ("cloud", "self_hosted")
 HEALTH_STATUSES = ("healthy", "degraded", "offline", "unknown")
-SERIES_SCOPES = ("profile", "provider", "account")
+SERIES_SCOPES = ("profile", "provider", "account", "machine")
 WINDOWS = (7, 30, 90)
+#: Usage responses carry the expanded dimensions payload (analytics-dimensions-breakdown §4); every other
+#: endpoint stays at ``SCHEMA_VERSION``.
+USAGE_SCHEMA_VERSION = 2
+DIMENSIONS = ("all", "profile", "model")
+ATTRIBUTION_SOURCES = ("session_provider", "billing_provider", "models_json", "unknown")
+SOURCE_STATES = ("ok", "absent", "unavailable", "excluded")
+USAGE_REASONS = ("no_observations", "source_unavailable")
+USAGE_METRICS = ("api_calls", "estimated_usd", "input_count", "output_count", "sessions")
+TOP_N_MODELS = 8
 
 # Fixed, safe public text. Upstream text never reaches a DTO.
 ERROR_MESSAGES = {
@@ -98,6 +107,9 @@ ERROR_VARIANTS = {
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_ROW_ID_RE = re.compile(r"^row_[0-9a-f]{64}$")
+_GROUP_ID_RE = re.compile(r'^(?:all|other|profile:\[(?:true|false),"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"\]'
+                          r'|model:null|model:"[\x21\x23-\x5b\x5d-\x7e]{1,128}")$')
 
 
 class DtoError(ValueError):
@@ -277,6 +289,112 @@ class Holder:
         if not isinstance(self.profile, str) or not _HOLDER_RE.match(self.profile):
             raise DtoError("holder.profile")
         _bool("is_global", self.is_global)
+
+
+@dataclass(frozen=True)
+class UsageMetrics:
+    """One aggregate of the baseline daily counters (``None`` = unavailable, never a computed zero)."""
+
+    input_count: Optional[int]
+    output_count: Optional[int]
+    estimated_usd: Optional[float]
+    sessions: Optional[int]
+    api_calls: Optional[int]
+    missing_fields: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for name in ("input_count", "output_count", "sessions", "api_calls"):
+            _integer(name, getattr(self, name))
+        _number("estimated_usd", self.estimated_usd, minimum=0)
+        fields_ = tuple(self.missing_fields)
+        if list(fields_) != sorted(set(fields_)) or any(f not in USAGE_METRICS for f in fields_):
+            raise DtoError("missing_fields")
+
+
+@dataclass(frozen=True)
+class ProvenanceRow:
+    """A daily aggregate for one ``(home, day, model, provider, attribution)``; never raw session content."""
+
+    id: str
+    day: str
+    profile: str
+    is_global: bool
+    source: str
+    model_id: Optional[str]
+    provider_id: str
+    attribution_source: str
+    metrics: UsageMetrics
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not _ROW_ID_RE.match(self.id):
+            raise DtoError("row.id")
+        if not isinstance(self.day, str) or not _DATE_RE.match(self.day):
+            raise DtoError("row.day")
+        Holder(self.profile, self.is_global)
+        _enum("row.source", self.source, ("state.db",))
+        _str("model_id", self.model_id, nullable=True, max_len=128)
+        _str("provider_id", self.provider_id, max_len=128)
+        if not self.provider_id:
+            raise DtoError("row.provider_id")
+        _enum("attribution_source", self.attribution_source, ATTRIBUTION_SOURCES)
+        if not isinstance(self.metrics, UsageMetrics):
+            raise DtoError("row.metrics")
+
+
+@dataclass(frozen=True)
+class UsageGroup:
+    id: str
+    label: str
+    series_id: str
+    model_id: Optional[str]
+    provider_ids: Tuple[str, ...]
+    profiles: Tuple[Holder, ...]
+    row_ids: Tuple[str, ...]
+    totals: UsageMetrics
+    is_other: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not _GROUP_ID_RE.match(self.id):
+            raise DtoError("group.id")
+        _str("label", self.label, max_len=512)
+        _str("series_id", self.series_id)
+        if self.series_id != self.id and self.series_id != "profile_session_analytics":
+            raise DtoError("group.series_id")
+        _str("model_id", self.model_id, nullable=True, max_len=128)
+        for seq in (self.provider_ids, self.row_ids):
+            if list(seq) != sorted(set(seq)) or not all(isinstance(s, str) and s for s in seq):
+                raise DtoError("group sets")
+        if not all(isinstance(h, Holder) for h in self.profiles) \
+                or list(self.profiles) != sorted(set(self.profiles), key=lambda h: (h.profile, h.is_global)):
+            raise DtoError("group.profiles")
+        if not isinstance(self.totals, UsageMetrics):
+            raise DtoError("group.totals")
+        _bool("is_other", self.is_other)
+        if self.is_other != (self.id == "other") or (self.is_other and self.model_id is not None):
+            raise DtoError("group.is_other")
+
+
+@dataclass(frozen=True)
+class SourceStatus:
+    profile: str
+    is_global: bool
+    state: str
+
+    def __post_init__(self) -> None:
+        Holder(self.profile, self.is_global)
+        _enum("state", self.state, SOURCE_STATES)
+
+
+@dataclass(frozen=True)
+class ProviderOption:
+    id: str
+    label: str
+
+    def __post_init__(self) -> None:
+        _str("id", self.id, max_len=128)
+        _str("label", self.label, max_len=128)
+        if not self.id or not self.label:
+            raise DtoError("provider option")
 
 
 @dataclass(frozen=True)
@@ -471,9 +589,9 @@ class UsageResult:
 # ---------------------------------------------------------------- envelope
 
 
-def build_meta(request_id: str, generated_at: str, errors: list) -> dict:
+def build_meta(request_id: str, generated_at: str, errors: list, schema_version: int = SCHEMA_VERSION) -> dict:
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": schema_version,
         "request_id": request_id,
         "generated_at": generated_at,
         "partial": bool(errors),
@@ -498,11 +616,15 @@ def failure_envelope(error: DeckError, meta: dict) -> dict:
 
 _WIRE_CLASSES = (
     DeckError, Period, UsageMeter, Holder, DebugInfo, SubscriptionCard, UsagePoint, UsageTimeSeries, HealthStripEntry,
+    UsageMetrics, ProvenanceRow, UsageGroup, SourceStatus, ProviderOption,
 )
 
 # Envelope (§3) and per-endpoint ``data`` keys that are not DTO fields.
 _ENVELOPE_KEYS = ("ok", "data", "error", "meta", "schema_version", "request_id", "generated_at", "partial", "errors")
-_DATA_KEYS = ("cards", "inventory_state", "view", "window_days", "provider_id", "series", "reason", "entries")
+_DATA_KEYS = ("cards", "inventory_state", "view", "window_days", "provider_id", "series", "reason", "entries",
+              "mode", "dimension", "groups", "rows", "totals", "providers", "sources", "complete", "top_n")
+USAGE_DATA_KEYS = frozenset(("window_days", "mode", "dimension", "provider_id", "series", "groups", "rows", "totals",
+                             "providers", "sources", "complete", "top_n", "reason"))
 
 #: Every field name the wire contract defines. Keys outside this set are not
 #: schema: the sanitizer scrubs them like any other string.
@@ -533,13 +655,13 @@ def _match(pattern):
 #: success-response value.
 WIRE_VALUE_RULES = {
     "confidence": _in(CONFIDENCE_LABELS),
-    "state": _in(CARD_STATES),
+    "state": _in(set(CARD_STATES) | set(SOURCE_STATES)),
     "reason": _in(REASONS),
     "code": _in(ERROR_CODES),
     "message": _in(set(ERROR_MESSAGES.values()) | {v[1] for v in ERROR_VARIANTS.values()}),
     "unit": _in(UNITS),
     "scope": _in(set(METER_SCOPES) | set(SERIES_SCOPES)),
-    "source": _in(METER_SOURCES),
+    "source": _in(set(METER_SOURCES) | {"state.db"}),
     "plan_source": _in(PLAN_SOURCES),
     "auth_status": _in(AUTH_STATUSES),
     "kind": _in(KINDS),
@@ -547,6 +669,9 @@ WIRE_VALUE_RULES = {
     "status": _in(HEALTH_STATUSES),
     "inventory_state": _in(("empty", "detected")),
     "view": _in(VIEWS),
+    "mode": _in(VIEWS),
+    "dimension": _in(DIMENSIONS),
+    "attribution_source": _in(ATTRIBUTION_SOURCES),
     "profile": _match(_HOLDER_RE),
     "bucket": _in(("day",)),
     "timezone": _in(("server_local",)),
@@ -656,29 +781,98 @@ def check_wire(kind: str, data: Any) -> Any:
     return data
 
 
+def _metrics_from_wire(data: Any) -> UsageMetrics:
+    data = _exact_keys("metrics", data, UsageMetrics)
+    if not isinstance(data["missing_fields"], list):
+        raise DtoError("metrics: expected list")
+    return UsageMetrics(**{**data, "missing_fields": tuple(data["missing_fields"])})
+
+
+def _row_from_wire(data: Any) -> ProvenanceRow:
+    data = _exact_keys("row", data, ProvenanceRow)
+    return ProvenanceRow(**{**data, "metrics": _metrics_from_wire(data["metrics"])})
+
+
+def _group_from_wire(data: Any) -> UsageGroup:
+    data = _exact_keys("group", data, UsageGroup)
+    if not all(isinstance(data[k], list) for k in ("provider_ids", "profiles", "row_ids")):
+        raise DtoError("group: expected lists")
+    return UsageGroup(**{
+        **data,
+        "provider_ids": tuple(data["provider_ids"]),
+        "profiles": tuple(_holder_from_wire(h) for h in data["profiles"]),
+        "row_ids": tuple(data["row_ids"]),
+        "totals": _metrics_from_wire(data["totals"]),
+    })
+
+
+def usage_from_wire(data: Any) -> dict:
+    """Validate (strictly, every key) an expanded usage ``data`` object and return its canonical rebuild."""
+    if not isinstance(data, dict) or frozenset(data) != USAGE_DATA_KEYS:
+        raise DtoError("usage: wire keys differ from schema")
+    _enum("window_days", data["window_days"], WINDOWS)
+    _enum("mode", data["mode"], VIEWS)
+    _enum("dimension", data["dimension"], DIMENSIONS)
+    _str("provider_id", data["provider_id"], nullable=True, max_len=128)
+    _enum("reason", data["reason"], USAGE_REASONS, nullable=True)
+    _bool("complete", data["complete"])
+    if data["top_n"] != (TOP_N_MODELS if data["dimension"] == "model" else None) or isinstance(data["top_n"], bool):
+        raise DtoError("top_n")
+    for name in ("series", "groups", "rows", "providers", "sources"):
+        if not isinstance(data[name], list):
+            raise DtoError(f"usage.{name}: expected list")
+    series = [to_plain(series_from_wire(s)) for s in data["series"]]
+    groups = [to_plain(_group_from_wire(g)) for g in data["groups"]]
+    rows = [to_plain(_row_from_wire(r)) for r in data["rows"]]
+    totals = to_plain(_metrics_from_wire(data["totals"]))
+    providers = [to_plain(ProviderOption(**_exact_keys("provider", p, ProviderOption))) for p in data["providers"]]
+    sources = [to_plain(SourceStatus(**_exact_keys("source", s, SourceStatus))) for s in data["sources"]]
+    if [g["series_id"] for g in groups] != [s["id"] for s in series]:
+        raise DtoError("usage: groups and series are not one-to-one")
+    row_ids = [r["id"] for r in rows]
+    if len(set(row_ids)) != len(row_ids):
+        raise DtoError("usage: duplicate row ids")
+    grouped = [rid for g in groups for rid in g["row_ids"]]
+    if sorted(grouped) != sorted(row_ids):
+        raise DtoError("usage: every row must belong to exactly one group")
+    out = {**data, "series": series, "groups": groups, "rows": rows, "totals": totals, "providers": providers,
+           "sources": sources}
+    if out != data:
+        raise DtoError("usage: wire dict does not round-trip")
+    return data
+
+
 _META_KEYS = ("schema_version", "request_id", "generated_at", "partial", "errors")
 _DATA_SHAPES = {
     frozenset(("cards", "inventory_state", "view")): "subscriptions",
-    frozenset(("window_days", "provider_id", "series", "reason")): "usage",
+    USAGE_DATA_KEYS: "usage",
     frozenset(("entries",)): "health",
 }
 
 
-def check_envelope(body: Any) -> Any:
+def check_envelope(body: Any, endpoint: Optional[str] = None) -> Any:
     """Assert ``body`` is exactly a §3 envelope with schema-exact ``data``.
 
     Used at the coordinator boundary *after* masking: if masking (or anything
     else) altered a key or produced an invalid enum/format, this raises
     ``DtoError`` and the caller answers with the existing ``internal_error``
-    model instead of a malformed 200. Returns ``body``.
+    model instead of a malformed 200. ``meta.schema_version`` is 2 for usage and
+    1 for every other endpoint; a failure envelope with no ``endpoint`` accepts either. Returns ``body``.
     """
     if not isinstance(body, dict) or sorted(body) != sorted(("ok", "data", "error", "meta")):
         raise DtoError("envelope: wire keys differ from schema")
     meta = body["meta"]
     if not isinstance(meta, dict) or sorted(meta) != sorted(_META_KEYS):
         raise DtoError("envelope.meta: wire keys differ from schema")
-    if meta["schema_version"] != SCHEMA_VERSION or not isinstance(meta["request_id"], str) \
-            or not _UUID_RE.match(meta["request_id"]):
+    data = body["data"]
+    if endpoint is not None:
+        expected = {USAGE_SCHEMA_VERSION} if endpoint == "usage" else {SCHEMA_VERSION}
+    elif body["ok"] is True and isinstance(data, dict):
+        expected = {USAGE_SCHEMA_VERSION} if frozenset(data) == USAGE_DATA_KEYS else {SCHEMA_VERSION}
+    else:
+        expected = {SCHEMA_VERSION, USAGE_SCHEMA_VERSION}
+    if type(meta["schema_version"]) is not int or meta["schema_version"] not in expected \
+            or not isinstance(meta["request_id"], str) or not _UUID_RE.match(meta["request_id"]):
         raise DtoError("envelope.meta: invalid")
     _ts("meta.generated_at", meta["generated_at"], nullable=False)
     _bool("meta.partial", meta["partial"])
@@ -712,11 +906,5 @@ def check_envelope(body: Any) -> Any:
         for entry in data["entries"]:
             check_wire("health", entry)
     else:
-        _enum("window_days", data["window_days"], WINDOWS)
-        _str("provider_id", data["provider_id"], nullable=True)
-        _enum("reason", data["reason"], REASONS, nullable=True)
-        if not isinstance(data["series"], list):
-            raise DtoError("series")
-        for series in data["series"]:
-            check_wire("series", series)
+        usage_from_wire(data)
     return body

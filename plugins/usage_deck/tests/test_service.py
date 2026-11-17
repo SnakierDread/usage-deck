@@ -156,7 +156,7 @@ class SubscriptionsTests(ServiceBase):
         self.assertEqual(len(cards), 4)
         self.assertTrue(all(c["provider_label"] != short and c["account_label"].startswith("Account") for c in cards))
         # Numeric values are not strings: safe counts survive scrubbing.
-        _, usage = self.call(svc, "usage")
+        _, usage = self.call(svc, "usage", [("mode", "profile")])  # profile mode keeps the baseline reader's numbers
         counts = [p for p in usage["data"]["series"][0]["points"] if p["input_count"] is not None]
         self.assertEqual([p["input_count"] for p in counts], [100, 0])
         self.assertEqual([p["output_count"] for p in counts], [50, 0])
@@ -317,10 +317,11 @@ class HealthTests(ServiceBase):
 class UsageTests(ServiceBase):
     def test_unfiltered_profile_series_once(self):
         self.seed_fleet()
-        status, body = self.call(self.make(), "usage", [("window", "7")])
+        status, body = self.call(self.make(), "usage", [("window", "7"), ("mode", "profile")])
         self.assertEqual(status, 200)
         data = body["data"]
         self.assertEqual((data["window_days"], data["provider_id"], data["reason"]), (7, None, None))
+        self.assertEqual((data["mode"], data["dimension"], body["meta"]["schema_version"]), ("profile", "all", 2))
         self.assertEqual(len(data["series"]), 1)  # never cloned per provider/account
         s = data["series"][0]
         self.assertEqual((s["scope"], s["confidence"], s["provider_id"], s["account_id"], s["timezone"]),
@@ -335,14 +336,15 @@ class UsageTests(ServiceBase):
         _, body = self.call(self.make(), "usage")
         self.assertEqual(body["data"]["window_days"], 30)
 
-    def test_filtered_by_known_provider_is_attribution_unavailable(self):
+    def test_inventory_providers_without_recorded_sessions_are_not_attributable(self):
+        # Provider options come from recorded sessions / the local catalog, never from the subscription
+        # inventory: a configured provider with no session records is an unknown filter (404), and the baseline
+        # analytics reader is never asked to fabricate a per-provider series.
         self.seed_fleet()
         for provider in ("openrouter", "mystery-cloud", "custom:gpu"):
             status, body = self.call(self.make(), "usage", [("provider", provider)])
-            self.assertEqual(status, 200)
-            self.assertEqual((body["data"]["series"], body["data"]["reason"], body["data"]["provider_id"]),
-                             ([], "attribution_unavailable", provider))
-        self.assertEqual(self.analytics.calls, [])  # no fake provider totals, no pointless read
+            self.assertEqual((status, body["error"]["code"]), (404, "provider_not_found"), provider)
+        self.assertEqual(self.analytics.calls, [])
 
     def test_unknown_provider_filter_is_404(self):
         self.seed_fleet()
@@ -351,14 +353,14 @@ class UsageTests(ServiceBase):
 
     def test_empty_analytics_is_no_observations(self):
         self.analytics.rows = ()
-        _, body = self.call(self.make(), "usage")
+        _, body = self.call(self.make(), "usage", [("mode", "profile")])
         self.assertEqual((body["data"]["series"][0]["points"], body["data"]["reason"]), ([], "no_observations"))
 
     def test_analytics_unavailable_is_503_only_for_usage(self):
         self.seed_fleet()
         self.analytics.fail = True
         svc = self.make()
-        status, body = self.call(svc, "usage")
+        status, body = self.call(svc, "usage", [("mode", "profile")])
         self.assertEqual((status, body["error"]["code"]), (503, "analytics_unavailable"))
         self.assertEqual(self.call(svc, "subscriptions")[0], 200)
         self.assertEqual(self.call(svc, "health")[0], 200)
@@ -375,6 +377,13 @@ class QueryValidationTests(ServiceBase):
             ("subscriptions", [("window", "7")]), ("subscriptions", [("provider", "x")]),
             ("health", [("foo", "bar")]), ("health", [("profile", "../x")]), ("health", [("profile", "a/b")]),
             ("subscriptions", [("profile", "a"), ("profile", "b")]), ("subscriptions", [("profile", "")]),
+            ("usage", [("mode", "everything")]), ("usage", [("mode", "")]), ("usage", [("mode", "Machine")]),
+            ("usage", [("dimension", "bogus")]), ("usage", [("dimension", "")]), ("usage", [("dimension", "ALL")]),
+            ("usage", [("dimension", "all"), ("dimension", "model")]),
+            ("usage", [("mode", "machine"), ("view", "profile")]),  # aliases must agree
+            ("usage", [("mode", "profile"), ("dimension", "profile")]),  # a single profile has no by-profile view
+            ("usage", [("view", "profile"), ("dimension", "profile")]),
+            ("subscriptions", [("mode", "machine")]), ("health", [("dimension", "all")]),  # usage-only parameters
         ]
         for endpoint, params in bad:
             status, body = self.call(svc, endpoint, params)
@@ -387,6 +396,11 @@ class QueryValidationTests(ServiceBase):
         q = parse_query("usage", [("provider", "custom:a b/c"), ("profile", "work"), ("window", "90")])
         self.assertEqual((q.provider, q.profile, q.window), ("custom:a b/c", "work", 90))
         self.assertEqual(parse_query("health", [("profile", "current")]).profile, "current")
+        q = parse_query("usage", [("mode", "profile"), ("view", "profile"), ("dimension", "model")])
+        self.assertEqual((q.view, q.dimension), ("profile", "model"))
+        self.assertEqual(parse_query("usage", [("view", "profile")]).view, "profile")  # compatibility alias
+        q = parse_query("usage", [])
+        self.assertEqual((q.view, q.dimension), ("machine", "all"))  # defaults
 
     def test_envelope_shape(self):
         status, body = self.call(self.make(), "health")

@@ -92,6 +92,9 @@ test("unwrapEnvelope enforces wire version and shape", () => {
   for (const bad of [null, [], { ok: true }, { ok: true, data: {}, meta: { schema_version: 2 } }, { ok: true, data: [], meta: { schema_version: 1 } }, { ok: false }]) {
     assert.throws(() => mod.unwrapEnvelope(bad), (e) => e.uiError && e.uiError.kind === "malformed");
   }
+  // usage speaks wire version 2; the legacy version is rejected for it, and v2 is rejected for everything else
+  assert.deepEqual(mod.unwrapEnvelope({ ok: true, data: { a: 1 }, error: null, meta: { schema_version: 2 } }, 2).data, { a: 1 });
+  assert.throws(() => mod.unwrapEnvelope({ ok: true, data: { a: 1 }, error: null, meta: { schema_version: 1 } }, 2), (e) => e.uiError.kind === "malformed");
   assert.throws(() => mod.unwrapEnvelope({ ok: false, error: { code: "timeout", message: "t", retryable: true } }),
     (e) => e.uiError.kind === "deck" && e.uiError.code === "timeout");
 });

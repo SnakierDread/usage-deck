@@ -31,6 +31,14 @@ DEBUG_KEYS = {"adapter", "capabilities", "source", "sanitized"}
 POINT_KEYS = {"day", "input_count", "output_count", "estimated_usd", "sessions", "api_calls", "confidence"}
 SERIES_KEYS = {"id", "provider_id", "account_id", "scope", "confidence", "source", "period", "window_days",
                "bucket", "timezone", "coverage", "points", "checked_at", "stale", "error"}
+# Usage v2 (analytics-dimensions-breakdown §4): exact key sets, deliberately independent of dto.py.
+USAGE_KEYS = {"window_days", "mode", "dimension", "provider_id", "series", "groups", "rows", "totals", "providers",
+              "sources", "complete", "top_n", "reason"}
+METRICS_KEYS = {"input_count", "output_count", "estimated_usd", "sessions", "api_calls", "missing_fields"}
+ROW_KEYS = {"id", "day", "profile", "is_global", "source", "model_id", "provider_id", "attribution_source", "metrics"}
+GROUP_KEYS = {"id", "label", "series_id", "model_id", "provider_ids", "profiles", "row_ids", "totals", "is_other"}
+SOURCE_KEYS = {"profile", "is_global", "state"}
+PROVIDER_KEYS = {"id", "label"}
 HEALTH_KEYS = {"endpoint_id", "provider_id", "display_name", "status", "confidence", "metrics_available",
                "latency_ms", "cpu_percent", "memory_bytes", "checked_at", "stale", "reason", "error"}
 META_KEYS = {"schema_version", "request_id", "generated_at", "partial", "errors"}
@@ -43,7 +51,7 @@ ENUMS = {
     "plan_source": {"unverified_claim", "provider", "none"},
     "auth_status": {"available", "missing", "rejected"},
     "unit": {"usd", "count", "percent", "bytes", "credit"},
-    "scope": {"api_credential", "provider_account", "endpoint", "profile", "provider", "account"},
+    "scope": {"api_credential", "provider_account", "endpoint", "profile", "provider", "account", "machine"},
     "source": {"openrouter_key", "session_analytics", "prometheus", "anthropic_headers", "anthropic_oauth_usage",
                 "chatgpt_wham_usage", "none"},
     "view": {"machine", "profile"},
@@ -123,10 +131,43 @@ class SchemaAsserts(unittest.TestCase):
         self.assertRegex(s["period"]["label"], r"^rolling_(7|30|90)d$")
         check_wire("series", s)
 
+    def assert_exact_metrics(self, m):
+        self.assertEqual(set(m), METRICS_KEYS)
+        for k in ("input_count", "output_count", "sessions", "api_calls"):
+            self.assertTrue(m[k] is None or (type(m[k]) is int and m[k] >= 0), k)
+        self.assertTrue(m["estimated_usd"] is None or (isinstance(m["estimated_usd"], (int, float)) and m["estimated_usd"] >= 0))
+        self.assertEqual(m["missing_fields"], sorted(set(m["missing_fields"])))
+        self.assertTrue(set(m["missing_fields"]) <= {"input_count", "output_count", "estimated_usd", "sessions", "api_calls"})
+
+    def assert_exact_usage_objects(self, data):
+        self.assert_exact_metrics(data["totals"])
+        for r in data["rows"]:
+            self.assertEqual(set(r), ROW_KEYS)
+            self.assertRegex(r["id"], r"^row_[0-9a-f]{64}$")
+            self.assertEqual(r["source"], "state.db")
+            self.assertIn(r["attribution_source"], ("session_provider", "billing_provider", "models_json", "unknown"))
+            self.assertIsInstance(r["is_global"], bool)
+            self.assert_exact_metrics(r["metrics"])
+        for g in data["groups"]:
+            self.assertEqual(set(g), GROUP_KEYS)
+            self.assertIsInstance(g["is_other"], bool)
+            for h in g["profiles"]:
+                self.assertEqual(set(h), HOLDER_KEYS)
+            self.assert_exact_metrics(g["totals"])
+        for o in data["providers"]:
+            self.assertEqual(set(o), PROVIDER_KEYS)
+        for src in data["sources"]:
+            self.assertEqual(set(src), SOURCE_KEYS)
+            self.assertIn(src["state"], ("ok", "absent", "unavailable", "excluded"))
+        self.assertEqual([g["series_id"] for g in data["groups"]], [s["id"] for s in data["series"]])
+        grouped = sorted(rid for g in data["groups"] for rid in g["row_ids"])
+        self.assertEqual(grouped, sorted(r["id"] for r in data["rows"]))  # every row in exactly one group
+
     def assert_exact_envelope(self, endpoint, status, body):
         self.assertEqual(status, 200, body)
         self.assertEqual(set(body), {"ok", "data", "error", "meta"})
         self.assertEqual(set(body["meta"]), META_KEYS)
+        self.assertEqual(body["meta"]["schema_version"], 2 if endpoint == "usage" else 1)  # usage only is v2
         self.assertRegex(body["meta"]["generated_at"], ISO_Z)
         self.assertRegex(body["meta"]["request_id"], r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
         data = body["data"]
@@ -141,11 +182,16 @@ class SchemaAsserts(unittest.TestCase):
             for h in data["entries"]:
                 self.assert_exact_health(h)
         else:
-            self.assertEqual(set(data), {"window_days", "provider_id", "series", "reason"})
+            self.assertEqual(set(data), USAGE_KEYS)
             self.assertIn(data["window_days"], (7, 30, 90))
-            self.assertIn(data["reason"], ENUMS["reason"])
+            self.assertIn(data["reason"], (None, "no_observations", "source_unavailable"))
+            self.assertIn(data["mode"], ENUMS["view"])
+            self.assertIn(data["dimension"], ("all", "profile", "model"))
+            self.assertIsInstance(data["complete"], bool)
+            self.assertEqual(data["top_n"], 8 if data["dimension"] == "model" else None)
             for s in data["series"]:
                 self.assert_exact_series(s)
+            self.assert_exact_usage_objects(data)
         check_envelope(body)
 
 
@@ -178,7 +224,8 @@ class SanitizeSchemaTests(unittest.TestCase):
 
     def test_wire_keys_cover_contract_and_none_are_sensitive(self):
         contract = (CARD_KEYS | METER_KEYS | PERIOD_KEYS | ERROR_KEYS | DEBUG_KEYS | POINT_KEYS | SERIES_KEYS
-                    | HEALTH_KEYS | META_KEYS | HOLDER_KEYS
+                    | HEALTH_KEYS | META_KEYS | HOLDER_KEYS | METRICS_KEYS | ROW_KEYS | GROUP_KEYS | SOURCE_KEYS
+                    | PROVIDER_KEYS | USAGE_KEYS
                     | {"ok", "data", "error", "meta", "cards", "inventory_state", "view",
                        "entries", "window_days", "series", "reason", "provider_id"})
         self.assertEqual(set(dto.WIRE_KEYS), contract)
@@ -295,7 +342,7 @@ class ServiceSchemaTests(ServiceBase, SchemaAsserts):
             control_pairs = [(p, k, v) for p, k, v in walk(c_body["data"]) if k in enum_keys and p[-1:] != ("debug",)]
             self.assertEqual(masked_pairs, control_pairs, (secret, endpoint))
             # Numeric values survive.
-            if endpoint == "usage":
+            if endpoint == "usage" and self.VIEW == "profile":  # profile mode serves the baseline reader's numbers
                 self.assertEqual([p["input_count"] for p in body["data"]["series"][0]["points"]], [100, 0])
         return masked
 

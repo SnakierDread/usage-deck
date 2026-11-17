@@ -27,7 +27,7 @@ test("renders all three zones from the namespaced API and never shows a credenti
   const m = await mount({ routes: routesFor() });
   assert.deepEqual(m.$$("[data-zone]").map((z) => z.dataset.zone), ["subscriptions", "usage", "health"]);
   assert.ok(m.calls.includes(B + "/subscriptions?view=machine"));
-  assert.ok(m.calls.includes(B + "/usage?window=30&view=machine"));
+  assert.ok(m.calls.includes(B + "/usage?mode=machine&dimension=all&window=30"));
   assert.ok(m.calls.includes(B + "/health?view=machine"));
   assert.ok(m.calls.every((u) => u.startsWith("/api/plugins/usage-deck/")), "only the ratified namespace");
   assert.equal(m.$$("input, textarea, [type=password]").length, 0, "no credential wall");
@@ -278,8 +278,8 @@ test("window picker refetches; out-of-order completion keeps the latest selectio
   assert.equal(btn(30).getAttribute("aria-pressed"), "true");
   await m.click(btn(7));
   await m.click(btn(90));
-  assert.ok(m.calls.includes(B + "/usage?window=7&view=machine"));
-  assert.ok(m.calls.includes(B + "/usage?window=90&view=machine"));
+  assert.ok(m.calls.includes(B + "/usage?mode=machine&dimension=all&window=7"));
+  assert.ok(m.calls.includes(B + "/usage?mode=machine&dimension=all&window=90"));
   // 90 answers first, then the stale 7 arrives late
   await act(async () => { pending[90].resolve(envelope(F.usage(90, [F.point("2026-08-01"), F.point("2026-08-02")]))); });
   await act(async () => { pending[7].resolve(envelope(F.usage(7, [F.point("2026-11-05")]))); });
@@ -299,7 +299,7 @@ test("window response for a different window is rejected as malformed", async ()
 test("profile-wide chart: honest subtitle, badge, separate token and USD charts, gaps not bridged", async () => {
   const m = await mount({ routes: routesFor() });
   const z = m.$("[data-zone=usage]");
-  assert.match(z.textContent, /This Hermes profile only — not subscription allowance\./);
+  assert.match(z.textContent, /All local profile session records — not subscription allowance\./);
   assert.equal(z.querySelector(".ud-series .ud-badge").dataset.confidence, "estimated");
   const charts = z.querySelectorAll("figure.ud-chart");
   assert.deepEqual([...charts].map((c) => c.dataset.chart), ["Tokens (count)", "Estimated spend (USD)"]);
@@ -498,7 +498,7 @@ test("manual Refresh re-requests all three zones and explains the cache", async 
   await m.click(btn);
   await m.flush(5);
   const added = m.calls.slice(before);
-  assert.deepEqual(added.sort(), [B + "/health?view=machine", B + "/subscriptions?view=machine", B + "/usage?window=30&view=machine"].sort());
+  assert.deepEqual(added.sort(), [B + "/health?view=machine", B + "/subscriptions?view=machine", B + "/usage?mode=machine&dimension=all&window=30"].sort());
   await m.unmount();
 });
 

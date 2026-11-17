@@ -17,6 +17,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .adapters import create_adapter
@@ -24,11 +25,39 @@ from .adapters.analytics import HostAnalyticsReader, MemoAnalyticsReader
 from .adapters.base import AdapterContext, AnalyticsReader, EndpointCache
 from .adapters.cloud import ANTHROPIC_PROVIDER_ID, ANTHROPIC_TARGET, CODEX_PROVIDER_ID, CODEX_TARGET, OPENROUTER_TARGET
 from .adapters.credentials import default_resolver
+from .adapters import dimensions as dims
 from .adapters.fallback import SessionAnalyticsAdapter
+from .adapters.session_db import (
+    STATE_ABSENT,
+    STATE_EXCLUDED,
+    STATE_OK,
+    STATE_UNAVAILABLE,
+    UNKNOWN,
+    HomeRead,
+    Metrics,
+    SessionDbReader,
+    catalog_identity,
+    normalize_provider,
+    sum_known as _known_sum,
+    sum_metrics,
+)
 from .adapters.transport import AllowedTarget, CrossProfileProbeTransport, GuardedTransport, UrllibTransport
 from .captures import CaptureStore
-from .discovery import InventoryItem, InventoryUnavailable, discover, discover_machine, host_inventory_source
+from .discovery import (
+    GLOBAL_PROFILE,
+    InventoryItem,
+    InventoryUnavailable,
+    discover,
+    discover_machine,
+    home_candidates,
+    home_rejects,
+    host_inventory_source,
+    provider_label_for,
+)
 from .models.dto import (
+    DIMENSIONS,
+    TOP_N_MODELS,
+    USAGE_SCHEMA_VERSION,
     DebugInfo,
     DeckError,
     HealthStripEntry,
@@ -53,10 +82,11 @@ REFRESH_DEADLINE_S = 8.0
 DEFAULT_WINDOW = 30
 DEFAULT_VIEW = "machine"
 VIEWS = ("machine", "profile")
+DEFAULT_DIMENSION = "all"
 _ALLOWED_PARAMS = {
     "subscriptions": {"profile", "view"},
     "health": {"profile", "view"},
-    "usage": {"profile", "window", "provider", "view"},
+    "usage": {"profile", "window", "provider", "view", "mode", "dimension"},
 }
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
@@ -76,7 +106,9 @@ class Query:
     window: int = DEFAULT_WINDOW
     provider: Optional[str] = None
     profile: Optional[str] = None
+    #: Home scope. For ``usage`` this is the ``mode`` parameter (``view`` is its compatibility alias).
     view: str = DEFAULT_VIEW
+    dimension: str = DEFAULT_DIMENSION
 
 
 def parse_query(endpoint: str, items: List[Tuple[str, str]]) -> Query:
@@ -104,11 +136,22 @@ def parse_query(endpoint: str, items: List[Tuple[str, str]]) -> Query:
             raise ApiError(400, "invalid_query")
         profile = value
     view = DEFAULT_VIEW
-    if "view" in seen:
-        if seen["view"] not in VIEWS:
-            raise ApiError(400, "invalid_query")
+    for name in ("view", "mode"):  # ``mode`` is the usage-only name; ``view`` stays its alias
+        if name in seen:
+            if seen[name] not in VIEWS:
+                raise ApiError(400, "invalid_query")
+    if "view" in seen and "mode" in seen and seen["view"] != seen["mode"]:
+        raise ApiError(400, "invalid_query")
+    if "mode" in seen:
+        view = seen["mode"]
+    elif "view" in seen:
         view = seen["view"]
-    return Query(window, provider, profile, view)
+    dimension = DEFAULT_DIMENSION
+    if "dimension" in seen:
+        if seen["dimension"] not in DIMENSIONS:
+            raise ApiError(400, "invalid_query")
+        dimension = seen["dimension"]
+    return Query(window, provider, profile, view, dimension)
 
 
 # ---------------------------------------------------------------- snapshot
@@ -152,8 +195,11 @@ class UsageDeckService:
         max_workers: int = MAX_WORKERS,
         deadline: float = REFRESH_DEADLINE_S,
         token_resolver: Any = None,
+        session_reader_factory: Optional[Callable[[], SessionDbReader]] = None,
     ):
         self._inventory_factory = inventory_factory or host_inventory_source
+        # Read-only state.db reader for the dimensions payload (tests inject one with a SQL trace).
+        self._session_reader_factory = session_reader_factory or SessionDbReader
         # §9.1.1: the Anthropic bearer is resolved through core's credential pool (refreshing an expiring row);
         # one resolver per service so its failure backoff outlives a single snapshot.
         self._token_resolver = token_resolver if token_resolver is not None else default_resolver()
@@ -174,7 +220,7 @@ class UsageDeckService:
         return self._guarded(lambda: self._subscriptions(query))
 
     def usage(self, query: Query) -> Tuple[int, dict]:
-        return self._guarded(lambda: self._usage(query))
+        return self._guarded(lambda: self._usage(query), "usage")
 
     def health(self, query: Query) -> Tuple[int, dict]:
         return self._guarded(lambda: self._health(query))
@@ -184,37 +230,41 @@ class UsageDeckService:
 
         ``profile_only`` is set by the router for a profile-restricted host principal (DESIGN.md §12.5): the
         machine view is a full-trust machine-owner inventory, so such a principal is clamped to the profile
-        view whatever ``view=`` says (a query string can never widen authorization).
+        view whatever ``view=``/``mode=`` says (a query string can never widen authorization); a by-profile
+        dimension is then normalised to All. The clamp runs before any home is discovered.
         """
         try:
             query = parse_query(endpoint, items)
         except ApiError as exc:
-            return self._fail(exc.status, exc.error)
+            return self._fail(exc.status, exc.error, endpoint)
         if profile_only and query.view != "profile":
-            query = replace(query, view="profile")
+            query = replace(query, view="profile", dimension="all" if query.dimension == "profile" else query.dimension)
+        elif endpoint == "usage" and query.view == "profile" and query.dimension == "profile":
+            return self._fail(400, make_error("invalid_query"), endpoint)  # a single profile has no by-profile view
         return getattr(self, endpoint)(query)
 
     # -- envelope helpers ------------------------------------------------
-    def _meta(self, errors: List[dict]) -> dict:
-        return build_meta(str(uuid.uuid4()), fmt_ts(self._clock()), errors)
+    def _meta(self, errors: List[dict], schema_version: int = 1) -> dict:
+        return build_meta(str(uuid.uuid4()), fmt_ts(self._clock()), errors, schema_version)
 
-    def _ok(self, data: dict, errors: List[dict]) -> Tuple[int, dict]:
+    def _ok(self, data: dict, errors: List[dict], schema_version: int = 1) -> Tuple[int, dict]:
         # Masking must never change the wire shape; if it would, fail via internal_error (500).
-        return 200, check_envelope(sanitize(success_envelope(data, self._meta(errors))))
+        return 200, check_envelope(sanitize(success_envelope(data, self._meta(errors, schema_version))))
 
-    def _fail(self, status: int, error: DeckError) -> Tuple[int, dict]:
-        return status, sanitize(failure_envelope(error, self._meta([])))
+    def _fail(self, status: int, error: DeckError, endpoint: Optional[str] = None) -> Tuple[int, dict]:
+        version = USAGE_SCHEMA_VERSION if endpoint == "usage" else 1
+        return status, sanitize(failure_envelope(error, self._meta([], version)))
 
-    def _guarded(self, fn: Callable[[], Tuple[int, dict]]) -> Tuple[int, dict]:
+    def _guarded(self, fn: Callable[[], Tuple[int, dict]], endpoint: Optional[str] = None) -> Tuple[int, dict]:
         try:
             return fn()
         except ApiError as exc:
-            return self._fail(exc.status, exc.error)
+            return self._fail(exc.status, exc.error, endpoint)
         except InventoryUnavailable:
-            return self._fail(503, make_error("inventory_unavailable"))
+            return self._fail(503, make_error("inventory_unavailable"), endpoint)
         except Exception as exc:  # noqa: BLE001 - invariant failure at the coordinator boundary
             log.error("usage_deck internal error: %s", type(exc).__name__)
-            return self._fail(500, make_error("internal_error"))
+            return self._fail(500, make_error("internal_error"), endpoint)
 
     # -- cache -----------------------------------------------------------
     def _cached(self, key: tuple, compute: Callable[[], Any]) -> Any:
@@ -246,26 +296,117 @@ class UsageDeckService:
         return self._ok({"entries": snap.health}, errors)
 
     def _usage(self, query: Query) -> Tuple[int, dict]:
-        if query.provider is not None:
-            source = self._inventory_factory()
-            items = discover_machine(source) if _effective_view(source, query) == "machine" else discover(source)
-            if not any(item.provider_id == query.provider for item in items):
-                raise ApiError(404, "provider_not_found")
-            # Session analytics has no provider/account attribution: never clone profile totals.
-            data = {"window_days": query.window, "provider_id": query.provider,
-                    "series": [], "reason": "attribution_unavailable"}
-            return self._ok(data, [])
         source = self._inventory_factory()
-        key = (self._source_key(source), query.profile or "", "usage", query.window)
-        series = self._cached(key, lambda: self._read_series(query))
-        if series is None:
-            raise ApiError(503, "analytics_unavailable")
-        data = {"window_days": query.window, "provider_id": None, "series": [series],
-                "reason": None if series["points"] else "no_observations"}
-        return self._ok(data, [])
+        mode = _effective_view(source, query)
+        if mode == "machine" and not callable(getattr(source, "root_dir", None)):
+            mode = "profile"
+        dimension = query.dimension if (mode == "machine" or query.dimension != "profile") else "all"
+        homes, truncated, rejected = self._scope_homes(source, query, mode)
+        catalog = tuple((name, is_global, catalog_identity(directory)) for name, is_global, directory in homes)
+        key = (self._source_key(source), query.profile or "", "usage", mode, dimension, query.window, query.provider,
+               catalog, truncated, tuple(rejected[0]), rejected[1])
+        data, errors = self._cached(key, lambda: self._compute_usage(query, mode, dimension, homes, truncated, rejected))
+        return self._ok(data, errors, USAGE_SCHEMA_VERSION)
 
-    def _read_series(self, query: Query) -> Optional[dict]:
-        now = self._clock()
+    @staticmethod
+    def _scope_homes(source: Any, query: Query, mode: str):
+        """``(homes, truncated, (rejected symlink names, parent symlink))`` of the analytics scope.
+
+        Machine: every home under the request-scoped root (the same enumeration the inventory uses). Profile:
+        exactly the selected home and nothing else."""
+        root_of = getattr(source, "root_dir", None)
+        if mode == "machine":
+            root = Path(root_of())
+            homes, truncated = home_candidates(root)
+            return homes, truncated, home_rejects(root)
+        home_of = getattr(source, "home_dir", None)
+        name_of = getattr(source, "profile_name", None)
+        if query.profile is None or query.profile.lower() == "current":
+            if not callable(home_of) or not callable(name_of):
+                return [], False, ([], False)
+            name, is_global = name_of()
+            return [(name, is_global, Path(home_of()))], False, ([], False)
+        root = Path(root_of()) if callable(root_of) else None
+        if root is None:
+            return [], False, ([], False)
+        if query.profile.lower() == "default":
+            return [(GLOBAL_PROFILE, True, root)], False, ([], False)
+        return [(query.profile, False, root / "profiles" / query.profile)], False, ([], False)
+
+    def _compute_usage(self, query: Query, mode: str, dimension: str, homes: list, truncated: bool,
+                       rejected: tuple) -> Tuple[dict, List[dict]]:
+        now = self._clock()  # one frozen clock for every DB, group and timestamp of this response
+        cutoff = now.timestamp() - query.window * 86400
+        reads = self._session_reader_factory().read_homes(homes, cutoff)
+        states = [r.state for r in reads]
+        sources = [(r.profile, r.is_global, r.state) for r in reads]
+        sources += [(name, False, STATE_EXCLUDED) for name in rejected[0]]
+        sources.sort(key=lambda s: (not s[1], s[0]))
+        incomplete = truncated or rejected[1] or any(s[2] in (STATE_UNAVAILABLE, STATE_EXCLUDED) for s in sources)
+
+        override = None
+        if mode == "profile" and dimension == "all" and query.provider is None:
+            # Profile-All keeps its exact baseline numbers: the host analytics reader and the shared
+            # profile-series arithmetic stay the source of truth for the series and its totals.
+            series = self._read_series(query, now)
+            if series is None:
+                raise ApiError(503, "analytics_unavailable")
+            override = series
+        elif mode == "profile":
+            if any(s in (STATE_UNAVAILABLE, STATE_EXCLUDED) for s in states) or not reads:
+                raise ApiError(503, "analytics_unavailable")  # the selected profile's store must be readable
+        elif not any(s == STATE_OK for s in states) and any(
+                s[2] in (STATE_UNAVAILABLE, STATE_EXCLUDED) for s in sources):
+            raise ApiError(503, "analytics_unavailable")  # nothing readable and something broken
+
+        def label_of(provider_id: str) -> str:
+            return "Unknown" if provider_id == UNKNOWN else provider_label_for(provider_id, frozenset())
+
+        rows_all = dims.observation_rows(reads)
+        wanted = None
+        if query.provider is not None:
+            wanted, bad = normalize_provider(query.provider)
+            if bad or wanted is None or wanted not in dims.known_provider_ids(rows_all, reads):
+                raise ApiError(404, "provider_not_found")
+        rows = dims.filter_rows(rows_all, wanted)
+        row_metrics = sum_metrics(r.metrics for r in rows)
+        override_all = None
+        if override is not None:
+            points = override.points
+            totals = Metrics(
+                input_count=_known_sum(p.input_count for p in points),
+                output_count=_known_sum(p.output_count for p in points),
+                estimated_usd=_known_sum(p.estimated_usd for p in points),
+                sessions=_known_sum(p.sessions for p in points),
+                api_calls=_known_sum(p.api_calls for p in points),
+                missing=row_metrics.missing)
+            override_all = (override, totals)
+        else:
+            totals = row_metrics
+        part = dims.partition(rows, dimension, mode, query.window, now, wanted, label_of, override_all)
+        has_data = bool(override.points) if override is not None else bool(rows)
+        reason = "source_unavailable" if incomplete else (None if has_data else "no_observations")
+        data = {
+            "window_days": query.window,
+            "mode": mode,
+            "dimension": dimension,
+            "provider_id": wanted,
+            "series": [to_plain(s) for s in part.series],
+            "groups": [to_plain(g) for g in part.groups],
+            "rows": [to_plain(dims.row_dto(r)) for r in rows],
+            "totals": to_plain(dims.metrics_dto(totals)),
+            "providers": [{"id": pid, "label": label} for pid, label
+                          in dims.provider_options(rows_all, reads, wanted, label_of)],
+            "sources": [{"profile": n, "is_global": g, "state": s} for n, g, s in sources],
+            "complete": not incomplete,
+            "top_n": TOP_N_MODELS if dimension == "model" else None,
+            "reason": reason,
+        }
+        errors = [to_plain(make_error("analytics_unavailable"))] if incomplete else []
+        return data, errors
+
+    def _read_series(self, query: Query, now: Optional[datetime] = None) -> Optional[Any]:
+        now = now or self._clock()
         reader = self._analytics_factory(query.profile)
         ctx = AdapterContext(
             provider_id="profile", account_id="profile", provider_label="Profile", account_label="Profile",
@@ -275,7 +416,7 @@ class UsageDeckService:
         result = SessionAnalyticsAdapter(ctx).get_usage(query.window)
         if result.error is not None or not result.series:
             return None
-        return check_wire("series", sanitize(to_plain(result.series[0])))
+        return result.series[0]
 
     @staticmethod
     def _source_key(source: Any) -> str:

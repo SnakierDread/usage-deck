@@ -27,9 +27,10 @@ function deferred() {
 }
 
 function envelope(data, extra) {
+  const usage = !!data && Array.isArray(data.groups); // the usage payload is wire version 2
   return Object.assign({
     ok: true, data, error: null,
-    meta: { schema_version: 1, request_id: "r", generated_at: "2026-11-06T00:00:00Z", partial: false, errors: [] },
+    meta: { schema_version: usage ? 2 : 1, request_id: "r", generated_at: "2026-11-06T00:00:00Z", partial: false, errors: [] },
   }, extra || {});
 }
 

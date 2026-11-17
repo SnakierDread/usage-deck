@@ -52,9 +52,21 @@ function series(points, over) {
     points, checked_at: T, stale: false, error: null,
   }, over);
 }
+function metrics(over) {
+  return Object.assign({ input_count: null, output_count: null, estimated_usd: null, sessions: null, api_calls: null, missing_fields: [] }, over);
+}
+function sumKnown(points, field) {
+  const known = points.map((p) => p[field]).filter((v) => v !== null && v !== undefined);
+  return known.length ? known.reduce((a, b) => a + b, 0) : null;
+}
+// Usage payload v2 (analytics-dimensions-breakdown §4): machine / All by default, one group, no provenance rows.
 function usage(windowDays, points, over) {
-  return Object.assign({ window_days: windowDays, provider_id: null,
-    series: [series(points, { window_days: windowDays })], reason: null }, over);
+  const s = series(points, { window_days: windowDays, id: "all", scope: "machine" });
+  const totals = metrics({ input_count: sumKnown(points, "input_count"), output_count: sumKnown(points, "output_count"),
+    estimated_usd: sumKnown(points, "estimated_usd"), sessions: sumKnown(points, "sessions"), api_calls: sumKnown(points, "api_calls") });
+  return Object.assign({ window_days: windowDays, mode: "machine", dimension: "all", provider_id: null, series: [s],
+    groups: [{ id: "all", label: "All", series_id: "all", model_id: null, provider_ids: [], profiles: [], row_ids: [], totals, is_other: false }],
+    rows: [], totals, providers: [], sources: [{ profile: "global", is_global: true, state: "ok" }], complete: true, top_n: null, reason: null }, over);
 }
 function healthEntry(over) {
   return Object.assign({
@@ -64,4 +76,4 @@ function healthEntry(over) {
   }, over);
 }
 
-module.exports = { T, card, meter, point, series, usage, healthEntry, readyOpenRouter, opaqueNous, errorAnthropic, selfHosted, PERIOD_UNKNOWN };
+module.exports = { T, card, meter, point, series, usage, metrics, healthEntry, readyOpenRouter, opaqueNous, errorAnthropic, selfHosted, PERIOD_UNKNOWN };

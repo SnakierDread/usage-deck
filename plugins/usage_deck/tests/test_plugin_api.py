@@ -112,8 +112,13 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(r.json()["error"]["code"], "invalid_query")
         r = self.client.get(f"{API_BASE}/usage?provider=nope")
         self.assertEqual((r.status_code, r.json()["error"]["code"]), (404, "provider_not_found"))
+        # a configured provider with no recorded sessions is not an attributable historical provider
         r = self.client.get(f"{API_BASE}/usage?provider=openrouter")
-        self.assertEqual(r.json()["data"]["reason"], "attribution_unavailable")
+        self.assertEqual((r.status_code, r.json()["error"]["code"]), (404, "provider_not_found"))
+        for bad in ("mode=bogus", "dimension=bogus", "mode=machine&view=profile", "mode=profile&dimension=profile"):
+            r = self.client.get(f"{API_BASE}/usage?{bad}")
+            self.assertEqual((r.status_code, r.json()["error"]["code"]), (400, "invalid_query"), bad)
+            self.assertEqual(r.json()["meta"]["schema_version"], 2, bad)  # usage failures are v2 too
 
     def test_post_not_allowed(self):
         self.assertEqual(self.client.post(f"{API_BASE}/subscriptions").status_code, 405)
@@ -198,7 +203,7 @@ class HostScratchHomeTests(unittest.TestCase):
         service = UsageDeckService(transport=FakeTransport(), clock=lambda: NOW)
         app = FastAPI()
         app.include_router(plugin_api.create_router(service), prefix=API_BASE)
-        r = TestClient(app).get(f"{API_BASE}/usage?window=7")
+        r = TestClient(app).get(f"{API_BASE}/usage?window=7&mode=profile")
         self.assertEqual(r.status_code, 200, r.text)
         series = r.json()["data"]["series"]
         self.assertEqual(len(series), 1)
@@ -211,7 +216,7 @@ class HostScratchHomeTests(unittest.TestCase):
         service2 = UsageDeckService(transport=FakeTransport(), clock=lambda: NOW)
         app2 = FastAPI()
         app2.include_router(plugin_api.create_router(service2), prefix=API_BASE)
-        r2 = TestClient(app2).get(f"{API_BASE}/usage?window=7")
+        r2 = TestClient(app2).get(f"{API_BASE}/usage?window=7&mode=profile")
         self.assertEqual((r2.status_code, r2.json()["error"]["code"]), (503, "analytics_unavailable"))
 
     def test_host_sources_through_router(self):

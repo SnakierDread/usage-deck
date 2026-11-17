@@ -311,10 +311,11 @@ class MachineViaService(MachineBase, SchemaAsserts):
         self.s.write_profile("verifier", pool("nous", {"id": "n1", "access_token": "n-token"}))
         self.s.write_auth({"credential_pool": {}})
         svc = self.make()
-        status, body = svc.handle("usage", [("provider", "nous")])
-        self.assertEqual((status, body["data"]["reason"]), (200, "attribution_unavailable"))
-        status, body = svc.handle("usage", [("provider", "nous"), ("view", "profile")])
-        self.assertEqual((status, body["error"]["code"]), (404, "provider_not_found"))
+        # the provider filter validates against recorded sessions / the local catalog of the selected scope,
+        # never against another home's subscription inventory
+        for query in ([("provider", "nous")], [("provider", "nous"), ("view", "profile")]):
+            status, body = svc.handle("usage", query)
+            self.assertEqual((status, body["error"]["code"]), (404, "provider_not_found"))
 
     def test_no_secret_anywhere_in_machine_responses(self):
         self.seed_machine()

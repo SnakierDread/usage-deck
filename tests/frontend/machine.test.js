@@ -75,7 +75,7 @@ test("profile toggle re-requests with view=profile, drops machine data and holde
   await m.flush(5);
   assert.ok(m.calls.includes(B + "/subscriptions?view=profile"));
   assert.ok(m.calls.includes(B + "/health?view=profile"));
-  assert.ok(m.calls.includes(B + "/usage?window=30&view=profile"));
+  assert.ok(m.calls.includes(B + "/usage?mode=profile&dimension=all&window=30"));
   assert.equal(m.$("[data-view=profile]").getAttribute("aria-pressed"), "true");
   assert.equal(m.$("[data-card-id=acct_go]"), null, "machine data never shown under the profile key");
   assert.ok(m.$("[data-card-id=acct_or]"));

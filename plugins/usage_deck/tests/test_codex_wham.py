@@ -738,7 +738,8 @@ class CodexService(ServiceBase, SchemaAsserts):
             self.assertEqual(status, 200, body)
         self.assertEqual(self.transport.urls(), [CODEX_USAGE_URL])  # cards + health share one snapshot; usage reads analytics only
         status, body = svc.handle("usage", [("provider", "openai-codex"), ("view", "profile")])
-        self.assertEqual((status, body["data"]["series"], body["data"]["reason"]), (200, [], "attribution_unavailable"))
+        # no recorded sessions attribute to this provider: a 404, never a series cloned from the spend control
+        self.assertEqual((status, body["error"]["code"]), (404, "provider_not_found"))
         self.assertEqual(len(self.transport.requests), 1)  # no history is manufactured from the spend control
 
     def test_no_refresh_and_credential_files_unchanged(self):
