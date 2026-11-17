@@ -5,13 +5,18 @@ const { mod, mount, deferred, envelope, errEnvelope, act, dom } = require("./har
 const F = require("./fixtures");
 
 const B = mod.API_BASE;
+// Provider options come from the analytics response (design §7), not the subscription inventory.
+const PROVIDERS = [
+  { id: "openrouter", label: "OpenRouter" }, { id: "nous", label: "Nous Portal" },
+  { id: "anthropic", label: "Anthropic" }, { id: "ollama", label: "Ollama" },
+];
 
 function routesFor(over) {
   const o = Object.assign({
     subs: () => envelope({ cards: [F.readyOpenRouter, F.opaqueNous, F.errorAnthropic, F.selfHosted], inventory_state: "detected" }),
     usage: (u) => {
       const w = Number(new URL(u, "http://x").searchParams.get("window"));
-      return envelope(F.usage(w, [F.point("2026-11-01"), F.point("2026-11-02"), F.point("2026-11-04")]));
+      return envelope(F.usage(w, [F.point("2026-11-01"), F.point("2026-11-02"), F.point("2026-11-04")], { providers: PROVIDERS }));
     },
     health: () => envelope({ entries: [F.healthEntry()] }),
   }, over || {});
@@ -323,27 +328,36 @@ test("chart with only null observations shows no fake zero line", async () => {
   await m.unmount();
 });
 
-test("provider filter requests ?provider= and shows attribution-unavailable honestly", async () => {
+test("provider filter requests ?provider= and renders the filtered subset, never the unfiltered series", async () => {
   const m = await mount({ routes: routesFor({
     usage: (u) => {
       const p = new URL(u, "http://x").searchParams;
       const w = Number(p.get("window"));
-      if (p.get("provider")) return envelope({ window_days: w, provider_id: p.get("provider"), series: [], reason: "attribution_unavailable" });
-      return envelope(F.usage(w, [F.point("2026-11-01")]));
+      if (p.get("provider")) {
+        // one day only, different numbers from the unfiltered series
+        return envelope(F.usage(w, [F.point("2026-11-02", { input_count: 7, output_count: 3 })], { provider_id: p.get("provider"), providers: PROVIDERS }));
+      }
+      return envelope(F.usage(w, [F.point("2026-11-01"), F.point("2026-11-02"), F.point("2026-11-04")], { providers: PROVIDERS }));
     },
   }) });
   const sel = m.$("select[aria-label='Provider filter']");
-  assert.deepEqual([...sel.options].map((o) => o.value), ["", "openrouter", "nous", "anthropic", "ollama"]); // inventory order preserved
+  assert.deepEqual([...sel.options].map((o) => o.value), ["", "openrouter", "nous", "anthropic", "ollama"]); // analytics order preserved
+  assert.equal(sel.options[0].textContent, "All providers");
+  const dots = () => m.$("[data-zone=usage]").querySelectorAll("circle.ud-dot.ud-line-a").length;
+  const before = dots();
+  assert.equal(before > 0, true);
   await act(async () => {
     const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLSelectElement.prototype, "value").set;
     setter.call(sel, "openrouter");
     sel.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
   });
-  assert.ok(m.calls.includes(B + "/usage?window=30&provider=openrouter&view=machine"));
-  const z = m.$("[data-zone=usage]");
-  assert.match(z.textContent, /Provider attribution unavailable from session analytics\./);
-  assert.equal(z.querySelectorAll("figure.ud-chart").length, 0, "no profile totals cloned onto the provider");
-  assert.equal(z.querySelectorAll("polyline, circle").length, 0);
+  await m.flush(5);
+  assert.ok(m.calls.includes(B + "/usage?mode=machine&dimension=all&window=30&provider=openrouter"));
+  const text = m.$("[data-zone=usage]").textContent;
+  assert.equal(/no per-provider attribution|attribution unavailable/i.test(text), false, "obsolete attribution copy is gone");
+  assert.match(text, /Filtered to OpenRouter\./);
+  assert.equal(dots() < before, true, "the chart shows the filtered subset");
+  assert.equal(m.$$("[data-zone=usage] figure.ud-chart").length > 0, true);
   await m.unmount();
 });
 
@@ -373,7 +387,7 @@ test("provider filter narrows the rendered subscription cards (DOM count), and c
   assert.deepEqual(ids(), ["acct_ol"]);
   await pick("");
   assert.equal(count(), 6);
-  assert.equal(m.$("[data-filter-note]"), null);
+  assert.equal(m.$("[data-filter-note]") === null, true);
   await m.unmount();
 });
 
@@ -386,7 +400,8 @@ test("changing the provider filter closes an open JSON dialog instead of leaving
     Object.getOwnPropertyDescriptor(dom.window.HTMLSelectElement.prototype, "value").set.call(sel, "anthropic");
     sel.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
   });
-  assert.equal(m.$("[role=dialog]"), null);
+  // compare booleans, never DOM nodes: a failing assert on a jsdom Element makes node inspect the whole object graph
+  assert.equal(m.$("[role=dialog]") === null, true, "dialog closed");
   assert.equal(m.$$("[data-zone=subscriptions] .ud-card").length, 1);
   await m.unmount();
 });
