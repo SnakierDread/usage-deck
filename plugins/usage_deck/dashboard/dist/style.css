@@ -224,3 +224,28 @@
 .usage-deck .ud-health-name { font-weight: 600; }
 .usage-deck .ud-health-metrics { font-variant-numeric: tabular-nums; font-size: 0.85rem; }
 .usage-deck .ud-health-err { color: var(--ud-bad); }
+
+/* Usage analytics dimensions: colour-coded groups (host tokens only), shared legend, grouped tables. */
+.usage-deck { --ud-g0: var(--ud-accent); --ud-g1: var(--ud-ok); --ud-g2: var(--ud-warn); --ud-g3: var(--ud-bad);
+  --ud-g4: color-mix(in srgb, var(--ud-accent) 50%, var(--ud-ok));
+  --ud-g5: color-mix(in srgb, var(--ud-warn) 50%, var(--ud-bad));
+  --ud-g6: color-mix(in srgb, var(--ud-accent) 50%, var(--ud-bad));
+  --ud-g7: color-mix(in srgb, var(--ud-ok) 50%, var(--ud-warn)); }
+.usage-deck .ud-line.ud-g0, .usage-deck circle.ud-dot.ud-g0 { stroke: var(--ud-g0); fill: var(--ud-g0); }
+.usage-deck .ud-line.ud-g1, .usage-deck circle.ud-dot.ud-g1 { stroke: var(--ud-g1); fill: var(--ud-g1); }
+.usage-deck .ud-line.ud-g2, .usage-deck circle.ud-dot.ud-g2 { stroke: var(--ud-g2); fill: var(--ud-g2); }
+.usage-deck .ud-line.ud-g3, .usage-deck circle.ud-dot.ud-g3 { stroke: var(--ud-g3); fill: var(--ud-g3); }
+.usage-deck .ud-line.ud-g4, .usage-deck circle.ud-dot.ud-g4 { stroke: var(--ud-g4); fill: var(--ud-g4); }
+.usage-deck .ud-line.ud-g5, .usage-deck circle.ud-dot.ud-g5 { stroke: var(--ud-g5); fill: var(--ud-g5); }
+.usage-deck .ud-line.ud-g6, .usage-deck circle.ud-dot.ud-g6 { stroke: var(--ud-g6); fill: var(--ud-g6); }
+.usage-deck .ud-line.ud-g7, .usage-deck circle.ud-dot.ud-g7 { stroke: var(--ud-g7); fill: var(--ud-g7); }
+.usage-deck .ud-line { fill: none; }
+.usage-deck .ud-line.ud-dash { stroke-dasharray: 5 3; }
+.usage-deck circle.ud-dot { stroke: none; }
+.usage-deck .ud-grouped { display: flex; flex-direction: column; gap: 0.75rem; }
+.usage-deck .ud-group-legend { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.usage-deck .ud-legend-btn { display: inline-flex; align-items: center; gap: 0.4rem; }
+.usage-deck .ud-legend-btn[aria-pressed="false"] { opacity: 0.55; }
+.usage-deck .ud-table-scroll { overflow-x: auto; }
+.usage-deck .ud-totals { border-top: 1px solid var(--ud-border); padding-top: 0.5rem; }
+.usage-deck .ud-zone-head .ud-controls { row-gap: 0.4rem; }

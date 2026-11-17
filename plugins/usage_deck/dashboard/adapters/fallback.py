@@ -9,7 +9,7 @@ provider.
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Tuple
+from typing import Optional, Tuple
 
 from ..models.dto import (
     Period,
@@ -25,7 +25,9 @@ from .base import AnalyticsDay, AnalyticsUnavailable, BaseAdapter
 PROFILE_SERIES_ID = "profile_session_analytics"
 
 
-def build_profile_series(rows: Tuple[AnalyticsDay, ...], window: int, now) -> UsageTimeSeries:
+def build_series(rows: Tuple[AnalyticsDay, ...], window: int, now, series_id: str, scope: str,
+                provider_id: Optional[str] = None) -> UsageTimeSeries:
+    """One estimated daily series (the same point arithmetic for every scope and dimension group)."""
     points = []
     seen = set()
     for row in sorted(rows, key=lambda r: r.day):
@@ -40,10 +42,10 @@ def build_profile_series(rows: Tuple[AnalyticsDay, ...], window: int, now) -> Us
     end = now
     start = end - timedelta(days=window)
     return UsageTimeSeries(
-        id=PROFILE_SERIES_ID,
-        provider_id=None,
+        id=series_id,
+        provider_id=provider_id,
         account_id=None,
-        scope="profile",
+        scope=scope,
         confidence="estimated",
         source="session_analytics",
         period=Period(fmt_ts(start), fmt_ts(end), f"rolling_{window}d"),
@@ -56,6 +58,10 @@ def build_profile_series(rows: Tuple[AnalyticsDay, ...], window: int, now) -> Us
         stale=False,
         error=None,
     )
+
+
+def build_profile_series(rows: Tuple[AnalyticsDay, ...], window: int, now) -> UsageTimeSeries:
+    return build_series(rows, window, now, PROFILE_SERIES_ID, "profile")
 
 
 class SessionAnalyticsAdapter(BaseAdapter):

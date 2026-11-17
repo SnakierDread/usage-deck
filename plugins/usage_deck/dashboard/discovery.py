@@ -192,6 +192,40 @@ def host_home_env(directory: Path) -> Dict[str, str]:
     return load_env_file(path)
 
 
+def home_candidates(root: Path) -> Tuple[List[Tuple[str, bool, Path]], bool]:
+    """Every Hermes home under ``root`` as ``(name, is_global, directory)`` plus a ``truncated`` flag.
+
+    The root comes first (the global holder), then the real, valid-named, non-symlink directories under
+    ``<root>/profiles`` in sorted order, at most ``MAX_PROFILES`` of them (``truncated`` is True when more
+    exist). A symlinked ``profiles`` parent is never followed (§12.3). Pure directory enumeration: shared
+    by the inventory (``read_stores``) and session analytics so the two cannot drift; it opens no file.
+    """
+    candidates: List[Tuple[str, bool, Path]] = [(GLOBAL_PROFILE, True, root)]
+    profiles_dir = root / "profiles"
+    try:
+        if profiles_dir.is_symlink():
+            names: List[str] = []
+        else:
+            names = sorted(p.name for p in profiles_dir.iterdir()
+                           if _PROFILE_NAME_RE.match(p.name) and p.is_dir() and not p.is_symlink())
+    except OSError:
+        names = []
+    candidates += [(name, False, root / "profiles" / name) for name in names[:MAX_PROFILES]]
+    return candidates, len(names) > MAX_PROFILES
+
+
+def home_rejects(root: Path) -> Tuple[List[str], bool]:
+    """Valid-named ``profiles/<name>`` entries that are symlinks (never followed) and whether the
+    ``profiles`` parent itself is a symlink. Used only to report an analytics read as incomplete."""
+    profiles_dir = root / "profiles"
+    try:
+        if profiles_dir.is_symlink():
+            return [], True
+        return sorted(p.name for p in profiles_dir.iterdir() if _PROFILE_NAME_RE.match(p.name) and p.is_symlink()), False
+    except OSError:
+        return [], False
+
+
 class FileInventorySource:
     """Inventory from ``<home>/auth.json`` (+ optional global root) and a config loader.
 
@@ -245,6 +279,10 @@ class FileInventorySource:
             return home.name, False
         return "current", False
 
+    def home_dir(self) -> Path:
+        """The (request-scoped) home this source reads."""
+        return self._home
+
     def captures_path(self) -> Path:
         return default_store_path(self.root_dir())
 
@@ -297,17 +335,7 @@ class FileInventorySource:
         """
         root = self.root_dir()
         current = self._home.resolve()
-        candidates: List[Tuple[str, bool, Path]] = [(GLOBAL_PROFILE, True, root)]
-        profiles_dir = root / "profiles"
-        try:
-            if profiles_dir.is_symlink():
-                names = []  # a symlinked ``profiles`` parent is never followed (§12.3)
-            else:
-                names = sorted(p.name for p in profiles_dir.iterdir()
-                               if _PROFILE_NAME_RE.match(p.name) and p.is_dir() and not p.is_symlink())
-        except OSError:
-            names = []
-        candidates += [(name, False, root / "profiles" / name) for name in names[:MAX_PROFILES]]
+        candidates, _truncated = home_candidates(root)
         stores: List[StoreRead] = []
         for name, is_global, directory in candidates:
             auth = directory / "auth.json"

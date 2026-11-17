@@ -3,7 +3,7 @@
  *
  * One screen, three independent zones:
  *   1. Subscriptions grid   GET /api/plugins/usage-deck/subscriptions?view=machine|profile
- *   2. Usage analytics      GET /api/plugins/usage-deck/usage?window=7|30|90[&provider=<id>]&view=...
+ *   2. Usage analytics      GET /api/plugins/usage-deck/usage?mode=machine|profile&dimension=all|profile|model&window=7|30|90[&provider=<id>]
  *   3. Self-hosted health   GET /api/plugins/usage-deck/health?view=machine|profile
  *
  * Plain IIFE, no build step, no runtime dependencies (DESIGN.md §6): React, hooks and
@@ -33,6 +33,21 @@
   const VIEWS = ["machine", "profile"];
   const DEFAULT_VIEW = "machine";
   const POLL_MS = 60000;
+  // Usage analytics dimension (analytics-dimensions-breakdown §7): how the scoped session records are partitioned.
+  const DIMENSIONS = ["all", "profile", "model"];
+  const DEFAULT_DIMENSION = "all";
+  const USAGE_SCHEMA_VERSION = 2;
+  const GROUP_PALETTE = 8; // ud-g0..ud-g7 colour classes (cycled)
+  // Copy of the usage zone (fixed local text; upstream strings only ever appear as text nodes).
+  const COPY_SCOPE_MACHINE = "All local profile session records — not subscription allowance.";
+  const COPY_SCOPE_PROFILE = "This Hermes profile only — not subscription allowance.";
+  const COPY_ATTRIBUTION_LIMIT = "Attribution follows each session's recorded model and provider (its last recorded values after a switch), counted once per session; it does not reconstruct every model call.";
+  const ATTRIBUTION_TIP = {
+    session_provider: "Provider recorded on the session.",
+    billing_provider: "Provider taken from the session's billing provider; not measured billing ownership.",
+    models_json: "Provider inferred from this profile's local models.json catalog by exact model id; not measured billing ownership.",
+    unknown: "No provider was recorded for this session and the local catalog does not name one.",
+  };
 
   const CONF_LABEL = {
     exact: "Exact",
@@ -336,8 +351,9 @@
     };
   }
 
-  /** Validate the envelope (DESIGN.md §3) and return `data`, or throw {uiError}. */
-  function unwrapEnvelope(resp) {
+  /** Validate the envelope (DESIGN.md §3) and return `data`, or throw {uiError}. `version` is the wire version
+   *  the endpoint speaks: 1 for subscriptions/health, 2 for usage (dimensions payload). */
+  function unwrapEnvelope(resp, version) {
     if (!isObj(resp)) throw malformed("not an object");
     if (resp.ok === false) {
       const de = deckErrorFrom(resp);
@@ -345,7 +361,7 @@
       throw malformed("failure without error");
     }
     if (resp.ok !== true) throw malformed("missing ok flag");
-    if (!isObj(resp.meta) || resp.meta.schema_version !== 1) throw malformed("unsupported schema version");
+    if (!isObj(resp.meta) || resp.meta.schema_version !== (version || 1)) throw malformed("unsupported schema version");
     if (!isObj(resp.data)) throw malformed("missing data");
     return { data: resp.data, meta: resp.meta };
   }
@@ -363,17 +379,105 @@
     };
   }
 
-  function validateUsage(env, windowDays) {
+  const USAGE_REASONS = { no_observations: 1, source_unavailable: 1 };
+  const METRIC_FIELDS = ["input_count", "output_count", "estimated_usd", "sessions", "api_calls"];
+
+  function validMetrics(m) {
+    if (!isObj(m) || !Array.isArray(m.missing_fields)) return false;
+    return METRIC_FIELDS.every(function (f) { return m[f] === null || num(m[f]) !== null; });
+  }
+
+  /**
+   * Validate the v2 usage payload (analytics-dimensions-breakdown §4). `query` is {provider, mode, dimension}
+   * as requested: the response must be for the same window and the same provider filter (a stale or unfiltered
+   * answer is never shown under a filtered label). mode/dimension are taken from the response: the server may
+   * clamp them (profile-restricted principal) and the UI renders the EFFECTIVE scope.
+   */
+  function validateUsage(env, windowDays, query) {
     const d = env.data;
+    const q = query || {};
     if (d.window_days !== windowDays) throw malformed("window mismatch");
-    if (!Array.isArray(d.series)) throw malformed("series");
+    if ((str(d.provider_id) || null) !== (q.provider || null)) throw malformed("provider mismatch");
+    if (!has({ machine: 1, profile: 1 }, d.mode) || DIMENSIONS.indexOf(d.dimension) < 0) throw malformed("scope");
+    if (q.mode && q.dimension && d.mode === q.mode && d.dimension !== q.dimension) throw malformed("dimension mismatch");
+    ["series", "groups", "rows", "providers", "sources"].forEach(function (k) {
+      if (!Array.isArray(d[k]) || !d[k].every(isObj)) throw malformed(k);
+    });
+    if (!validMetrics(d.totals)) throw malformed("totals");
+    if (!d.groups.every(function (g) { return typeof g.id === "string" && typeof g.series_id === "string" && Array.isArray(g.row_ids) && validMetrics(g.totals); })) {
+      throw malformed("groups");
+    }
+    if (!d.rows.every(function (r) { return typeof r.id === "string" && validMetrics(r.metrics); })) throw malformed("rows");
     return {
       window_days: d.window_days,
       provider_id: str(d.provider_id),
-      series: d.series.filter(isObj),
-      reason: has(REASON_TEXT, d.reason) ? d.reason : null,
+      mode: d.mode,
+      dimension: d.dimension,
+      series: d.series,
+      groups: d.groups,
+      rows: d.rows,
+      totals: d.totals,
+      providers: d.providers.filter(function (p) { return str(p.id) && str(p.label); }).map(function (p) { return { id: p.id, label: p.label }; }),
+      sources: d.sources,
+      complete: d.complete !== false,
+      top_n: num(d.top_n),
+      reason: has(USAGE_REASONS, d.reason) ? d.reason : null,
       meta: env.meta,
     };
+  }
+
+  /** Dimension options of a mode: machine offers All | By profile | By model, a single profile All | By model. */
+  function dimensionOptions(mode) {
+    const all = [{ id: "all", label: "All" }, { id: "profile", label: "By profile" }, { id: "model", label: "By model" }];
+    return mode === "profile" ? all.filter(function (o) { return o.id !== "profile"; }) : all;
+  }
+
+  /** Dimension actually requested: a by-profile view does not exist for a single profile. */
+  function effectiveDimension(mode, dimension) {
+    return mode === "profile" && dimension === "profile" ? "all" : dimension;
+  }
+
+  /** Total tokens of a metrics object: null when neither component is known; `partial` when only one is. */
+  function totalTokens(m) {
+    const i = num(m && m.input_count), o = num(m && m.output_count);
+    if (i === null && o === null) return { value: null, partial: false };
+    return { value: (i || 0) + (o || 0), partial: i === null || o === null };
+  }
+
+  /** Cell text of a (possibly unavailable) count: null is a dash, a measured zero is 0. */
+  function fmtMetric(v, unit) {
+    return num(v) === null ? "—" : fmtNumber(v, unit || "count");
+  }
+
+  function scopeCopy(mode) {
+    return mode === "machine" ? COPY_SCOPE_MACHINE : COPY_SCOPE_PROFILE;
+  }
+
+  function providerLabelOf(providers, id) {
+    const hit = (providers || []).filter(function (p) { return p.id === id; })[0];
+    return hit ? hit.label : (str(id) || "Unknown");
+  }
+
+  function profileDbLabel(row) {
+    return (row.is_global === true ? "global (default home)" : str(row.profile) || "profile") + " · state.db";
+  }
+
+  /** Groups joined with their series (by series_id), in server order; a group without a series is dropped. */
+  function groupViews(data) {
+    const byId = {};
+    data.series.forEach(function (s) { if (str(s.id)) byId[s.id] = s; });
+    const rowsById = {};
+    data.rows.forEach(function (r) { rowsById[r.id] = r; });
+    const out = [];
+    data.groups.forEach(function (g, i) {
+      const s = has(byId, g.series_id) ? byId[g.series_id] : null;
+      if (!s) return;
+      out.push({
+        group: g, series: s, color: i % GROUP_PALETTE,
+        rows: g.row_ids.map(function (id) { return rowsById[id]; }).filter(Boolean),
+      });
+    });
+    return out;
   }
 
   function validateHealth(env) {
@@ -429,9 +533,9 @@
       return Array.prototype.filter.call(arguments, Boolean).join(" ");
     }
 
-    function getJSON(path, signal) {
+    function getJSON(path, signal, version) {
       const init = signal ? { signal: signal } : undefined;
-      return SDK.fetchJSON(API_BASE + path, init).then(unwrapEnvelope);
+      return SDK.fetchJSON(API_BASE + path, init).then(function (resp) { return unwrapEnvelope(resp, version); });
     }
 
     function currentProfileKey() {
@@ -800,7 +904,10 @@
         } else {
           // The page-level provider filter narrows this list too (not only the usage chart).
           const shown = props.provider
-            ? data.cards.filter(function (c) { return str(c.provider_id) === props.provider; })
+            ? data.cards.filter(function (c) {
+              const id = str(c.provider_id);
+              return id === props.provider || (props.provider === "custom" && id.indexOf("custom:") === 0);
+            })
             : data.cards;
           content = h("div", null, err,
             props.provider
@@ -891,11 +998,94 @@
           els));
     }
 
+    /** A metric cell: dash for unavailable, 0 for a measured zero, `*` on a known subtotal that misses sessions. */
+    function MetricCell(props) {
+      const m = props.metrics;
+      const v = num(m && m[props.field]);
+      const partial = v !== null && Array.isArray(m.missing_fields) && m.missing_fields.indexOf(props.field) >= 0;
+      return h("td", { "data-field": props.field, "data-partial": partial ? "true" : undefined,
+        title: partial ? "Known subtotal: some sessions did not record this value." : (v === null ? "Not recorded." : undefined) },
+        fmtMetric(v, props.unit), partial ? h("span", { "aria-hidden": "true" }, "*") : null);
+    }
+
+    function TotalTokensCell(props) {
+      const t = totalTokens(props.metrics);
+      return h("td", { "data-field": "total_tokens", "data-partial": t.partial ? "true" : undefined,
+        title: t.partial ? "Known subtotal: only one of input / output was recorded." : undefined },
+        t.value === null ? "—" : fmtNumber(t.value, "count"), t.partial ? h("span", { "aria-hidden": "true" }, "*") : null);
+    }
+
+    /** Whole-scope totals: independent of the dimension, the top-N cut and the legend. */
+    function TotalsBar(props) {
+      const t = props.totals;
+      const partial = Array.isArray(t.missing_fields) && t.missing_fields.length > 0;
+      const tt = totalTokens(t);
+      const items = [
+        ["Input", fmtMetric(t.input_count, "count")],
+        ["Output", fmtMetric(t.output_count, "count")],
+        ["Total tokens", tt.value === null ? "—" : fmtNumber(tt.value, "count")],
+        ["Est. USD", fmtMetric(t.estimated_usd, "usd")],
+        ["Sessions", fmtMetric(t.sessions, "count")],
+        ["API calls", fmtMetric(t.api_calls, "count")],
+      ];
+      return h("div", { className: "ud-totals", "data-usage-totals": "true" },
+        h("p", { className: "ud-muted ud-small" }, "Totals for the whole filtered scope, including any group hidden in the legend."),
+        h("dl", { className: "ud-vals" }, items.map(function (it) {
+          return h("div", { key: it[0] }, h("dt", null, it[0]), h("dd", null, it[1]));
+        })),
+        partial ? h("p", { className: "ud-muted ud-small", "data-totals-partial": "true" },
+          "* Some sessions did not record: " + t.missing_fields.join(", ") + ". Those figures are known subtotals; nothing is estimated for the missing values.") : null);
+    }
+
+    function CoverageNote(props) {
+      const d = props.data;
+      if (d.complete) return null;
+      const bad = d.sources.filter(function (s) { return s.state === "unavailable" || s.state === "excluded"; });
+      return h("div", { className: "ud-error", role: "status", "data-coverage": "incomplete" },
+        h("div", { className: "ud-error-title" }, "⚠ " + (d.mode === "machine" ? "Incomplete machine coverage" : "Incomplete coverage")),
+        h("p", { className: "ud-error-msg" }, "Totals below cover only the session stores that could be read; nothing is guessed for the others."),
+        h("ul", { className: "ud-small", "data-sources": "true" }, d.sources.map(function (s, i) {
+          const name = s.is_global === true ? "global (default home)" : str(s.profile) || "profile";
+          return h("li", { key: i, "data-source-state": str(s.state) || undefined }, name + " — " + (str(s.state) || "unknown"));
+        })),
+        bad.length === 0 ? h("p", { className: "ud-muted ud-small" }, "Some profile stores were not enumerated (safety bound or unreadable directory).") : null);
+    }
+
+    /** Daily provenance rows: which profile DB, model and provider each contribution came from. */
+    function RowsTable(props) {
+      const rows = props.rows.slice().sort(function (a, b) {
+        return (a.day < b.day ? -1 : a.day > b.day ? 1 : 0) || (str(a.profile) < str(b.profile) ? -1 : 1);
+      });
+      const shown = rows.slice(0, 500);
+      const cols = (props.withGroup ? ["Group"] : []).concat(["Day", "Profile DB", "Model", "Provider", "Input", "Output", "Est. USD", "Sessions", "API calls"]);
+      return h("div", { className: "ud-table-scroll" },
+        h("table", { className: "ud-table", "data-rows-table": props.name || "rows" },
+          h("thead", null, h("tr", null, cols.map(function (c) { return h("th", { key: c, scope: "col" }, c); }))),
+          h("tbody", null, shown.map(function (r) {
+            const attr = str(r.attribution_source);
+            const note = attr === "billing_provider" ? " (billing)" : attr === "models_json" ? " (catalog)" : "";
+            return h("tr", { key: r.id, "data-row-id": r.id },
+              props.withGroup ? h("td", null, props.groupLabel(r)) : null,
+              h("td", null, r.day),
+              h("td", null, profileDbLabel(r)),
+              h("td", null, str(r.model_id) || "Unknown model"),
+              h("td", { title: has(ATTRIBUTION_TIP, attr) ? ATTRIBUTION_TIP[attr] : undefined, "data-attribution": attr || undefined },
+                providerLabelOf(props.providers, r.provider_id) + note),
+              h(MetricCell, { metrics: r.metrics, field: "input_count" }),
+              h(MetricCell, { metrics: r.metrics, field: "output_count" }),
+              h(MetricCell, { metrics: r.metrics, field: "estimated_usd", unit: "usd" }),
+              h(MetricCell, { metrics: r.metrics, field: "sessions" }),
+              h(MetricCell, { metrics: r.metrics, field: "api_calls" }));
+          }))),
+        rows.length > shown.length ? h("p", { className: "ud-muted ud-small" }, "Showing the first " + shown.length + " of " + rows.length + " daily rows.") : null);
+    }
+
     function SeriesBlock(props) {
       const s = props.series;
       const conf = effectiveConfidence(s.confidence, SOURCE_CEILING[s.source] || "opaque");
       const pts = Array.isArray(s.points) ? s.points : [];
-      const tip = "Source: Hermes session analytics. Scope: " + (s.scope === "profile" ? "this Hermes profile" : "provider-attributed") +
+      const scopeText = s.scope === "machine" ? "all local profiles" : s.scope === "profile" ? "this Hermes profile" : "provider-attributed";
+      const tip = "Source: Hermes session analytics. Scope: " + scopeText +
         ". Period: " + (isObj(s.period) && s.period.start ? fmtTime(s.period.start) + " to " + fmtTime(s.period.end) : "rolling window") +
         ". Checked: " + fmtTime(s.checked_at) + ".";
       if (isObj(s.error)) {
@@ -931,35 +1121,170 @@
                 h("td", null, fmtNumber(p.estimated_usd, "usd")),
                 h("td", null, fmtNumber(p.sessions, "count")),
                 h("td", null, fmtNumber(p.api_calls, "count")));
-            })))));
+            })))),
+        props.rows && props.rows.length > 0 ? h("details", { className: "ud-table-wrap", "data-provenance": "true" },
+          h("summary", null, "Contributions by profile DB, model and provider (" + props.rows.length + ")"),
+          h(RowsTable, { rows: props.rows, providers: props.providers, name: "provenance" })) : null);
+    }
+
+    /** One chart over several groups: every line has its own points; null breaks a line, never a zero. */
+    function GroupChart(props) {
+      const W = 640, H = 190, L = 64, R = 14, T = 12, B = 30;
+      const all = [];
+      const days = [];
+      props.lines.forEach(function (ln) {
+        splitSegments(ln.points, ln.field).forEach(function (seg) { seg.forEach(function (p) { all.push(p.v); days.push(p.t); }); });
+      });
+      if (all.length === 0) {
+        return h("div", { className: "ud-chart-empty", "data-chart-empty": props.title },
+          h("strong", null, props.title), h("p", { className: "ud-muted ud-small" }, "No observations for this period."));
+      }
+      const tmin = Math.min.apply(null, days), tmax = Math.max.apply(null, days);
+      const ymax = niceMax(Math.max.apply(null, all));
+      const x = function (t) { return tmax === tmin ? L + (W - L - R) / 2 : L + ((t - tmin) / (tmax - tmin)) * (W - L - R); };
+      const y = function (v) { return T + (1 - v / ymax) * (H - T - B); };
+      const els = [];
+      [0, 0.5, 1].forEach(function (f, i) {
+        const v = ymax * f;
+        els.push(h("g", { key: "tick" + i },
+          h("line", { className: "ud-grid-line", x1: L, x2: W - R, y1: y(v), y2: y(v) }),
+          h("text", { className: "ud-axis", x: L - 6, y: y(v) + 4, textAnchor: "end" }, fmtNumber(v, props.unit))));
+      });
+      const first = new Date(tmin).toISOString().slice(0, 10), last = new Date(tmax).toISOString().slice(0, 10);
+      els.push(h("text", { key: "x0", className: "ud-axis", x: L, y: H - 8, textAnchor: "start" }, first));
+      if (tmax !== tmin) els.push(h("text", { key: "x1", className: "ud-axis", x: W - R, y: H - 8, textAnchor: "end" }, last));
+      props.lines.forEach(function (ln) {
+        splitSegments(ln.points, ln.field).forEach(function (seg, si) {
+          if (seg.length > 1) {
+            els.push(h("polyline", {
+              key: ln.key + "-s" + si, className: "ud-line ud-g" + ln.color + (ln.dash ? " ud-dash" : ""), fill: "none",
+              "data-group-line": ln.groupId, "data-metric": ln.field,
+              points: seg.map(function (p) { return x(p.t).toFixed(1) + "," + y(p.v).toFixed(1); }).join(" "),
+            }));
+          }
+          seg.forEach(function (p) {
+            els.push(h("circle", { key: ln.key + "-" + p.day, className: "ud-dot ud-g" + ln.color, cx: x(p.t), cy: y(p.v), r: 3,
+              "data-group-line": ln.groupId, "data-metric": ln.field },
+            h("title", null, ln.tip(p))));
+          });
+        });
+      });
+      return h("figure", { className: "ud-chart", "data-chart": props.title },
+        h("figcaption", { className: "ud-chart-title" }, props.title,
+          props.note ? h("span", { className: "ud-legend" }, props.note) : null),
+        h("svg", { viewBox: "0 0 " + W + " " + H, className: "ud-svg", role: "img", "aria-label": props.title + ", " + props.lines.length + " lines" }, els));
+    }
+
+    function pointTip(view, p) {
+      const g = view.group;
+      const owners = (Array.isArray(g.profiles) ? g.profiles : []).map(function (o) { return o.is_global === true ? "global" : str(o.profile); }).filter(Boolean);
+      return str(g.label) + " — " + p.day + ": input " + fmtMetric(p.input_count) + ", output " + fmtMetric(p.output_count) +
+        ", est. " + fmtMetric(p.estimated_usd, "usd") + (owners.length ? "; profiles: " + owners.join(", ") : "");
+    }
+
+    /** By profile / By model: one shared legend drives both charts and the grouped tables (no refetch). */
+    function GroupedView(props) {
+      const d = props.data;
+      const views = useMemo(function () { return groupViews(d); }, [d]);
+      const [hidden, setHidden] = useState({});
+      const visible = views.filter(function (v) { return !hidden[v.group.id]; });
+      const toggle = function (id) { setHidden(function (prev) { const n = Object.assign({}, prev); if (n[id]) delete n[id]; else n[id] = true; return n; }); };
+      const anyHidden = views.some(function (v) { return hidden[v.group.id]; });
+      const byProfile = d.dimension === "profile";
+      const tokenLines = [], spendLines = [];
+      visible.forEach(function (v) {
+        const pts = sortedByDay(v.series.points);
+        const base = { color: v.color, groupId: v.group.id, points: pts, tip: function (p) { return pointTip(v, p); } };
+        tokenLines.push(Object.assign({ key: v.group.id + "-in", field: "input_count", dash: false }, base));
+        tokenLines.push(Object.assign({ key: v.group.id + "-out", field: "output_count", dash: true }, base));
+        spendLines.push(Object.assign({ key: v.group.id + "-usd", field: "estimated_usd", dash: false }, base));
+      });
+      const otherView = views.filter(function (v) { return v.group.is_other === true && !hidden[v.group.id]; })[0] || null;
+      const groupOfRow = {};
+      views.forEach(function (v) { v.rows.forEach(function (r) { groupOfRow[r.id] = v.group; }); });
+      const mainRows = [];
+      visible.forEach(function (v) { if (v.group.is_other !== true) v.rows.forEach(function (r) { mainRows.push(r); }); });
+      const sumRows = visible.map(function (v) { return v; });
+      return h("div", { className: "ud-grouped", "data-dimension-view": d.dimension },
+        h("div", { className: "ud-group-legend", role: "group", "aria-label": byProfile ? "Profiles" : "Models" },
+          views.map(function (v) {
+            const on = !hidden[v.group.id];
+            return h("button", { key: v.group.id, type: "button", className: cx("ud-btn", "ud-legend-btn", on && "ud-seg-on"),
+              "aria-pressed": on ? "true" : "false", "data-group-id": v.group.id, onClick: function () { toggle(v.group.id); } },
+            h("svg", { width: 22, height: 8, "aria-hidden": "true" }, h("line", { className: "ud-line ud-g" + v.color, x1: 0, x2: 22, y1: 4, y2: 4 })),
+            str(v.group.label));
+          }),
+          h("button", { type: "button", className: "ud-btn", disabled: anyHidden ? undefined : true, "data-show-all": "true",
+            onClick: function () { setHidden({}); } }, "Show all")),
+        d.dimension === "model" && d.top_n ? h("p", { className: "ud-muted ud-small" },
+          "Top " + d.top_n + " models by known input + output tokens over this window; every remaining model is rolled up into Other.") : null,
+        h("div", { className: "ud-charts" },
+          h(GroupChart, { title: "Tokens (count)", unit: "count", lines: tokenLines, note: "solid = input · dashed = output" }),
+          h(GroupChart, { title: "Estimated spend (USD)", unit: "usd", lines: spendLines })),
+        h("div", { className: "ud-table-scroll" },
+          h("table", { className: "ud-table", "data-summary-table": d.dimension },
+            h("thead", null, h("tr", null, ["Group", "Input", "Output", "Total tokens", "Est. USD", "Sessions", "API calls"].map(function (c) { return h("th", { key: c, scope: "col" }, c); }))),
+            h("tbody", null, sumRows.map(function (v) {
+              const t = v.group.totals;
+              return h("tr", { key: v.group.id, "data-group-id": v.group.id },
+                h("td", null, str(v.group.label)),
+                h(MetricCell, { metrics: t, field: "input_count" }),
+                h(MetricCell, { metrics: t, field: "output_count" }),
+                h(TotalTokensCell, { metrics: t }),
+                h(MetricCell, { metrics: t, field: "estimated_usd", unit: "usd" }),
+                h(MetricCell, { metrics: t, field: "sessions" }),
+                h(MetricCell, { metrics: t, field: "api_calls" }));
+            })))),
+        h("details", { className: "ud-table-wrap", "data-grouped-rows": "true", open: undefined },
+          h("summary", null, "Daily rows by " + (byProfile ? "profile" : "model") + " (" + mainRows.length + ")"),
+          h(RowsTable, { rows: mainRows, providers: props.providers, withGroup: true, name: "grouped",
+            groupLabel: function (r) { return str(groupOfRow[r.id] && groupOfRow[r.id].label); } })),
+        otherView ? h("details", { className: "ud-table-wrap", "data-other-rows": "true" },
+          h("summary", null, "Other — " + otherView.rows.length + " daily rows from the models rolled up into Other"),
+          h(RowsTable, { rows: otherView.rows, providers: props.providers, name: "other" })) : null);
     }
 
     function UsageZone(props) {
       const st = props.res.state;
       const reload = props.res.reload;
       const providers = props.providers;
+      const d = st.data;
+      const mode = d ? d.mode : props.view;
+      const dimension = d ? d.dimension : effectiveDimension(props.view, props.dimension);
       let content;
       if (st.status === "loading" && !st.data) {
         content = h(Skeleton, { rows: 5, label: "Loading usage analytics…", className: "ud-skel-chart" });
       } else if (st.status === "error" && !st.data) {
         content = h(ErrorCard, { what: "usage analytics", error: st.error, onRetry: reload });
       } else {
-        const d = st.data;
         const err = st.status === "error" ? h(ErrorCard, { key: "err", what: "usage analytics", error: st.error, onRetry: reload }) : null;
         let inner;
         if (d.series.length === 0) {
-          const reasonKey = d.reason || (props.provider ? "attribution_unavailable" : "no_observations");
-          inner = h("p", { className: "ud-empty-text", "data-chart-state": reasonKey }, REASON_TEXT[reasonKey]);
+          const reasonKey = d.reason || "no_observations";
+          inner = h("p", { className: "ud-empty-text", "data-chart-state": reasonKey },
+            d.provider_id && reasonKey === "no_observations" ? "No observations for " + providerLabelOf(d.providers, d.provider_id) + " in this period." : REASON_TEXT[reasonKey]);
+        } else if (d.dimension === "all") {
+          inner = d.series.map(function (s, i) { return h(SeriesBlock, { key: str(s.id) || i, series: s, rows: d.rows, providers: d.providers }); });
         } else {
-          inner = d.series.map(function (s, i) { return h(SeriesBlock, { key: str(s.id) || i, series: s }); });
+          inner = h(GroupedView, { key: [d.mode, d.dimension, d.window_days, d.provider_id].join("|"), data: d, providers: d.providers });
         }
-        content = h("div", { "aria-busy": st.refreshing ? "true" : undefined }, err, inner);
+        content = h("div", { "aria-busy": st.refreshing ? "true" : undefined }, err, h(CoverageNote, { data: d }), inner, h(TotalsBar, { totals: d.totals }));
       }
-      return h("section", { className: "ud-zone", "aria-labelledby": "ud-h-usage", "data-zone": "usage" },
+      const options = dimensionOptions(mode);
+      const selected = providers.filter(function (p) { return p.id === props.provider; })[0];
+      return h("section", { className: "ud-zone", "aria-labelledby": "ud-h-usage", "data-zone": "usage", "data-mode": mode, "data-dimension": dimension },
         h("div", { className: "ud-zone-head" },
           h("h2", { id: "ud-h-usage" }, "Usage analytics"),
           st.data && (st.status === "error" || st.refreshing) ? h(StaleTag, { stale: true }) : null,
           h("div", { className: "ud-controls" },
+            h("div", { role: "group", "aria-label": "Analytics dimension", className: "ud-seg", "data-dimension-toggle": dimension },
+              options.map(function (o) {
+                return h("button", {
+                  key: o.id, type: "button", className: cx("ud-btn", "ud-seg-btn", dimension === o.id && "ud-seg-on"),
+                  "aria-pressed": dimension === o.id ? "true" : "false", "data-dimension": o.id,
+                  onClick: function () { props.onDimension(o.id); },
+                }, o.label);
+              })),
             h("div", { role: "group", "aria-label": "Time window", className: "ud-seg" },
               WINDOWS.map(function (w) {
                 return h("button", {
@@ -973,12 +1298,11 @@
                 className: "ud-select", value: props.provider, "aria-label": "Provider filter",
                 onChange: function (e) { props.onProvider(e.target.value); },
               },
-                h("option", { value: "" }, "All (this profile)"),
+                h("option", { value: "" }, "All providers"),
                 providers.map(function (p) { return h("option", { key: p.id, value: p.id }, p.label); }))))),
         h("p", { className: "ud-muted ud-small ud-subtitle" },
-          props.provider
-            ? "Filtered to " + (providers.filter(function (p) { return p.id === props.provider; })[0] || { label: "provider" }).label + ". Session analytics carry no per-provider attribution."
-            : "This Hermes profile only — not subscription allowance."),
+          scopeCopy(mode) + (props.provider ? " Filtered to " + (selected ? selected.label : "the selected provider") + "." : "")),
+        h("p", { className: "ud-muted ud-small", "data-attribution-limit": "true" }, COPY_ATTRIBUTION_LIMIT),
         content);
     }
 
@@ -1051,6 +1375,17 @@
       const [windowDays, setWindowDays] = useState(DEFAULT_WINDOW);
       const [provider, setProvider] = useState("");
       const [view, setView] = useState(DEFAULT_VIEW);
+      const [dimension, setDimension] = useState(DEFAULT_DIMENSION);
+      // Last provider options reported by the analytics (historical providers + Unknown): kept while the next
+      // answer loads so the selector never flickers empty.
+      const [providerOptions, setProviderOptions] = useState([]);
+
+      // Machine -> profile resets a by-profile dimension to All before anything is fetched.
+      const onView = function (v) {
+        setView(v);
+        setDimension(function (d) { return effectiveDimension(v, d); });
+      };
+      const effDimension = effectiveDimension(view, dimension);
 
       const subs = useResource("subs|" + profileKey + "|" + view, function (signal) {
         return getJSON("/subscriptions?view=" + view, signal).then(validateSubscriptions);
@@ -1059,28 +1394,28 @@
         return getJSON("/health?view=" + view, signal).then(validateHealth);
       });
 
-      const providers = useMemo(function () {
-        const seen = {};
-        const out = [];
-        const cards = subs.state.data ? subs.state.data.cards : [];
-        cards.forEach(function (c) {
-          const id = str(c.provider_id);
-          if (id && !has(seen, id)) { seen[id] = true; out.push({ id: id, label: str(c.provider_label) || id }); }
+      const usageKey = "usage|" + profileKey + "|" + windowDays + "|" + provider + "|" + view + "|" + effDimension;
+      const usage = useResource(usageKey, function (signal) {
+        const q = "?mode=" + view + "&dimension=" + effDimension + "&window=" + windowDays +
+          (provider ? "&provider=" + encodeURIComponent(provider) : "");
+        return getJSON("/usage" + q, signal, USAGE_SCHEMA_VERSION).then(function (env) {
+          return validateUsage(env, windowDays, { provider: provider, mode: view, dimension: effDimension });
         });
-        return out;
-      }, [subs.state.data]);
-
-      // A provider that vanished from the inventory (profile switch) falls back to profile-wide.
-      const providerValid = provider === "" || providers.some(function (p) { return p.id === provider; });
-      useEffect(function () {
-        if (!providerValid && subs.state.status === "ready") setProvider("");
-      }, [providerValid, subs.state.status]);
-      const effProvider = providerValid || subs.state.status !== "ready" ? provider : "";
-
-      const usage = useResource("usage|" + profileKey + "|" + windowDays + "|" + effProvider + "|" + view, function (signal) {
-        const q = "?window=" + windowDays + (effProvider ? "&provider=" + encodeURIComponent(effProvider) : "") + "&view=" + view;
-        return getJSON("/usage" + q, signal).then(function (env) { return validateUsage(env, windowDays); });
       });
+
+      const usageData = usage.state.data;
+      useEffect(function () {
+        if (usageData) setProviderOptions(usageData.providers);
+      }, [usageData]);
+      const providers = useMemo(function () {
+        return provider && !providerOptions.some(function (p) { return p.id === provider; })
+          ? providerOptions.concat([{ id: provider, label: provider }]) : providerOptions;
+      }, [providerOptions, provider]);
+
+      // A provider the server no longer knows (window / mode change) falls back to All providers.
+      const ust = usage.state;
+      const providerGone = !!provider && ust.status === "error" && !!ust.error && ust.error.code === "provider_not_found";
+      useEffect(function () { if (providerGone) setProvider(""); }, [providerGone]);
 
       const refreshAll = function () { subs.reload(); usage.reload(); health.reload(); };
 
@@ -1100,8 +1435,11 @@
               type: "button", className: "ud-btn", onClick: refreshAll, disabled: busy || undefined,
               title: "Re-requests all three zones. The server may answer from its 30-second cache, so values can be up to 30 seconds old.",
             }, busy ? "Refreshing…" : "Refresh"))),
-        h(SubscriptionsZone, { res: subs, provider: effProvider, view: view, onView: setView }),
-        h(UsageZone, { res: usage, window: windowDays, onWindow: setWindowDays, provider: effProvider, onProvider: setProvider, providers: providers }),
+        h(SubscriptionsZone, { res: subs, provider: provider, view: view, onView: onView }),
+        h(UsageZone, {
+          res: usage, window: windowDays, onWindow: setWindowDays, provider: provider, onProvider: setProvider, providers: providers,
+          view: view, dimension: effDimension, onDimension: setDimension,
+        }),
         h(HealthZone, { res: health, view: view }),
         h("div", { className: "ud-sr", role: "status", "aria-live": "polite" },
           busy ? "Refreshing UsageDeck data" : "UsageDeck data up to date"));
@@ -1132,6 +1470,13 @@
     holderNames: holderNames,
     opaqueNote: opaqueNote,
     machineOnlyNote: machineOnlyNote,
+    validateUsage: validateUsage,
+    dimensionOptions: dimensionOptions,
+    effectiveDimension: effectiveDimension,
+    totalTokens: totalTokens,
+    fmtMetric: fmtMetric,
+    scopeCopy: scopeCopy,
+    groupViews: groupViews,
   };
 
   if (typeof module !== "undefined" && module.exports) {

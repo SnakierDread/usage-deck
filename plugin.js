@@ -32,6 +32,23 @@ const DEFAULT_WINDOW = 30
 const VIEWS = ['machine', 'profile']
 const DEFAULT_VIEW = 'machine'
 const ALL_PROVIDERS = '__usage_deck_all__'
+// Usage analytics dimension (analytics-dimensions-breakdown §7): how scoped session records are partitioned.
+const DIMENSIONS = ['all', 'profile', 'model']
+const DEFAULT_DIMENSION = 'all'
+const USAGE_SCHEMA_VERSION = 2
+const COPY_SCOPE_MACHINE = 'All local profile session records — not subscription allowance.'
+const COPY_SCOPE_PROFILE = 'This Hermes profile only — not subscription allowance.'
+const COPY_ATTRIBUTION_LIMIT =
+  "Attribution follows each session's recorded model and provider (its last recorded values after a switch), counted once per session; it does not reconstruct every model call."
+const ATTRIBUTION_TIP = {
+  session_provider: 'Provider recorded on the session.',
+  billing_provider: "Provider taken from the session's billing provider; not measured billing ownership.",
+  models_json: "Provider inferred from this profile's local models.json catalog by exact model id; not measured billing ownership.",
+  unknown: 'No provider was recorded for this session and the local catalog does not name one.'
+}
+const USAGE_REASONS = { no_observations: true, source_unavailable: true }
+const METRIC_FIELDS = ['input_count', 'output_count', 'estimated_usd', 'sessions', 'api_calls']
+const GROUP_PALETTE = 8
 
 const CONF_LABEL = { exact: 'Exact', estimated: 'Estimated', opaque: 'Opaque', self_hosted: 'Self-hosted' }
 const CONF_RANK = { opaque: 0, estimated: 1, exact: 2 }
@@ -645,7 +662,8 @@ function classifyRestError(e) {
   return new UdError('backend_unavailable')
 }
 
-function unwrapEnvelope(resp) {
+// `version` is the wire version the endpoint speaks: 1 for subscriptions/health, 2 for usage.
+function unwrapEnvelope(resp, version) {
   if (!isObj(resp)) {
     throw new UdError('malformed')
   }
@@ -656,7 +674,7 @@ function unwrapEnvelope(resp) {
     throw code ? new UdError('deck', { code }) : new UdError('malformed')
   }
 
-  if (resp.ok !== true || !isObj(resp.meta) || resp.meta.schema_version !== 1 || !isObj(resp.data)) {
+  if (resp.ok !== true || !isObj(resp.meta) || resp.meta.schema_version !== (version || 1) || !isObj(resp.data)) {
     throw new UdError('malformed')
   }
 
@@ -681,24 +699,144 @@ function validateSubscriptions(env) {
   return { cards: d.cards, inventory_state: d.inventory_state, view: d.view, meta: env.meta }
 }
 
-function validateUsage(env, windowDays, provider) {
-  const d = env.data
+function validMetrics(m) {
+  return isObj(m) && Array.isArray(m.missing_fields) && METRIC_FIELDS.every(f => m[f] === null || num(m[f]) !== null)
+}
 
-  if (d.window_days !== windowDays || !Array.isArray(d.series) || !d.series.every(isObj)) {
-    throw new UdError('malformed')
+// Validate the v2 usage payload (analytics-dimensions-breakdown §4). `query` is {provider, mode, dimension} as
+// requested: the answer must be for the same window and provider filter (a stale or unfiltered answer is never
+// shown under a filtered label). mode/dimension come from the response: the server may clamp them
+// (profile-restricted principal) and the UI renders the EFFECTIVE scope.
+function validateUsage(env, windowDays, query) {
+  const d = env.data
+  const q = query || {}
+  const bad = () => new UdError('malformed')
+
+  if (d.window_days !== windowDays || (d.provider_id ?? null) !== (q.provider || null)) {
+    throw bad()
   }
 
-  if ((d.provider_id ?? null) !== (provider || null)) {
-    throw new UdError('malformed')
+  if ((d.mode !== 'machine' && d.mode !== 'profile') || !DIMENSIONS.includes(d.dimension)) {
+    throw bad()
+  }
+
+  if (q.mode && q.dimension && d.mode === q.mode && d.dimension !== q.dimension) {
+    throw bad()
+  }
+
+  for (const k of ['series', 'groups', 'rows', 'providers', 'sources']) {
+    if (!Array.isArray(d[k]) || !d[k].every(isObj)) {
+      throw bad()
+    }
+  }
+
+  if (!validMetrics(d.totals)) {
+    throw bad()
+  }
+
+  if (!d.groups.every(g => typeof g.id === 'string' && typeof g.series_id === 'string' && Array.isArray(g.row_ids) && validMetrics(g.totals))) {
+    throw bad()
+  }
+
+  if (!d.rows.every(r => typeof r.id === 'string' && validMetrics(r.metrics))) {
+    throw bad()
   }
 
   return {
     window_days: d.window_days,
     provider_id: str(d.provider_id),
+    mode: d.mode,
+    dimension: d.dimension,
     series: d.series,
-    reason: has(REASON_TEXT, d.reason) ? d.reason : null,
+    groups: d.groups,
+    rows: d.rows,
+    totals: d.totals,
+    providers: d.providers.filter(p => str(p.id) && str(p.label)).map(p => ({ id: p.id, label: p.label })),
+    sources: d.sources,
+    complete: d.complete !== false,
+    top_n: num(d.top_n),
+    reason: has(USAGE_REASONS, d.reason) ? d.reason : null,
     meta: env.meta
   }
+}
+
+// Dimension options of a mode: machine offers All | By profile | By model, a single profile All | By model.
+function dimensionOptions(mode) {
+  const all = [
+    { id: 'all', label: 'All' },
+    { id: 'profile', label: 'By profile' },
+    { id: 'model', label: 'By model' }
+  ]
+
+  return mode === 'profile' ? all.filter(o => o.id !== 'profile') : all
+}
+
+// A by-profile view does not exist for a single profile.
+function effectiveDimension(mode, dimension) {
+  return mode === 'profile' && dimension === 'profile' ? 'all' : dimension
+}
+
+// Total tokens of a metrics object: null when neither component is known; `partial` when only one is.
+function totalTokens(m) {
+  const i = num(m && m.input_count)
+  const o = num(m && m.output_count)
+
+  if (i === null && o === null) {
+    return { value: null, partial: false }
+  }
+
+  return { value: (i || 0) + (o || 0), partial: i === null || o === null }
+}
+
+// Cell text of a possibly unavailable count: null is a dash, a measured zero is 0.
+function fmtMetric(v, unit) {
+  return num(v) === null ? '—' : fmtNumber(v, unit || 'count')
+}
+
+function scopeCopy(mode) {
+  return mode === 'machine' ? COPY_SCOPE_MACHINE : COPY_SCOPE_PROFILE
+}
+
+function providerLabelOf(providers, id) {
+  const hit = (providers || []).filter(p => p.id === id)[0]
+
+  return hit ? hit.label : str(id) || 'Unknown'
+}
+
+function profileDbLabel(row) {
+  return (row.is_global === true ? 'global (default home)' : str(row.profile) || 'profile') + ' · state.db'
+}
+
+// Groups joined with their series (by series_id) in server order; a group without a series is dropped.
+function groupViews(data) {
+  const byId = {}
+  const rowsById = {}
+
+  data.series.forEach(s => {
+    if (str(s.id)) {
+      byId[s.id] = s
+    }
+  })
+  data.rows.forEach(r => {
+    rowsById[r.id] = r
+  })
+
+  const out = []
+
+  data.groups.forEach((g, i) => {
+    const series = has(byId, g.series_id) ? byId[g.series_id] : null
+
+    if (series) {
+      out.push({ group: g, series, color: i % GROUP_PALETTE, rows: g.row_ids.map(id => rowsById[id]).filter(Boolean) })
+    }
+  })
+
+  return out
+}
+
+// Theme-neutral categorical hue per group slot (the SDK has no categorical palette).
+function groupStroke(i) {
+  return 'hsl(' + ((i * 47 + 210) % 360) + ' 65% 55%)'
 }
 
 function validateHealth(env) {
@@ -827,7 +965,7 @@ function purge(reg, keep) {
 
 // One guarded GET: capture-checked before the call and again after resolution AND
 // rejection. A mismatch throws the retired sentinel; old data / old errors never surface.
-async function guardedGet(reg, scope, path, validate) {
+async function guardedGet(reg, scope, path, validate, version) {
   assertLive(reg, scope)
 
   let raw
@@ -847,7 +985,7 @@ async function guardedGet(reg, scope, path, validate) {
     throw classifyRestError(failure)
   }
 
-  return validate(unwrapEnvelope(raw))
+  return validate(unwrapEnvelope(raw, version))
 }
 
 function useResourceQuery(reg, scope, spec) {
@@ -860,12 +998,13 @@ function useResourceQuery(reg, scope, spec) {
     spec.view,
     spec.resource,
     spec.windowKey,
-    spec.providerKey
+    spec.providerKey,
+    spec.dimension || ''
   ]
 
   return ui.useQuery({
     queryKey: key,
-    queryFn: () => guardedGet(reg, scope, spec.path, spec.validate),
+    queryFn: () => guardedGet(reg, scope, spec.path, spec.validate, spec.version),
     enabled: spec.enabled,
     refetchInterval: POLL_MS,
     refetchIntervalInBackground: false,
@@ -971,7 +1110,7 @@ function Zone(props) {
 
   return h(
     'section',
-    { 'aria-labelledby': headingId, 'data-zone': props.id, style: { marginTop: '1.75rem' } },
+    { 'aria-labelledby': headingId, 'data-zone': props.id, ...(props.dataAttrs || {}), style: { marginTop: '1.75rem' } },
     h(
       'div',
       {
@@ -1486,13 +1625,394 @@ function LineChart(props) {
   )
 }
 
+// Table cells shared by the dimension tables.
+const TH = { textAlign: 'left', padding: '0.15rem 0.5rem', ...MUTED }
+const TD = { padding: '0.15rem 0.5rem', fontSize: '0.75rem' }
+
+// A metric cell: dash for unavailable, 0 for a measured zero, `*` on a known subtotal that misses sessions.
+function MetricCell(props) {
+  const m = props.metrics
+  const v = num(m && m[props.field])
+  const partial = v !== null && Array.isArray(m.missing_fields) && m.missing_fields.includes(props.field)
+
+  return h(
+    'td',
+    {
+      'data-field': props.field,
+      'data-partial': partial ? 'true' : undefined,
+      title: partial ? 'Known subtotal: some sessions did not record this value.' : v === null ? 'Not recorded.' : undefined,
+      style: TD
+    },
+    fmtMetric(v, props.unit),
+    partial ? h('span', { 'aria-hidden': 'true' }, '*') : null
+  )
+}
+
+function TotalTokensCell(props) {
+  const t = totalTokens(props.metrics)
+
+  return h(
+    'td',
+    {
+      'data-field': 'total_tokens',
+      'data-partial': t.partial ? 'true' : undefined,
+      title: t.partial ? 'Known subtotal: only one of input / output was recorded.' : undefined,
+      style: TD
+    },
+    t.value === null ? '—' : fmtNumber(t.value, 'count'),
+    t.partial ? h('span', { 'aria-hidden': 'true' }, '*') : null
+  )
+}
+
+// Whole-scope totals: independent of the dimension, the top-N cut and the legend.
+function TotalsBar(props) {
+  const t = props.totals
+  const partial = Array.isArray(t.missing_fields) && t.missing_fields.length > 0
+  const tt = totalTokens(t)
+  const items = [
+    ['Input', fmtMetric(t.input_count, 'count')],
+    ['Output', fmtMetric(t.output_count, 'count')],
+    ['Total tokens', tt.value === null ? '—' : fmtNumber(tt.value, 'count')],
+    ['Est. USD', fmtMetric(t.estimated_usd, 'usd')],
+    ['Sessions', fmtMetric(t.sessions, 'count')],
+    ['API calls', fmtMetric(t.api_calls, 'count')]
+  ]
+
+  return h(
+    'div',
+    { 'data-usage-totals': 'true', style: { marginTop: '0.75rem', borderTop: '1px solid ' + STROKE, paddingTop: '0.5rem' } },
+    h('p', { style: { ...MUTED, margin: 0 } }, 'Totals for the whole filtered scope, including any group hidden in the legend.'),
+    h(
+      'dl',
+      { style: { display: 'flex', flexWrap: 'wrap', gap: '0.25rem 1.25rem', margin: '0.25rem 0 0' } },
+      items.map(it =>
+        h(
+          'div',
+          { key: it[0] },
+          h('dt', { style: MUTED }, it[0]),
+          h('dd', { style: { margin: 0, fontSize: '0.85rem', fontWeight: 500 } }, it[1])
+        )
+      )
+    ),
+    partial
+      ? h(
+          'p',
+          { 'data-totals-partial': 'true', style: { ...MUTED, margin: '0.25rem 0 0' } },
+          '* Some sessions did not record: ' + t.missing_fields.join(', ') + '. Those figures are known subtotals; nothing is estimated for the missing values.'
+        )
+      : null
+  )
+}
+
+function CoverageNote(props) {
+  const d = props.data
+
+  if (d.complete) {
+    return null
+  }
+
+  const bad = d.sources.filter(x => x.state === 'unavailable' || x.state === 'excluded')
+
+  return h(
+    'div',
+    { role: 'status', 'data-coverage': 'incomplete', style: { border: '1px solid ' + STROKE, borderRadius: '6px', padding: '0.5rem 0.75rem', marginBottom: '0.5rem' } },
+    h('div', { style: { fontSize: '0.8rem', fontWeight: 500 } }, '⚠ ' + (d.mode === 'machine' ? 'Incomplete machine coverage' : 'Incomplete coverage')),
+    h('p', { style: { ...SMALL, margin: '0.25rem 0' } }, 'Totals below cover only the session stores that could be read; nothing is guessed for the others.'),
+    h(
+      'ul',
+      { 'data-sources': 'true', style: { ...SMALL, margin: 0, paddingLeft: '1.1rem' } },
+      d.sources.map((x, i) =>
+        h('li', { key: i, 'data-source-state': str(x.state) || undefined }, (x.is_global === true ? 'global (default home)' : str(x.profile) || 'profile') + ' — ' + (str(x.state) || 'unknown'))
+      )
+    ),
+    bad.length === 0 ? h('p', { style: { ...MUTED, margin: '0.25rem 0 0' } }, 'Some profile stores were not enumerated (safety bound or unreadable directory).') : null
+  )
+}
+
+// Daily provenance rows: which profile DB, model and provider each contribution came from.
+function RowsTable(props) {
+  const rows = props.rows.slice().sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0) || (str(a.profile) < str(b.profile) ? -1 : 1))
+  const shown = rows.slice(0, 500)
+  const cols = (props.withGroup ? ['Group'] : []).concat(['Day', 'Profile DB', 'Model', 'Provider', 'Input', 'Output', 'Est. USD', 'Sessions', 'API calls'])
+
+  return h(
+    'div',
+    { style: { overflowX: 'auto' } },
+    h(
+      'table',
+      { 'data-rows-table': props.name || 'rows', style: { borderCollapse: 'collapse', width: '100%' } },
+      h('thead', null, h('tr', null, cols.map(c => h('th', { key: c, scope: 'col', style: TH }, c)))),
+      h(
+        'tbody',
+        null,
+        shown.map(r => {
+          const attr = str(r.attribution_source)
+          const note = attr === 'billing_provider' ? ' (billing)' : attr === 'models_json' ? ' (catalog)' : ''
+
+          return h(
+            'tr',
+            { key: r.id, 'data-row-id': r.id },
+            props.withGroup ? h('td', { style: TD }, props.groupLabel(r)) : null,
+            h('td', { style: TD }, r.day),
+            h('td', { style: TD }, profileDbLabel(r)),
+            h('td', { style: TD }, str(r.model_id) || 'Unknown model'),
+            h('td', { 'data-attribution': attr || undefined, title: has(ATTRIBUTION_TIP, attr) ? ATTRIBUTION_TIP[attr] : undefined, style: TD }, providerLabelOf(props.providers, r.provider_id) + note),
+            h(MetricCell, { metrics: r.metrics, field: 'input_count' }),
+            h(MetricCell, { metrics: r.metrics, field: 'output_count' }),
+            h(MetricCell, { metrics: r.metrics, field: 'estimated_usd', unit: 'usd' }),
+            h(MetricCell, { metrics: r.metrics, field: 'sessions' }),
+            h(MetricCell, { metrics: r.metrics, field: 'api_calls' })
+          )
+        })
+      )
+    ),
+    rows.length > shown.length ? h('p', { style: MUTED }, 'Showing the first ' + shown.length + ' of ' + rows.length + ' daily rows.') : null
+  )
+}
+
+// One chart over several groups: every line has its own points; null breaks a line, never a zero.
+function GroupChart(props) {
+  const W = 640
+  const H = 190
+  const L = 64
+  const R = 14
+  const T = 12
+  const B = 30
+  const all = []
+  const days = []
+
+  props.lines.forEach(ln => {
+    splitSegments(ln.points, ln.field).forEach(seg =>
+      seg.forEach(p => {
+        all.push(p.v)
+        days.push(p.t)
+      })
+    )
+  })
+
+  if (all.length === 0) {
+    return h(
+      'div',
+      { 'data-chart-empty': props.title, style: { padding: '0.5rem 0' } },
+      h('strong', { style: { fontSize: '0.8rem' } }, props.title),
+      h('p', { style: { ...MUTED, margin: 0 } }, 'No observations for this period.')
+    )
+  }
+
+  const tmin = Math.min(...days)
+  const tmax = Math.max(...days)
+  const ymax = niceMax(Math.max(...all))
+  const x = t => (tmax === tmin ? L + (W - L - R) / 2 : L + ((t - tmin) / (tmax - tmin)) * (W - L - R))
+  const y = v => T + (1 - v / ymax) * (H - T - B)
+  const els = []
+
+  ;[0, 0.5, 1].forEach((f, i) => {
+    const v = ymax * f
+
+    els.push(
+      h(
+        'g',
+        { key: 'tick' + i },
+        h('line', { x1: L, x2: W - R, y1: y(v), y2: y(v), style: { stroke: STROKE, strokeWidth: 1 } }),
+        h('text', { x: L - 6, y: y(v) + 4, textAnchor: 'end', style: { fill: TEXT_3, fontSize: '10px' } }, fmtNumber(v, props.unit))
+      )
+    )
+  })
+  els.push(h('text', { key: 'x0', x: L, y: H - 8, textAnchor: 'start', style: { fill: TEXT_3, fontSize: '10px' } }, new Date(tmin).toISOString().slice(0, 10)))
+
+  if (tmax !== tmin) {
+    els.push(h('text', { key: 'x1', x: W - R, y: H - 8, textAnchor: 'end', style: { fill: TEXT_3, fontSize: '10px' } }, new Date(tmax).toISOString().slice(0, 10)))
+  }
+
+  props.lines.forEach(ln => {
+    const lineStyle = { stroke: ln.stroke, strokeWidth: 2, strokeDasharray: ln.dash, fill: 'none' }
+
+    splitSegments(ln.points, ln.field).forEach((seg, si) => {
+      if (seg.length > 1) {
+        els.push(
+          h('polyline', {
+            key: ln.key + '-s' + si,
+            'data-group-line': ln.groupId,
+            'data-metric': ln.field,
+            style: lineStyle,
+            points: seg.map(p => x(p.t).toFixed(1) + ',' + y(p.v).toFixed(1)).join(' ')
+          })
+        )
+      }
+
+      seg.forEach(p => {
+        els.push(
+          h(
+            'circle',
+            { key: ln.key + '-' + p.day, 'data-group-line': ln.groupId, 'data-metric': ln.field, cx: x(p.t), cy: y(p.v), r: 3, style: { fill: ln.stroke } },
+            h('title', null, ln.tip(p))
+          )
+        )
+      })
+    })
+  })
+
+  return h(
+    'figure',
+    { 'data-chart': props.title, style: { margin: 0, minWidth: 0 } },
+    h(
+      'figcaption',
+      { style: { fontSize: '0.8rem', fontWeight: 500, display: 'flex', flexWrap: 'wrap', gap: '0.25rem 0.75rem', alignItems: 'center' } },
+      props.title,
+      props.note ? h('span', { style: MUTED }, props.note) : null
+    ),
+    h(
+      'svg',
+      { viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': props.title + ', ' + props.lines.length + ' lines', style: { width: '100%', height: 'auto', maxWidth: '100%' } },
+      els
+    )
+  )
+}
+
+function pointTip(view, p) {
+  const owners = (Array.isArray(view.group.profiles) ? view.group.profiles : []).map(o => (o.is_global === true ? 'global' : str(o.profile))).filter(Boolean)
+
+  return (
+    str(view.group.label) +
+    ' — ' +
+    p.day +
+    ': input ' +
+    fmtMetric(p.input_count) +
+    ', output ' +
+    fmtMetric(p.output_count) +
+    ', est. ' +
+    fmtMetric(p.estimated_usd, 'usd') +
+    (owners.length ? '; profiles: ' + owners.join(', ') : '')
+  )
+}
+
+// By profile / By model: one shared legend drives both charts and the grouped tables (no refetch).
+function GroupedView(props) {
+  const d = props.data
+  const views = useMemo(() => groupViews(d), [d])
+  const [hidden, setHidden] = useState({})
+  const visible = views.filter(v => !hidden[v.group.id])
+  const anyHidden = views.some(v => hidden[v.group.id])
+  const byProfile = d.dimension === 'profile'
+  const tokenLines = []
+  const spendLines = []
+  const toggle = id =>
+    setHidden(prev => {
+      const n = { ...prev }
+
+      if (n[id]) {
+        delete n[id]
+      } else {
+        n[id] = true
+      }
+
+      return n
+    })
+
+  visible.forEach(v => {
+    const pts = sortedByDay(v.series.points)
+    const stroke = groupStroke(v.color)
+    const base = { stroke, groupId: v.group.id, points: pts, tip: p => pointTip(v, p) }
+
+    tokenLines.push({ key: v.group.id + '-in', field: 'input_count', dash: undefined, ...base })
+    tokenLines.push({ key: v.group.id + '-out', field: 'output_count', dash: '4 3', ...base })
+    spendLines.push({ key: v.group.id + '-usd', field: 'estimated_usd', dash: undefined, ...base })
+  })
+
+  const otherView = visible.filter(v => v.group.is_other === true)[0] || null
+  const groupOfRow = {}
+  const mainRows = []
+
+  views.forEach(v => v.rows.forEach(r => (groupOfRow[r.id] = v.group)))
+  visible.forEach(v => {
+    if (v.group.is_other !== true) {
+      v.rows.forEach(r => mainRows.push(r))
+    }
+  })
+
+  return h(
+    'div',
+    { 'data-dimension-view': d.dimension, style: { display: 'flex', flexDirection: 'column', gap: '0.75rem' } },
+    h(
+      'div',
+      { role: 'group', 'aria-label': byProfile ? 'Profiles' : 'Models', style: { display: 'flex', flexWrap: 'wrap', gap: '0.4rem' } },
+      views.map(v =>
+        h(
+          ui.Button,
+          {
+            key: v.group.id,
+            type: 'button',
+            variant: hidden[v.group.id] ? 'outline' : 'default',
+            size: 'sm',
+            'aria-pressed': hidden[v.group.id] ? 'false' : 'true',
+            'data-group-id': v.group.id,
+            onClick: () => toggle(v.group.id)
+          },
+          h('svg', { width: 22, height: 8, 'aria-hidden': 'true', style: { marginRight: '0.35rem' } }, h('line', { x1: 0, x2: 22, y1: 4, y2: 4, style: { stroke: groupStroke(v.color), strokeWidth: 2 } })),
+          str(v.group.label)
+        )
+      ),
+      h(ui.Button, { type: 'button', variant: 'outline', size: 'sm', disabled: !anyHidden, 'data-show-all': 'true', onClick: () => setHidden({}) }, 'Show all')
+    ),
+    d.dimension === 'model' && d.top_n
+      ? h('p', { style: { ...MUTED, margin: 0 } }, 'Top ' + d.top_n + ' models by known input + output tokens over this window; every remaining model is rolled up into Other.')
+      : null,
+    h(
+      'div',
+      { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 22rem), 1fr))', gap: '1rem' } },
+      h(GroupChart, { title: 'Tokens (count)', unit: 'count', lines: tokenLines, note: 'solid = input · dashed = output' }),
+      h(GroupChart, { title: 'Estimated spend (USD)', unit: 'usd', lines: spendLines })
+    ),
+    h(
+      'div',
+      { style: { overflowX: 'auto' } },
+      h(
+        'table',
+        { 'data-summary-table': d.dimension, style: { borderCollapse: 'collapse', width: '100%' } },
+        h('thead', null, h('tr', null, ['Group', 'Input', 'Output', 'Total tokens', 'Est. USD', 'Sessions', 'API calls'].map(c => h('th', { key: c, scope: 'col', style: TH }, c)))),
+        h(
+          'tbody',
+          null,
+          visible.map(v =>
+            h(
+              'tr',
+              { key: v.group.id, 'data-group-id': v.group.id },
+              h('td', { style: TD }, str(v.group.label)),
+              h(MetricCell, { metrics: v.group.totals, field: 'input_count' }),
+              h(MetricCell, { metrics: v.group.totals, field: 'output_count' }),
+              h(TotalTokensCell, { metrics: v.group.totals }),
+              h(MetricCell, { metrics: v.group.totals, field: 'estimated_usd', unit: 'usd' }),
+              h(MetricCell, { metrics: v.group.totals, field: 'sessions' }),
+              h(MetricCell, { metrics: v.group.totals, field: 'api_calls' })
+            )
+          )
+        )
+      )
+    ),
+    h(
+      'details',
+      { 'data-grouped-rows': 'true' },
+      h('summary', { style: { ...SMALL, cursor: 'pointer' } }, 'Daily rows by ' + (byProfile ? 'profile' : 'model') + ' (' + mainRows.length + ')'),
+      h(RowsTable, { rows: mainRows, providers: props.providers, withGroup: true, name: 'grouped', groupLabel: r => str(groupOfRow[r.id] && groupOfRow[r.id].label) })
+    ),
+    otherView
+      ? h(
+          'details',
+          { 'data-other-rows': 'true' },
+          h('summary', { style: { ...SMALL, cursor: 'pointer' } }, 'Other — ' + otherView.rows.length + ' daily rows from the models rolled up into Other'),
+          h(RowsTable, { rows: otherView.rows, providers: props.providers, name: 'other' })
+        )
+      : null
+  )
+}
+
 function SeriesBlock(props) {
   const s = props.series
   const conf = effectiveConfidence(s.confidence, has(SOURCE_CEILING, s.source) ? SOURCE_CEILING[s.source] : 'opaque')
   const sorted = sortedByDay(s.points)
   const tip =
     'Source: Hermes session analytics. Scope: ' +
-    (s.scope === 'profile' ? 'this Hermes profile' : 'provider-attributed') +
+    (s.scope === 'machine' ? 'all local profiles' : s.scope === 'profile' ? 'this Hermes profile' : 'provider-attributed') +
     '. Period: ' +
     (isObj(s.period) && s.period.start ? fmtTime(s.period.start) + ' to ' + fmtTime(s.period.end) : 'rolling window') +
     '. Checked: ' +
@@ -1515,7 +2035,7 @@ function SeriesBlock(props) {
       'div',
       { style: { display: 'flex', flexWrap: 'wrap', gap: '0.25rem 0.5rem', alignItems: 'center', marginBottom: '0.5rem' } },
       h(ConfBadge, { conf, tip }),
-      h(ui.Badge, { variant: 'outline' }, s.scope === 'profile' ? 'This Hermes profile' : 'Provider-attributed'),
+      h(ui.Badge, { variant: 'outline' }, s.scope === 'machine' ? 'All local profiles' : s.scope === 'profile' ? 'This Hermes profile' : 'Provider-attributed'),
       h(
         'span',
         { style: MUTED },
@@ -1578,7 +2098,15 @@ function SeriesBlock(props) {
               )
             )
           )
+        ),
+    props.rows && props.rows.length > 0
+      ? h(
+          'details',
+          { 'data-provenance': 'true', style: { marginTop: '0.5rem' } },
+          h('summary', { style: { ...SMALL, cursor: 'pointer' } }, 'Contributions by profile DB, model and provider (' + props.rows.length + ')'),
+          h(RowsTable, { rows: props.rows, providers: props.providers, name: 'provenance' })
         )
+      : null
   )
 }
 
@@ -1586,6 +2114,9 @@ function UsageZone(props) {
   const rs = props.rs
   const providers = props.providers
   const selected = providers.filter(p => p.id === props.provider)[0]
+  const d = rs.data
+  const mode = d ? d.mode : props.view
+  const dimension = d ? d.dimension : effectiveDimension(props.view, props.dimension)
   let content
 
   if (rs.phase === 'loading') {
@@ -1593,19 +2124,24 @@ function UsageZone(props) {
   } else if (rs.phase === 'error') {
     content = h(ErrorBlock, { what: 'usage analytics', error: rs.error, onRetry: props.onRetry })
   } else {
-    const d = rs.data
     const err = rs.error ? h(ErrorBlock, { key: 'err', what: 'usage analytics', error: rs.error, onRetry: props.onRetry }) : null
     let inner
 
     if (d.series.length === 0) {
-      const reasonKey = d.reason || (props.provider ? 'attribution_unavailable' : 'no_observations')
+      const reasonKey = d.reason || 'no_observations'
 
-      inner = h('p', { 'data-chart-state': reasonKey, style: { ...SMALL, margin: 0 } }, REASON_TEXT[reasonKey])
+      inner = h(
+        'p',
+        { 'data-chart-state': reasonKey, style: { ...SMALL, margin: 0 } },
+        d.provider_id && reasonKey === 'no_observations' ? 'No observations for ' + providerLabelOf(d.providers, d.provider_id) + ' in this period.' : REASON_TEXT[reasonKey]
+      )
+    } else if (d.dimension === 'all') {
+      inner = d.series.map((s, i) => h(SeriesBlock, { key: str(s.id) || i, series: s, rows: d.rows, providers: d.providers }))
     } else {
-      inner = d.series.map((s, i) => h(SeriesBlock, { key: str(s.id) || i, series: s }))
+      inner = h(GroupedView, { key: [d.mode, d.dimension, d.window_days, d.provider_id].join('|'), data: d, providers: d.providers })
     }
 
-    content = h('div', { 'aria-busy': rs.refreshing ? 'true' : undefined }, err, inner)
+    content = h('div', { 'aria-busy': rs.refreshing ? 'true' : undefined }, err, h(CoverageNote, { data: d }), inner, h(TotalsBar, { totals: d.totals }))
   }
 
   return h(
@@ -1614,7 +2150,18 @@ function UsageZone(props) {
       id: 'usage',
       title: 'Usage analytics',
       badge: zoneBadge(rs),
+      dataAttrs: { 'data-mode': mode, 'data-dimension': dimension },
       controls: [
+        h(
+          'div',
+          { key: 'dimension', role: 'group', 'aria-label': 'Analytics dimension', 'data-dimension-toggle': dimension },
+          h(ui.SegmentedControl, {
+            options: dimensionOptions(mode),
+            value: dimension,
+            onChange: id => props.onDimension(id),
+            sizing: 'content'
+          })
+        ),
         h(
           'div',
           { key: 'window', role: 'group', 'aria-label': 'Time window' },
@@ -1632,15 +2179,14 @@ function UsageZone(props) {
           h(
             ui.SelectContent,
             null,
-            h(ui.SelectItem, { key: ALL_PROVIDERS, value: ALL_PROVIDERS }, 'All (this profile)'),
+            h(ui.SelectItem, { key: ALL_PROVIDERS, value: ALL_PROVIDERS }, 'All providers'),
             providers.map(p => h(ui.SelectItem, { key: p.id, value: p.id }, p.label))
           )
         )
       ],
-      note:
-        'This Hermes profile only — not subscription allowance. Usage follows the active gateway profile even when machine inventory is selected.' +
-        (props.provider ? ' Filtered to ' + (selected ? selected.label : 'the selected provider') + '. Session analytics carry no per-provider attribution.' : '')
+      note: scopeCopy(mode) + (props.provider ? ' Filtered to ' + (selected ? selected.label : 'the selected provider') + '.' : '')
     },
+    h('p', { 'data-attribution-limit': 'true', style: { ...MUTED, margin: '0 0 0.75rem' } }, COPY_ATTRIBUTION_LIMIT),
     content
   )
 }
@@ -1828,6 +2374,7 @@ function ScopedPage(props) {
   const scope = props.scope
   const view = props.view
   const windowDays = props.windowDays
+  const dimension = effectiveDimension(view, props.dimension)
   const [provider, setProvider] = useState('')
   const live = scopeIsLive(reg, scope)
 
@@ -1845,8 +2392,10 @@ function ScopedPage(props) {
     view,
     windowKey: windowDays,
     providerKey: provider,
-    path: '/usage?window=' + windowDays + '&view=' + view + (provider ? '&provider=' + encodeURIComponent(provider) : ''),
-    validate: env => validateUsage(env, windowDays, provider),
+    dimension,
+    version: USAGE_SCHEMA_VERSION,
+    path: '/usage?mode=' + view + '&dimension=' + dimension + '&window=' + windowDays + (provider ? '&provider=' + encodeURIComponent(provider) : ''),
+    validate: env => validateUsage(env, windowDays, { provider, mode: view, dimension }),
     enabled: live
   })
   const healthQ = useResourceQuery(reg, scope, {
@@ -1865,35 +2414,21 @@ function ScopedPage(props) {
   const health = resourceState(live ? healthQ : null)
   const effectiveView = subs.data ? subs.data.view : null
 
-  const providers = useMemo(() => {
-    const seen = {}
-    const out = []
-    const cards = subs.data ? subs.data.cards : []
+  // Provider options come from the analytics itself (historical providers + Unknown), not the subscription
+  // inventory; the last answer's list is kept while the next one loads so the selector never flickers empty.
+  const [providerOptions, setProviderOptions] = useState([])
+  const usageData = usage.data
 
-    cards.forEach(c => {
-      const id = str(c.provider_id)
-
-      if (id && !has(seen, id)) {
-        seen[id] = true
-        out.push({ id, label: str(c.provider_label) || id })
-      }
-    })
-
-    return out
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subs.data])
+  useEffect(() => {
+    if (usageData) {
+      setProviderOptions(usageData.providers)
+    }
+  }, [usageData])
 
   const selectable = useMemo(
-    () => (provider && !providers.some(p => p.id === provider) ? [...providers, { id: provider, label: provider }] : providers),
-    [providers, provider]
+    () => (provider && !providerOptions.some(p => p.id === provider) ? [...providerOptions, { id: provider, label: provider }] : providerOptions),
+    [providerOptions, provider]
   )
-
-  // A provider that vanished from a successfully loaded inventory falls back to All.
-  useEffect(() => {
-    if (provider && subs.phase === 'ready' && !subs.error && !providers.some(p => p.id === provider)) {
-      setProvider('')
-    }
-  }, [provider, providers, subs.phase, subs.error])
 
   // provider_not_found invalidates the filter (not a missing backend).
   const usageErr = usage.error
@@ -1944,6 +2479,9 @@ function ScopedPage(props) {
       provider,
       onProvider: setProvider,
       providers: selectable,
+      view,
+      dimension,
+      onDimension: props.onDimension,
       onRetry: retryUsage
     }),
     h(HealthZone, { rs: health, effectiveView, requestedView: view, onRetry: retryHealth })
@@ -1960,6 +2498,12 @@ function GatedPage(props) {
   const epoch = ui.useGatewayActivationEpoch()
   const [view, setView] = useState(DEFAULT_VIEW)
   const [windowDays, setWindowDays] = useState(DEFAULT_WINDOW)
+  const [dimension, setDimension] = useState(DEFAULT_DIMENSION)
+  // Machine -> profile resets a by-profile dimension to All before anything is fetched.
+  const onView = v => {
+    setView(v)
+    setDimension(d => effectiveDimension(v, d))
+  }
   const scope = {
     generation: reg.id,
     epoch,
@@ -1998,8 +2542,10 @@ function GatedPage(props) {
     scope,
     view,
     windowDays,
-    onView: setView,
-    onWindow: setWindowDays
+    dimension,
+    onView,
+    onWindow: setWindowDays,
+    onDimension: setDimension
   })
 }
 
