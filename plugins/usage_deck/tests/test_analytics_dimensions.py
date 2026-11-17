@@ -788,5 +788,51 @@ class UsageSchemaGuardTests(unittest.TestCase):
                 self.assertEqual(sanitize(sample, {secret}), sample)
 
 
+class ModelIdVerbatimTests(unittest.TestCase):
+    """Gate 4 decision (t_ac53ed12): by-model keys are the recorded ``sessions.model`` string, byte for byte.
+
+    Design §7 keys by "exact model ID, not model family or provider" and §5 forbids alias/prefix matching, so no
+    canonicalisation may exist: the real builder DB records ``claude-sonnet-5-5`` (dash) and the acceptance prose
+    shorthand ``sonnet-5.5`` is NOT an id. Expected values are hand-written, never derived from the code under test.
+    """
+
+    DASH, DOT, SHORT = "claude-sonnet-5-5", "claude-sonnet-5.5", "sonnet-5.5"
+
+    def setUp(self):
+        self.m = Machine(self)
+        self.m.write_db(None, [S("r1", 1, self.DASH, "anthropic", None, 10, 5, 0.1, 1, "anthropic")])
+        self.m.write_db("builder", [S("b1", 1, self.DASH, "anthropic", None, 100, 50, 0.5, 2, "anthropic"),
+                                    S("b2", 2, self.DOT, "anthropic", None, 7, 3, 0.2, 1, "anthropic")])
+        self.m.write_db("verifier", [S("v1", 1, "gpt-6-luna", "openai", None, 40, 20, 0.4, 3, "openai")])
+        self.svc = self.m.service()
+
+    def get(self, params):
+        status, body = self.svc.handle("usage", params)
+        self.assertEqual(status, 200, body)
+        return body["data"]
+
+    def test_machine_by_model_publishes_each_recorded_spelling_verbatim_and_distinct(self):
+        data = self.get([("mode", "machine"), ("dimension", "model")])
+        by_id = {g["model_id"]: g for g in data["groups"]}
+        self.assertEqual(set(by_id), {self.DASH, self.DOT, "gpt-6-luna"})  # dash and dot stay two groups
+        self.assertNotIn(self.SHORT, by_id)
+        self.assertEqual(by_id[self.DASH]["label"], f"{self.DASH} (Anthropic)")
+        self.assertEqual(by_id[self.DASH]["totals"]["input_count"], 110)  # root + builder dash sessions only
+        self.assertEqual(by_id[self.DOT]["totals"]["input_count"], 7)
+        rows = {(r["profile"], r["model_id"]) for r in data["rows"]}
+        self.assertEqual(rows, {("global", self.DASH), ("builder", self.DASH), ("builder", self.DOT),
+                                ("verifier", "gpt-6-luna")})
+        self.assertNotIn(self.SHORT, {r["model_id"] for r in data["rows"]})  # no row is rewritten to the shorthand
+
+    def test_profile_mode_by_model_is_verbatim_too(self):
+        data = self.get([("mode", "profile"), ("profile", "builder"), ("dimension", "model")])
+        self.assertEqual({g["model_id"] for g in data["groups"]}, {self.DASH, self.DOT})
+
+    def test_shorthand_is_not_an_alias_group_ids_are_exact(self):
+        data = self.get([("mode", "machine"), ("dimension", "model")])
+        self.assertIn('model:"claude-sonnet-5-5"', {g["id"] for g in data["groups"]})
+        self.assertEqual(attribute(self.SHORT, None, None, {self.DASH: "anthropic"}), ("unknown", "unknown"))
+
+
 if __name__ == "__main__":
     unittest.main()
