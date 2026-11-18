@@ -716,6 +716,114 @@ class ReadOnlyAndFailureTests(unittest.TestCase):
         self.assertEqual({g["model_id"] for g in body["data"]["groups"]}, {None})  # unpublishable ids collapse to Unknown model
 
 
+class AuthorizedHomeTests(unittest.TestCase):
+    """A profile-restricted principal is bound to the host-authorized home: ``profile=`` can name only that home."""
+
+    SIBLING_MARK = 777777777
+
+    def setUp(self):
+        self.m = Machine(self)
+        seed_machine(self.m)
+        # distinctive sibling/root rows: if any leaks, these huge counts show up in the totals
+        for name in (None, "b"):
+            conn = sqlite3.connect(self.m.home(name) / "state.db")
+            conn.execute("INSERT INTO sessions (id, model, provider, started_at, input_tokens, output_tokens, "
+                         "estimated_cost_usd, api_call_count) VALUES ('big', 'x', 'openai', ?, ?, 1, 5.0, 3)",
+                         (NOW_TS - DAY, self.SIBLING_MARK))
+            conn.commit()
+            conn.close()
+        self.opened = []
+        self.analytics_profiles = []
+        opened = self.opened
+
+        class Spy(SessionDbReader):
+            def read_groups(self, directory, cutoff):
+                opened.append(Path(directory).resolve())
+                return super().read_groups(directory, cutoff)
+
+        self.Spy = Spy
+
+    def service(self, home):
+        svc = self.m.service(home=home, reader_factory=self.Spy)
+        inner = svc._analytics_factory
+        seen = self.analytics_profiles
+
+        def recording(profile):
+            seen.append(profile)
+            return inner(profile)
+
+        svc._analytics_factory = recording
+        return svc
+
+    def assert_only_home(self, home):
+        allowed = {self.m.home(home).resolve()}
+        self.assertEqual(set(self.opened) - allowed, set())
+        self.assertTrue(all(p is None for p in self.analytics_profiles), self.analytics_profiles)
+
+    def test_profile_principal_cannot_select_sibling_or_root(self):
+        svc = self.service("a")
+        for selector in ("b", "default", "DEFAULT", "global", "A", "nope"):
+            for params in ([], [("mode", "machine")], [("dimension", "model")],
+                           [("provider", "openai")], [("window", "7")]):
+                with self.subTest(selector=selector, params=params):
+                    status, body = svc.handle("usage", [("profile", selector), *params], profile_only=True)
+                    self.assertEqual((status, body["error"]["code"]), (400, "invalid_query"), body)
+                    self.assertNotIn(str(self.SIBLING_MARK), json.dumps(body))
+        for endpoint in ("subscriptions", "health"):
+            for selector in ("b", "default"):
+                status, body = svc.handle(endpoint, [("profile", selector)], profile_only=True)
+                self.assertEqual((status, body["error"]["code"]), (400, "invalid_query"), (endpoint, selector))
+        self.assertEqual(self.opened, [])  # refused before any home was opened
+        self.assertEqual(self.analytics_profiles, [])
+
+    def test_own_selector_is_bound_to_the_authorized_home(self):
+        svc = self.service("a")
+        for window in (7, 30, 90):
+            base = svc.handle("usage", [("window", str(window))], profile_only=True)[1]["data"]
+            assert_totals(self, totals_of(base), direct_totals(A_SESSIONS, window))
+            for selector in ("a", "current", "CURRENT"):
+                for dimension in ("all", "model"):
+                    with self.subTest(window=window, selector=selector, dimension=dimension):
+                        params = [("profile", selector), ("dimension", dimension), ("window", str(window))]
+                        status, body = svc.handle("usage", params, profile_only=True)
+                        self.assertEqual(status, 200, body)
+                        self.assertEqual(body["data"]["mode"], "profile")
+                        assert_totals(self, totals_of(body["data"]), direct_totals(A_SESSIONS, window))
+        # machine/by-profile asks keep clamping to this home even alongside an own-home selector
+        status, body = svc.handle("usage", [("profile", "a"), ("mode", "machine"), ("dimension", "profile")],
+                                  profile_only=True)
+        self.assertEqual((status, body["data"]["mode"], body["data"]["dimension"]), (200, "profile", "all"))
+        self.assertEqual({s["profile"] for s in body["data"]["sources"]}, {"a"})
+        self.assert_only_home("a")
+
+    def test_root_principal_may_name_default_but_not_a_profile(self):
+        svc = self.service(None)
+        for selector in ("a", "b"):
+            status, body = svc.handle("usage", [("profile", selector)], profile_only=True)
+            self.assertEqual((status, body["error"]["code"]), (400, "invalid_query"), selector)
+        self.assertEqual(self.opened, [])
+        big = S("big", 1, "x", "openai", None, self.SIBLING_MARK, 1, 5.0, 3, "openai")
+        expected = direct_totals(ROOT_SESSIONS + [big])
+        for selector in ("default", "DEFAULT", "current"):
+            status, body = svc.handle("usage", [("profile", selector)], profile_only=True)
+            self.assertEqual(status, 200, body)
+            assert_totals(self, totals_of(body["data"]), expected)
+        self.assert_only_home(None)
+
+    def test_rejection_does_not_poison_the_cache(self):
+        svc = self.service("a")
+        first = svc.handle("usage", [], profile_only=True)[1]["data"]
+        self.assertEqual(svc.handle("usage", [("profile", "b")], profile_only=True)[0], 400)
+        self.assertEqual(svc.handle("usage", [], profile_only=True)[1]["data"], first)
+        assert_totals(self, totals_of(first), direct_totals(A_SESSIONS))
+
+    def test_unrestricted_dashboard_session_still_selects_any_home(self):
+        svc = self.service("a")
+        status, body = svc.handle("usage", [("profile", "b"), ("mode", "profile")])
+        self.assertEqual(status, 200, body)
+        self.assertEqual(totals_of(body["data"])["input_count"], 123 + self.SIBLING_MARK)
+
+
 class UsageSchemaGuardTests(unittest.TestCase):
     """The v2 usage payload is validated exactly like the legacy shapes: no unknown keys, no bad enums."""
 

@@ -237,11 +237,42 @@ class UsageDeckService:
             query = parse_query(endpoint, items)
         except ApiError as exc:
             return self._fail(exc.status, exc.error, endpoint)
+        if profile_only:
+            try:
+                query = self._bind_authorized_home(query)
+            except ApiError as exc:
+                return self._fail(exc.status, exc.error, endpoint)
+            except InventoryUnavailable:
+                return self._fail(503, make_error("inventory_unavailable"), endpoint)
+            except Exception as exc:  # noqa: BLE001 - invariant failure at the coordinator boundary
+                log.error("usage_deck internal error: %s", type(exc).__name__)
+                return self._fail(500, make_error("internal_error"), endpoint)
         if profile_only and query.view != "profile":
             query = replace(query, view="profile", dimension="all" if query.dimension == "profile" else query.dimension)
         elif endpoint == "usage" and query.view == "profile" and query.dimension == "profile":
             return self._fail(400, make_error("invalid_query"), endpoint)  # a single profile has no by-profile view
         return getattr(self, endpoint)(query)
+
+    def _bind_authorized_home(self, query: Query) -> Query:
+        """Pin a profile-restricted principal to the host-authorized (request-scoped) home.
+
+        The inventory source reads exactly the home the host authorized for this request. A ``profile``
+        selector is accepted only when it names that very home (its profile name, ``default`` for the global
+        home, or ``current``) and is then dropped so every reader resolves the authorized home itself; any
+        other selector (a sibling profile, or ``default``/root from a profile home) is refused before any
+        home is opened. Fails closed: with no way to name the authorized home only the absent/``current``
+        selector is accepted.
+        """
+        selector = query.profile
+        if selector is None:
+            return query
+        if selector.lower() != "current":
+            name_of = getattr(self._inventory_factory(), "profile_name", None)
+            name, is_global = name_of() if callable(name_of) else ("current", False)
+            own = selector.lower() == "default" if is_global else (name != "current" and selector == name)
+            if not own:
+                raise ApiError(400, "invalid_query")
+        return replace(query, profile=None)
 
     # -- envelope helpers ------------------------------------------------
     def _meta(self, errors: List[dict], schema_version: int = 1) -> dict:
