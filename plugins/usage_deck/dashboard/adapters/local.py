@@ -49,6 +49,11 @@ class _Snapshot:
 
 _NOT_RUN = _Attempt(False, "")
 
+#: Fixed, secret-free identity on every self-hosted probe (the one UsageDeck sends everywhere, ``cloud.py``).
+#: Boxes published through a CDN/WAF tunnel refuse the stock ``Python-urllib`` agent outright (Cloudflare error
+#: 1010 -> 403 on /metrics AND /v1/models) while answering the same anonymous GET with 200 for any other agent.
+PROBE_USER_AGENT = "HermesAgent/usage-deck"
+
 
 def _denied(attempt: _Attempt) -> bool:
     """The endpoint answered 401/403 (an access refusal, as opposed to an outage or a bad payload)."""
@@ -73,7 +78,7 @@ class SelfHostedAdapter(BaseAdapter):
     # -- snapshot --------------------------------------------------------
     def _attempt(self, path: str, validator, credential) -> Tuple[_Attempt, Any]:
         ctx = self.ctx
-        headers = {"Accept": "application/json, text/plain"}
+        headers = {"Accept": "application/json, text/plain", "User-Agent": PROBE_USER_AGENT}
         if credential:
             headers["Authorization"] = "Bearer " + credential.reveal()
         try:
@@ -202,7 +207,13 @@ class SelfHostedAdapter(BaseAdapter):
         if metrics_attempt.failure in ("connection", "timeout"):
             return _Snapshot(True, metrics_attempt, _NOT_RUN, None, "offline", "opaque", "box_offline",
                              None, None)
-        return _Snapshot(True, metrics_attempt, _NOT_RUN, None, "unknown", "opaque", "source_unavailable",
+        # The request WAS made, so the row must not read as "Not probed" (reason source_unavailable is what the
+        # machine view renders for local inventory that never went out): an anonymous 401/403 is the box refusing
+        # an unidentified caller, anything else (non-200, not an exposition) is "metrics unavailable".
+        if _denied(metrics_attempt) and not self.ctx.health_credential:
+            return _Snapshot(True, metrics_attempt, _NOT_RUN, None, "degraded", "opaque", "credentials_missing",
+                             None, None)
+        return _Snapshot(True, metrics_attempt, _NOT_RUN, None, "unknown", "opaque", "metrics_unavailable",
                          None, None)
 
     def _do_probe(self) -> ProbeResult:
