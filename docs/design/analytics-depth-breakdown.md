@@ -144,6 +144,13 @@ Repo group ID grammar is `repo:null` for missing, otherwise `repo:` plus a JSON 
 
 For dimension=repo the current API `groups`, `series`, `rows` use repo membership. Aggregate facts into repo provenance leaves keyed by `(holder, legacy local day, exact model, attributed provider, repo key)` and group totals, preserving legacy UsageMetrics formulas including its old cost behavior **for this new view only**. Add nullable `repo_basename` to these repo provenance rows (absent/null on old dimensions), plus `repo_paths` for sanitized detail (array or null); allowlists must include both. Existing row IDs in all/profile/model remain byte-identical. Repo-only row IDs must encode repo membership with the existing deterministic ID utility; no collision across different repo keys. If pricing integration is present, annotate split repo leaves before summing so api_equivalent fields conserve too; its priced-row counters may differ for repo because leaves split, but amounts must not.
 
+**Row counters vs dollars across dimensions (reconciled, t_045ea424).** `totals.api_equivalent.{priced,unpriced,proxy}_rows` count the leaves of the response's own `rows[]` (`priced_rows + unpriced_rows == len(rows)`; `pricing.unknown_row_ids` lists exactly the unpriced ones). all/profile/model share the legacy leaves, so their whole block is identical. `repo` splits a legacy leaf into one leaf per repository, so its counters exceed the legacy ones by exactly the extra leaves, while `amount_pico_usd` is identical because each repo part is priced once and the integer parts sum to the whole (per legacy leaf: sum of known part amounts == legacy leaf amount). Two cases produce the extra leaves:
+
+1. **Recorded-zero part.** A split part whose sessions recorded 0 input and 0 output tokens is a *priced genuine zero* (api-equivalent-pricing §6), so it adds `priced_rows +1`, and `proxy_rows +1` when the model resolves through a proxy alias, and adds no dollars. This is the live-machine `priced +1 / proxy +1` observation (window=90: on 2026-11-07 one `qwen3.8-flash-next` session in `hermes-agent` recorded 0/0 tokens while the other 88 sessions of that day/model/provider leaf were unscoped).
+2. **No-token part.** A split part whose sessions recorded no tokens at all is unpriced (`tokens_missing`) and adds `unpriced_rows +1`, while the legacy merged leaf prices the known sums of its siblings. This can flip `partial` to true for repo only; no money moves.
+
+Counter parity across dimensions is therefore *not* an invariant; dollar parity and the leaf-by-leaf reconciliation above are. Pinned by `tests/test_api_equivalent_row_counts.py`.
+
 **Conservation is over one identical authorized session set:**
 
 ```
