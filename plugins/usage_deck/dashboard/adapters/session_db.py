@@ -224,12 +224,48 @@ class ObsGroup:
 
 
 @dataclass(frozen=True)
+class RawFact:
+    """One session row of the depth projection (analytics-depth-breakdown §3), values exactly as stored.
+
+    Validation (invalid epochs, negative counters, booleans) is deliberately NOT done here: the pure builder in
+    ``analytics_depth`` owns it so the rules are testable without a database.
+    """
+
+    day: Any  # legacy local day, ``date(started_at, 'unixepoch', 'localtime')`` (same expression as the counters)
+    started_at: Any
+    ended_at: Any
+    last_activity_at: Any
+    model: Any
+    provider: Any
+    billing: Any
+    repo_root: Any
+    input_tokens: Any
+    output_tokens: Any
+    cost: Any
+    cache_read_tokens: Any
+    cache_write_tokens: Any
+    reasoning_tokens: Any
+    api_calls: Any
+
+
+@dataclass(frozen=True)
+class HomeFacts:
+    """The second projection of one home, scanned inside the SAME read-only transaction as its counters."""
+
+    rows: Tuple[RawFact, ...]
+    #: Names of the projected columns this database does not have (they project SQL NULL).
+    absent: FrozenSet[str] = frozenset()
+
+
+@dataclass(frozen=True)
 class HomeRead:
     profile: str
     is_global: bool
     state: str
     groups: Tuple[ObsGroup, ...] = ()
     models: Dict[str, Optional[str]] = field(default_factory=dict)
+    #: None = the depth projection is unavailable for this home (failed/not attempted); never an empty scan.
+    facts: Optional[HomeFacts] = None
 
 
 def _db_uri(path: Path, immutable: bool = False) -> str:
@@ -298,6 +334,14 @@ class SessionDbReader:
 
     def read_groups(self, directory: Path, cutoff: float) -> Optional[Tuple[ObsGroup, ...]]:
         """The grouped counters of ``<directory>/state.db`` newer than ``cutoff``; None = unavailable."""
+        both = self.read_groups_with_facts(directory, cutoff)
+        return None if both is None else both[0]
+
+    def read_groups_with_facts(self, directory: Path, cutoff: float) -> Optional[Tuple[Tuple[ObsGroup, ...], Optional[HomeFacts]]]:
+        """``(counters, facts)`` of one home from ONE read-only transaction (one snapshot, no N+1).
+
+        None = the counters are unavailable. ``facts`` is None when only the optional depth projection failed:
+        the legacy counters then stay available (design §3)."""
         path = Path(directory) / DB_NAME
         conn = None
         uri = open_uri(path)
@@ -313,7 +357,12 @@ class SessionDbReader:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
             if "started_at" not in columns:
                 return None
-            return self._query(conn, columns, cutoff)
+            groups = self._query(conn, columns, cutoff)
+            try:
+                facts: Optional[HomeFacts] = self._query_facts(conn, columns, cutoff)
+            except (sqlite3.Error, ValueError, UnicodeError, OverflowError):
+                facts = None
+            return groups, facts
         except (sqlite3.Error, OSError, ValueError, UnicodeError, OverflowError):
             return None
         finally:
@@ -322,6 +371,20 @@ class SessionDbReader:
                     conn.close()
                 except sqlite3.Error:
                     pass
+
+    #: Projected session columns besides ``started_at``; one that the database lacks projects SQL NULL.
+    FACT_COLUMNS = ("ended_at", "last_activity_at", "model", "provider", "billing_provider", "git_repo_root",
+                    "input_tokens", "output_tokens", "estimated_cost_usd", "cache_read_tokens",
+                    "cache_write_tokens", "reasoning_tokens", "api_call_count")
+
+    @classmethod
+    def _query_facts(cls, conn: sqlite3.Connection, columns: set, cutoff: float) -> HomeFacts:
+        """Every session newer than ``cutoff`` (the exact legacy predicate) as one row each."""
+        select = ", ".join(c if c in columns else "NULL" for c in cls.FACT_COLUMNS)
+        sql = (f"SELECT date(started_at, 'unixepoch', 'localtime'), started_at, {select} "
+               "FROM sessions WHERE started_at > ?")
+        rows = tuple(RawFact(*row) for row in conn.execute(sql, (cutoff,)))
+        return HomeFacts(rows, frozenset(c for c in cls.FACT_COLUMNS if c not in columns))
 
     @staticmethod
     def _query(conn: sqlite3.Connection, columns: set, cutoff: float) -> Tuple[ObsGroup, ...]:
@@ -370,13 +433,22 @@ class SessionDbReader:
             if state == STATE_OK and ident in seen:
                 state = STATE_EXCLUDED
             groups: Tuple[ObsGroup, ...] = ()
+            facts: Optional[HomeFacts] = None
             if state == STATE_OK:
                 seen.add(ident)
-                read = self.read_groups(directory, cutoff)
+                read = self._read_home(directory, cutoff)
                 if read is None:
                     state = STATE_UNAVAILABLE
                 else:
-                    groups = read
+                    groups, facts = read
             models = load_models_map(directory) if state in (STATE_OK, STATE_ABSENT) else {}
-            out.append(HomeRead(name, is_global, state, groups, models))
+            out.append(HomeRead(name, is_global, state, groups, models, facts))
         return out
+
+    def _read_home(self, directory: Path, cutoff: float):
+        """``(groups, facts)`` or None. A subclass that replaces ``read_groups`` (a test seam) keeps owning the
+        counters; it has no depth projection, which therefore reads as unavailable for that home."""
+        if type(self).read_groups is not SessionDbReader.read_groups:
+            groups = self.read_groups(directory, cutoff)
+            return None if groups is None else (groups, None)
+        return self.read_groups_with_facts(directory, cutoff)

@@ -3,7 +3,7 @@
  *
  * One screen, three independent zones:
  *   1. Subscriptions grid   GET /api/plugins/usage-deck/subscriptions?view=machine|profile
- *   2. Usage analytics      GET /api/plugins/usage-deck/usage?mode=machine|profile&dimension=all|profile|model&window=7|30|90[&provider=<id>]
+ *   2. Usage analytics      GET /api/plugins/usage-deck/usage?mode=machine|profile&dimension=all|profile|model|repo&window=7|30|90[&provider=<id>]
  *   3. Self-hosted health   GET /api/plugins/usage-deck/health?view=machine|profile
  *
  * Plain IIFE, no build step, no runtime dependencies (DESIGN.md §6): React, hooks and
@@ -34,7 +34,7 @@
   const DEFAULT_VIEW = "machine";
   const POLL_MS = 60000;
   // Usage analytics dimension (analytics-dimensions-breakdown §7): how the scoped session records are partitioned.
-  const DIMENSIONS = ["all", "profile", "model"];
+  const DIMENSIONS = ["all", "profile", "model", "repo"];
   const DEFAULT_DIMENSION = "all";
   const USAGE_SCHEMA_VERSION = 2;
   const GROUP_PALETTE = 8; // ud-g0..ud-g7 colour classes (cycled)
@@ -423,13 +423,14 @@
       top_n: num(d.top_n),
       reason: has(USAGE_REASONS, d.reason) ? d.reason : null,
       pricing: isObj(d.pricing) ? d.pricing : null,
+      depth: decodeDepth(d),
       meta: env.meta,
     };
   }
 
-  /** Dimension options of a mode: machine offers All | By profile | By model, a single profile All | By model. */
+  /** Dimension options of a mode: machine offers All | By profile | By model | By repo, a single profile All | By model | By repo. */
   function dimensionOptions(mode) {
-    const all = [{ id: "all", label: "All" }, { id: "profile", label: "By profile" }, { id: "model", label: "By model" }];
+    const all = [{ id: "all", label: "All" }, { id: "profile", label: "By profile" }, { id: "model", label: "By model" }, { id: "repo", label: "By repo" }];
     return mode === "profile" ? all.filter(function (o) { return o.id !== "profile"; }) : all;
   }
 
@@ -584,6 +585,256 @@ function pricingNotes(data) {
   return w.filter(function (c) { return Object.prototype.hasOwnProperty.call(API_WARNING_TEXT, c); }).map(function (c) { return { code: c, text: API_WARNING_TEXT[c] }; });
 }
 // </api-equivalent-helpers>
+
+// <depth-helpers>
+// Analytics depth (docs/design/analytics-depth-breakdown.md §4-§7). Pure helpers, no rendering: the SAME block
+// (byte for byte) lives in dist/index.js and desktop/plugin.js (tests/frontend/depth.test.js enforces it).
+// null means "not recorded" everywhere: it is never coerced to 0, never averaged and never drawn as a zero cell.
+const DEPTH_FIELDS = ["durations", "duration_samples", "heatmap", "cache_metrics", "repo_rollup", "model_rollup", "depth_totals", "depth_status"];
+const DEPTH_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const DURATION_LABEL = "Completed session duration";
+const CACHE_LABEL = "Effective recorded $/Mtok (weighted diagnostic)";
+const CACHE_TIP = "Recorded cost divided by base-cache-weighted recorded counters. Reasoning may overlap output; not a tariff, invoice, or measured savings.";
+const CACHE_NOTE = "Recorded-cost basis: base-cache weighting of recorded counters. No prices are fetched and nothing here is a bill.";
+const HEAT_NOTE = "Each session is counted once, in the hour it started (never split across midnight or hours).";
+const CACHE_REASON_TEXT = {
+  missing_usage: "Some sessions did not record every token counter.",
+  missing_cost: "Some sessions did not record a cost.",
+  unknown_discount: "No published cache discount for this exact provider and model.",
+  zero_denominator: "No weighted tokens to divide by.",
+  incomplete_source: "Some session stores could not be read; ratios are not computed over a partial set.",
+};
+const DEPTH_MISSING_TEXT = {
+  input_tokens: "input tokens", output_tokens: "output tokens", estimated_cost_usd: "cost", cache_read_tokens: "cache reads",
+  cache_write_tokens: "cache writes", reasoning_tokens: "reasoning tokens", duration: "a completed duration",
+};
+
+function depthCount(v) {
+  return typeof v === "number" && isFinite(v) && v >= 0 && Math.floor(v) === v ? v : null;
+}
+
+function depthNum(v) {
+  return typeof v === "number" && isFinite(v) && v >= 0 ? v : null;
+}
+
+function depthText(v) {
+  return typeof v === "string" ? v : null;
+}
+
+function depthGroup(n) {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+function depthPad(n) {
+  return n < 10 ? "0" + n : String(n);
+}
+
+/** Decode the eight additive members of a usage payload. An older server omits all of them: `supported` is false. */
+function decodeDepth(d) {
+  const own = function (o, k) { return Object.prototype.hasOwnProperty.call(o, k); };
+  const supported = !!d && typeof d === "object" && DEPTH_FIELDS.every(function (k) { return own(d, k); });
+  const out = { supported: supported, durations: null, samples: null, heatmap: null, cache: null, repos: null, totals: null, status: null };
+  if (!supported) return out;
+  const du = d.durations;
+  if (du && typeof du === "object" && !Array.isArray(du)) {
+    out.durations = { p50: depthNum(du.p50), p90: depthNum(du.p90), p99: depthNum(du.p99), mean: depthNum(du.mean), max: depthNum(du.max) };
+    out.samples = depthCount(d.duration_samples);
+  }
+  const hm = d.heatmap;
+  if (hm && typeof hm === "object" && !Array.isArray(hm)) {
+    // `starts` (exact epochs) is what makes a LOCAL rendering correct; without a trustworthy list there is none.
+    let starts = Array.isArray(hm.starts) ? hm.starts : null;
+    if (starts) {
+      starts = starts.map(function (s) {
+        const ok = s && typeof s === "object" && typeof s.started_at === "number" && isFinite(s.started_at)
+          && depthCount(s.sessions) !== null && s.sessions >= 1 && (s.total_tokens === null || depthCount(s.total_tokens) !== null)
+          && !isNaN(new Date(s.started_at * 1000).getTime());
+        return ok ? { t: s.started_at, n: s.sessions, tokens: s.total_tokens } : null;
+      });
+      if (starts.some(function (s) { return s === null; })) starts = null;
+    }
+    out.heatmap = { starts: starts };
+  }
+  out.cache = Array.isArray(d.cache_metrics) ? d.cache_metrics.filter(function (r) { return r && typeof r === "object"; }) : null;
+  out.repos = Array.isArray(d.repo_rollup) ? d.repo_rollup.filter(function (r) { return r && typeof r === "object"; }) : null;
+  const t = d.depth_totals;
+  if (t && typeof t === "object") out.totals = { sessions: depthCount(t.sessions), tokens: depthCount(t.total_tokens), cost: depthNum(t.total_cost) };
+  const s = d.depth_status;
+  if (s && typeof s === "object") {
+    const missing = {};
+    const raw = s.missing && typeof s.missing === "object" ? s.missing : {};
+    Object.keys(DEPTH_MISSING_TEXT).forEach(function (k) { missing[k] = depthCount(raw[k]); });
+    out.status = { partial: s.partial === true, excluded: depthCount(s.excluded_started_at), missing: missing };
+  }
+  return out;
+}
+
+/** Human text for a count of seconds; null is a dash. The exact value is always available as a tooltip. */
+function fmtDuration(sec) {
+  const s = depthNum(sec);
+  if (s === null) return "\u2014";
+  if (s < 60) return String(Math.round(s * 10) / 10) + " s";
+  const whole = Math.round(s);
+  if (whole < 3600) return Math.floor(whole / 60) + "m " + (whole % 60) + "s";
+  return Math.floor(whole / 3600) + "h " + Math.floor((whole % 3600) / 60) + "m";
+}
+
+function exactSeconds(sec) {
+  const s = depthNum(sec);
+  return s === null ? "Not recorded." : String(s) + " seconds";
+}
+
+/** The five stats and the sample count as display items (every null stays a dash). */
+function durationItems(stats, samples) {
+  const st = stats || {};
+  const items = ["p50", "p90", "p99", "mean", "max"].map(function (k) {
+    return { id: k, label: k, text: fmtDuration(st[k]), title: exactSeconds(st[k]) };
+  });
+  const n = depthCount(samples);
+  items.push({ id: "samples", label: "samples", text: n === null ? "\u2014" : depthGroup(n), title: "Completed sessions with a valid start and end." });
+  return items;
+}
+
+/** Browser-local weekday/hour cell of one epoch (seconds), judged by the zone rules of THAT instant. */
+function localCellOf(epochSec) {
+  const d = new Date(epochSec * 1000);
+  return { row: (d.getDay() + 6) % 7, col: d.getHours() };
+}
+
+/** Re-bucket the exact start epochs into the 7x24 local grid (row-major, Monday first). Each start counts once. */
+function localHeat(starts) {
+  const cells = [];
+  for (let i = 0; i < DEPTH_DAYS.length * 24; i++) cells.push({ sessions: 0, tokens: null });
+  (starts || []).forEach(function (s) {
+    const c = localCellOf(s.t);
+    const cell = cells[c.row * 24 + c.col];
+    cell.sessions += s.n;
+    if (s.tokens !== null) cell.tokens = (cell.tokens || 0) + s.tokens;
+  });
+  return cells;
+}
+
+/** Colour level 0..4 and the "not recorded" flag of a cell for the active metric. */
+function heatLevel(cell, metric, max) {
+  if (metric === "tokens" && cell.sessions > 0 && cell.tokens === null) return { level: 0, na: true };
+  const v = metric === "tokens" ? cell.tokens : cell.sessions;
+  if (!v || !max) return { level: 0, na: false };
+  return { level: Math.max(1, Math.min(4, Math.ceil((4 * v) / max))), na: false };
+}
+
+function heatMax(cells, metric) {
+  let max = 0;
+  cells.forEach(function (c) {
+    const v = metric === "tokens" ? c.tokens : c.sessions;
+    if (v !== null && v > max) max = v;
+  });
+  return max;
+}
+
+function heatCellLabel(row, col, cell, partial) {
+  const tokens = cell.tokens === null ? (cell.sessions ? "tokens not recorded" : "no tokens") : depthGroup(cell.tokens) + " tokens";
+  return DEPTH_DAYS[row] + " " + depthPad(col) + ":00, " + cell.sessions + (cell.sessions === 1 ? " session, " : " sessions, ") + tokens + (partial ? " (partial data)" : "");
+}
+
+function localOffset(epochSec) {
+  const m = -new Date(epochSec * 1000).getTimezoneOffset();
+  const a = Math.abs(m);
+  return (m < 0 ? "-" : "+") + depthPad(Math.floor(a / 60)) + ":" + depthPad(a % 60);
+}
+
+/** The start cohorts inside one local cell (ISO instant + the local offset tell a repeated DST hour apart). */
+function heatDetail(starts, row, col) {
+  return (starts || []).filter(function (s) {
+    const c = localCellOf(s.t);
+    return c.row === row && c.col === col;
+  }).sort(function (a, b) { return a.t - b.t; }).map(function (s) {
+    return { t: s.t, iso: new Date(s.t * 1000).toISOString(), offset: localOffset(s.t), sessions: s.n, tokens: s.tokens };
+  });
+}
+
+function localZoneName() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "local time";
+  } catch (e) {
+    return "local time";
+  }
+}
+
+function fmtPct(v) {
+  const n = depthNum(v);
+  return n === null ? "\u2014" : n.toFixed(2) + "%";
+}
+
+function fmtCacheCount(v) {
+  const n = depthCount(v);
+  return n === null ? "\u2014" : depthGroup(n);
+}
+
+function fmtCacheMoney(v) {
+  const n = depthNum(v);
+  return n === null ? "\u2014" : "$" + n.toFixed(4);
+}
+
+/** One cache-economics row for display. Reuses the backend numbers verbatim: no money is recomputed here. */
+function cacheRowView(r) {
+  const eff = depthNum(r.effective_cost_per_mtok);
+  const mult = depthNum(r.discount_multiplier);
+  const reason = depthText(r.reason);
+  return {
+    model: depthText(r.model) === null ? "Unknown model" : r.model,
+    provider: depthText(r.provider_id),
+    hit: fmtPct(r.hit_rate_pct),
+    cached: fmtCacheCount(r.cached_input_tokens),
+    uncached: fmtCacheCount(r.uncached_input_tokens),
+    writes: fmtCacheCount(r.cache_write_tokens),
+    reasoning: fmtCacheCount(r.reasoning_tokens),
+    share: fmtPct(r.reasoning_share_pct),
+    effective: fmtCacheMoney(eff),
+    effectiveTitle: eff === null ? "Not computed." : "Exact: " + String(eff) + " USD per million weighted tokens (recorded-cost basis)",
+    output: fmtCacheCount(r.output_tokens),
+    multiplier: mult === null ? "\u2014" : String(mult),
+    rateSource: depthText(r.rate_source) === null ? "\u2014" : r.rate_source,
+    reason: reason,
+    reasonText: reason !== null && Object.prototype.hasOwnProperty.call(CACHE_REASON_TEXT, reason) ? CACHE_REASON_TEXT[reason] : null,
+  };
+}
+
+/** One-line disclosure of what was not recorded / readable (never replaces the legacy status cards). */
+function depthStatusLine(status) {
+  if (!status) return null;
+  const bits = [];
+  if (status.partial) bits.push("partial data");
+  if (status.excluded) bits.push(status.excluded + " session" + (status.excluded === 1 ? "" : "s") + " without a valid start time left out");
+  Object.keys(DEPTH_MISSING_TEXT).forEach(function (k) {
+    const n = status.missing[k];
+    if (n) bits.push(n + " without " + DEPTH_MISSING_TEXT[k]);
+  });
+  return bits.length ? "Known subtotals only: " + bits.join("; ") + "." : null;
+}
+
+/** The repo rollup row that belongs to a repo group (rollup rows carry no group id; label + shape identify them). */
+function repoRowFor(group, rollup) {
+  if (!group) return null;
+  const label = depthText(group.label);
+  const missing = group.id === "repo:null";
+  const shaped = function (r) {
+    return r.full_path === null && Array.isArray(r.full_paths) && r.full_paths.length === 0;
+  };
+  const named = (rollup || []).filter(function (r) { return r.repo_basename === label; });
+  // "Unscoped" is both the missing bucket and a possible literal repository name: the empty-path row is the former.
+  const hits = label === "Unscoped" && named.some(function (r) { return shaped(r) === missing; })
+    ? named.filter(function (r) { return shaped(r) === missing; }) : named;
+  if (hits.length <= 1) return hits[0] || null;
+  const sessions = group.totals && group.totals.sessions;
+  return hits.filter(function (r) { return r.sessions === sessions; })[0] || hits[0];
+}
+
+function repoPathSummary(r) {
+  const paths = r && Array.isArray(r.full_paths) ? r.full_paths.filter(function (p) { return typeof p === "string"; }) : [];
+  if (paths.length === 0) return { count: 0, text: null, paths: [] };
+  return { count: paths.length, text: paths.length === 1 ? paths[0] : paths.length + " paths", paths: paths };
+}
+// </depth-helpers>
 
   function scopeCopy(mode) {
     return mode === "machine" ? COPY_SCOPE_MACHINE : COPY_SCOPE_PROFILE;
@@ -1201,6 +1452,22 @@ function pricingNotes(data) {
       return h("th", { key: c, scope: "col", title: c === API_LABEL ? API_TIP : undefined }, c);
     }
 
+    /** Subordinate line of the totals area: completed-session duration percentiles (null stays a dash, never 0). */
+    function DurationLine(props) {
+      const dp = props.depth;
+      if (!dp || !dp.supported) return null;  // an older server: nothing to show, nothing invented
+      if (dp.durations === null) {
+        return h("p", { className: "ud-muted ud-small", "data-duration-summary": "unavailable" }, DURATION_LABEL + ": unavailable (session stores could not be read).");
+      }
+      const items = durationItems(dp.durations, dp.samples);
+      const out = [DURATION_LABEL + ": "];
+      items.forEach(function (it, i) {
+        if (i > 0) out.push(" \u00b7 ");
+        out.push(h("span", { key: it.id, title: it.title, "data-duration": it.id }, it.label + " " + it.text));
+      });
+      return h("p", { className: "ud-muted ud-small", "data-duration-summary": "true" }, out);
+    }
+
     /** Whole-scope totals: independent of the dimension, the top-N cut and the legend. */
     function TotalsBar(props) {
       const t = props.totals;
@@ -1220,9 +1487,119 @@ function pricingNotes(data) {
         h("dl", { className: "ud-vals" }, items.map(function (it) {
           return h("div", { key: it[0] }, h("dt", { title: it[2] }, it[0]), h("dd", null, it[1]));
         })),
+        h(DurationLine, { depth: props.depth }),
         h("p", { className: "ud-muted ud-small", "data-api-footnote": "true" }, API_FOOTNOTE),
         partial ? h("p", { className: "ud-muted ud-small", "data-totals-partial": "true" },
           "* Some sessions did not record: " + t.missing_fields.join(", ") + ". Those figures are known subtotals; nothing is estimated for the missing values.") : null);
+    }
+
+    /** Activity by start time: the exact start epochs are re-bucketed by the BROWSER's zone rules (never a rotated UTC grid). */
+    function HeatmapCard(props) {
+      const dp = props.depth;
+      const [metric, setMetric] = useState("sessions");
+      const [sel, setSel] = useState(null);
+      const starts = dp && dp.heatmap ? dp.heatmap.starts : null;
+      const cells = useMemo(function () { return starts ? localHeat(starts) : null; }, [starts]);
+      if (!dp || !dp.supported) return null;
+      const partial = !!(dp.status && dp.status.partial);
+      let body;
+      if (dp.heatmap === null) {
+        body = h("p", { className: "ud-empty-text", "data-depth-state": "unavailable" }, "Activity heatmap unavailable: the session stores could not be read.");
+      } else if (cells === null) {
+        body = h("p", { className: "ud-empty-text", "data-depth-state": "no-local" }, "Local heatmap unavailable");
+      } else {
+        const max = heatMax(cells, metric);
+        const picked = sel && cells[sel.row * 24 + sel.col];
+        const detail = sel ? heatDetail(starts, sel.row, sel.col) : [];
+        body = h("div", null,
+          h("div", { className: "ud-table-scroll" },
+            h("table", { className: "ud-heat", "data-heat-grid": "local", "data-heat-metric": metric },
+              h("caption", { className: "ud-sr-only" }, "Sessions started per local weekday and hour"),
+              h("thead", null, h("tr", null, h("th", { scope: "col" }, "Day"), Array.from({ length: 24 }, function (_, c) {
+                return h("th", { key: c, scope: "col" }, depthPad(c));
+              }))),
+              h("tbody", null, DEPTH_DAYS.map(function (day, r) {
+                return h("tr", { key: day },
+                  h("th", { scope: "row" }, day),
+                  Array.from({ length: 24 }, function (_, c) {
+                    const cell = cells[r * 24 + c];
+                    const lv = heatLevel(cell, metric, max);
+                    const label = heatCellLabel(r, c, cell, partial);
+                    const on = !!sel && sel.row === r && sel.col === c;
+                    return h("td", { key: c }, h("button", {
+                      type: "button", className: cx("ud-heat-cell", "ud-heat-l" + lv.level, lv.na && "ud-heat-na"),
+                      "aria-label": label, title: label, "aria-pressed": on ? "true" : "false",
+                      "data-heat-cell": r + "-" + c, "data-sessions": String(cell.sessions),
+                      "data-tokens": cell.tokens === null ? "null" : String(cell.tokens), "data-heat-na": lv.na ? "true" : undefined,
+                      onClick: function () { setSel(on ? null : { row: r, col: c }); },
+                    }, lv.na ? "?" : (cell.sessions > 0 ? String(cell.sessions) : "")));
+                  }));
+              })))),
+          sel && picked ? h("div", { className: "ud-heat-detail", "data-heat-detail": sel.row + "-" + sel.col, role: "region",
+            "aria-label": "Sessions started " + DEPTH_DAYS[sel.row] + " " + depthPad(sel.col) + ":00" },
+          h("p", { className: "ud-small" }, heatCellLabel(sel.row, sel.col, picked, partial)),
+          detail.length === 0 ? h("p", { className: "ud-muted ud-small" }, "No sessions started in this hour.") :
+            h("table", { className: "ud-table" },
+              h("thead", null, h("tr", null, ["Start (instant)", "Local offset", "Sessions", "Tokens"].map(function (c) { return h("th", { key: c, scope: "col" }, c); }))),
+              h("tbody", null, detail.map(function (e) {
+                return h("tr", { key: e.t, "data-heat-start": String(e.t) },
+                  h("td", null, e.iso), h("td", null, e.offset), h("td", null, String(e.sessions)),
+                  h("td", null, e.tokens === null ? "\u2014" : depthGroup(e.tokens)));
+              })))) : null);
+      }
+      return h("section", { className: "ud-card ud-depth-card", "data-depth-card": "heatmap", "aria-labelledby": "ud-h-heat" },
+        h("h3", { id: "ud-h-heat" }, "Activity by start time (local)"),
+        h("p", { className: "ud-muted ud-small", "data-heat-caption": "true" }, "Time zone: " + localZoneName() + ". " + HEAT_NOTE),
+        h("div", { role: "group", "aria-label": "Heatmap intensity", className: "ud-seg" }, ["sessions", "tokens"].map(function (m) {
+          return h("button", { key: m, type: "button", className: cx("ud-btn", "ud-seg-btn", metric === m && "ud-seg-on"),
+            "aria-pressed": metric === m ? "true" : "false", "data-heat-toggle": m, onClick: function () { setMetric(m); } },
+          m === "sessions" ? "Sessions" : "Tokens");
+        })),
+        body,
+        depthStatusLine(dp.status) ? h("p", { className: "ud-muted ud-small", "data-depth-status": "true" }, depthStatusLine(dp.status)) : null);
+    }
+
+    /** Cache economics per exact model/provider pair (recorded-cost basis): no top-N, no price fetch, no JS money. */
+    function CacheCard(props) {
+      const dp = props.depth;
+      if (!dp || !dp.supported) return null;
+      const cols = ["Model", "Provider", "Hit %", "Cached input", "Uncached input", "Cache writes", "Reasoning", "Reasoning share", CACHE_LABEL, "Details"];
+      let body;
+      if (dp.cache === null) {
+        body = h("p", { className: "ud-empty-text", "data-depth-state": "unavailable" }, "Cache economics unavailable: the session stores could not be read.");
+      } else if (dp.cache.length === 0) {
+        body = h("p", { className: "ud-empty-text", "data-depth-state": "empty" }, "No sessions in this scope.");
+      } else {
+        body = h("div", { className: "ud-table-scroll ud-cache-scroll" },
+          h("table", { className: "ud-table", "data-cache-table": "true" },
+            h("thead", null, h("tr", null, cols.map(function (c) {
+              return h("th", { key: c, scope: "col", title: c === CACHE_LABEL ? CACHE_TIP : undefined }, c);
+            }))),
+            h("tbody", null, dp.cache.map(function (r, i) {
+              const v = cacheRowView(r);
+              return h("tr", { key: i, "data-cache-row": v.model + "|" + (v.provider || ""), "data-cache-reason": v.reason || undefined },
+                h("td", null, v.model),
+                h("td", null, v.provider === null ? "Unknown" : providerLabelOf(props.providers, v.provider)),
+                h("td", { "data-field": "hit_rate_pct" }, v.hit),
+                h("td", { "data-field": "cached_input_tokens" }, v.cached),
+                h("td", { "data-field": "uncached_input_tokens" }, v.uncached),
+                h("td", { "data-field": "cache_write_tokens" }, v.writes),
+                h("td", { "data-field": "reasoning_tokens" }, v.reasoning),
+                h("td", { "data-field": "reasoning_share_pct" }, v.share),
+                h("td", { "data-field": "effective_cost_per_mtok", title: v.effectiveTitle }, v.effective),
+                h("td", null, h("details", { className: "ud-cache-detail" }, h("summary", null, "Details"),
+                  h("dl", { className: "ud-small" },
+                    h("dt", null, "Output tokens"), h("dd", { "data-field": "output_tokens" }, v.output),
+                    h("dt", null, "Cache discount multiplier"), h("dd", { "data-field": "discount_multiplier" }, v.multiplier),
+                    h("dt", null, "Rate snapshot"), h("dd", { "data-field": "rate_source" }, v.rateSource),
+                    v.reasonText ? h("dt", null, "Why a value is missing") : null, v.reasonText ? h("dd", { "data-field": "reason" }, v.reasonText) : null))));
+            }))));
+      }
+      return h("section", { className: "ud-card ud-depth-card", "data-depth-card": "cache", "aria-labelledby": "ud-h-cache" },
+        h("h3", { id: "ud-h-cache" }, "Cache economics \u00b7 recorded-cost basis"),
+        h("p", { className: "ud-muted ud-small" }, CACHE_NOTE + " " + CACHE_TIP),
+        body,
+        depthStatusLine(dp.status) ? h("p", { className: "ud-muted ud-small", "data-depth-status": "true" }, depthStatusLine(dp.status)) : null);
     }
 
     function CoverageNote(props) {
@@ -1372,7 +1749,43 @@ function pricingNotes(data) {
         ", est. " + fmtMetric(p.estimated_usd, "usd") + (owners.length ? "; profiles: " + owners.join(", ") : "");
     }
 
-    /** By profile / By model: one shared legend drives both charts and the grouped tables (no refetch). */
+    /** By profile / By model / By repo: one shared legend drives both charts and the grouped tables (no refetch). */
+    function GroupDurations(props) {
+      const dp = props.depth;
+      if (!dp || !dp.supported) return null;
+      const withStats = props.views.filter(function (v) { return isObj(v.group.durations); });
+      if (withStats.length === 0) return null;
+      return h("details", { className: "ud-table-wrap", "data-group-durations": "true" },
+        h("summary", null, DURATION_LABEL + " by group"),
+        h("div", { className: "ud-table-scroll" },
+          h("table", { className: "ud-table" },
+            h("thead", null, h("tr", null, ["Group", "p50", "p90", "p99", "mean", "max", "samples"].map(function (c) { return h("th", { key: c, scope: "col" }, c); }))),
+            h("tbody", null, withStats.map(function (v) {
+              const items = durationItems(v.group.durations, v.group.duration_samples);
+              return h("tr", { key: v.group.id, "data-group-id": v.group.id },
+                h("td", null, str(v.group.label)),
+                items.map(function (it) { return h("td", { key: it.id, title: it.title, "data-duration": it.id }, it.text); }));
+            })))));
+    }
+
+    /** Repository path detail: one path in full, several as "N paths" that expand to every path. Text nodes only. */
+    function RepoPaths(props) {
+      const dp = props.depth;
+      if (!dp || !dp.repos) return null;
+      const items = props.views.map(function (v) { return { v: v, p: repoPathSummary(repoRowFor(v.group, dp.repos)) }; })
+        .filter(function (x) { return x.p.count > 0; });
+      if (items.length === 0) return null;
+      return h("details", { className: "ud-table-wrap", "data-repo-paths": "true" },
+        h("summary", null, "Repository paths (" + items.length + ")"),
+        h("ul", { className: "ud-small" }, items.map(function (x) {
+          return h("li", { key: x.v.group.id, "data-repo-group": x.v.group.id },
+            x.p.count === 1 ? str(x.v.group.label) + " \u2014 " + x.p.text
+              : h("details", null, h("summary", null, str(x.v.group.label) + " \u2014 " + x.p.text),
+                h("ul", null, x.p.paths.map(function (p) { return h("li", { key: p }, p); }))));
+        })));
+    }
+
+    /** By profile / By model / By repo: one shared legend drives both charts and the grouped tables (no refetch). */
     function GroupedView(props) {
       const d = props.data;
       const views = useMemo(function () { return groupViews(d); }, [d]);
@@ -1381,6 +1794,10 @@ function pricingNotes(data) {
       const toggle = function (id) { setHidden(function (prev) { const n = Object.assign({}, prev); if (n[id]) delete n[id]; else n[id] = true; return n; }); };
       const anyHidden = views.some(function (v) { return hidden[v.group.id]; });
       const byProfile = d.dimension === "profile";
+      const byRepo = d.dimension === "repo";
+      const noun = byRepo ? "repository" : byProfile ? "profile" : "model";
+      const depthInfo = d.depth || null;
+      const repoOf = function (v) { return byRepo && depthInfo && depthInfo.repos ? repoPathSummary(repoRowFor(v.group, depthInfo.repos)) : null; };
       const tokenLines = [], spendLines = [];
       visible.forEach(function (v) {
         const pts = sortedByDay(v.series.points);
@@ -1396,7 +1813,7 @@ function pricingNotes(data) {
       visible.forEach(function (v) { if (v.group.is_other !== true) v.rows.forEach(function (r) { mainRows.push(r); }); });
       const sumRows = visible.map(function (v) { return v; });
       return h("div", { className: "ud-grouped", "data-dimension-view": d.dimension },
-        h("div", { className: "ud-group-legend", role: "group", "aria-label": byProfile ? "Profiles" : "Models" },
+        h("div", { className: "ud-group-legend", role: "group", "aria-label": byRepo ? "Repositories" : byProfile ? "Profiles" : "Models" },
           views.map(function (v) {
             const on = !hidden[v.group.id];
             return h("button", { key: v.group.id, type: "button", className: cx("ud-btn", "ud-legend-btn", on && "ud-seg-on"),
@@ -1413,11 +1830,12 @@ function pricingNotes(data) {
           h(GroupChart, { title: "Estimated spend (USD)", unit: "usd", lines: spendLines })),
         h("div", { className: "ud-table-scroll" },
           h("table", { className: "ud-table", "data-summary-table": d.dimension },
-            h("thead", null, h("tr", null, ["Group", "Input", "Output", "Total tokens", "Est. USD", API_LABEL, "Sessions", "API calls"].map(apiHead))),
+            h("thead", null, h("tr", null, [byRepo ? "Repository" : "Group", "Input", "Output", "Total tokens", "Est. USD", API_LABEL, "Sessions", "API calls"].map(apiHead))),
             h("tbody", null, sumRows.map(function (v) {
               const t = v.group.totals;
+              const repo = repoOf(v);
               return h("tr", { key: v.group.id, "data-group-id": v.group.id },
-                h("td", null, str(v.group.label)),
+                h("td", null, str(v.group.label), repo && repo.text ? h("div", { className: "ud-muted ud-small", "data-repo-path": repo.count === 1 ? "single" : "multi" }, repo.text) : null),
                 h(MetricCell, { metrics: t, field: "input_count" }),
                 h(MetricCell, { metrics: t, field: "output_count" }),
                 h(TotalTokensCell, { metrics: t }),
@@ -1426,8 +1844,10 @@ function pricingNotes(data) {
                 h(MetricCell, { metrics: t, field: "sessions" }),
                 h(MetricCell, { metrics: t, field: "api_calls" }));
             })))),
+        h(GroupDurations, { views: views, depth: depthInfo }),
+        byRepo ? h(RepoPaths, { views: views, depth: depthInfo }) : null,
         h("details", { className: "ud-table-wrap", "data-grouped-rows": "true", open: undefined },
-          h("summary", null, "Daily rows by " + (byProfile ? "profile" : "model") + " (" + mainRows.length + ")"),
+          h("summary", null, "Daily rows by " + noun + " (" + mainRows.length + ")"),
           h(RowsTable, { rows: mainRows, providers: props.providers, withGroup: true, name: "grouped",
             groupLabel: function (r) { return str(groupOfRow[r.id] && groupOfRow[r.id].label); } })),
         otherView ? h("details", { className: "ud-table-wrap", "data-other-rows": "true" },
@@ -1459,7 +1879,8 @@ function pricingNotes(data) {
         } else {
           inner = h(GroupedView, { key: [d.mode, d.dimension, d.window_days, d.provider_id].join("|"), data: d, providers: d.providers });
         }
-        content = h("div", { "aria-busy": st.refreshing ? "true" : undefined }, err, h(CoverageNote, { data: d }), inner, h(TotalsBar, { totals: d.totals, rowCount: d.rows.length }),
+        content = h("div", { "aria-busy": st.refreshing ? "true" : undefined }, err, h(CoverageNote, { data: d }), inner, h(TotalsBar, { totals: d.totals, rowCount: d.rows.length, depth: d.depth }),
+          h(HeatmapCard, { depth: d.depth }), h(CacheCard, { depth: d.depth, providers: d.providers }),
           h(PricingNotes, { data: d }), h(UnpricedModels, { data: d }));
       }
       const options = dimensionOptions(mode);

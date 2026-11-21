@@ -56,7 +56,7 @@ WINDOWS = (7, 30, 90)
 #: Usage responses carry the expanded dimensions payload (analytics-dimensions-breakdown §4); every other
 #: endpoint stays at ``SCHEMA_VERSION``.
 USAGE_SCHEMA_VERSION = 2
-DIMENSIONS = ("all", "profile", "model")
+DIMENSIONS = ("all", "profile", "model", "repo")
 ATTRIBUTION_SOURCES = ("session_provider", "billing_provider", "models_json", "unknown")
 SOURCE_STATES = ("ok", "absent", "unavailable", "excluded")
 USAGE_REASONS = ("no_observations", "source_unavailable")
@@ -74,9 +74,21 @@ PRICING_WARNINGS = ("pricing_aliases_invalid", "pricing_cache_invalid", "pricing
                     "pricing_refresh_failed", "pricing_seed_invalid", "pricing_stale")
 PICO = 10 ** 12  # one USD in the authoritative integer unit (pico-USD)
 
+# Analytics depth (docs/design/analytics-depth-breakdown.md §2): fixed vocabularies and limits.
+CACHE_REASONS = ("missing_usage", "missing_cost", "unknown_discount", "zero_denominator", "incomplete_source")
+DEPTH_MISSING_NAMES = ("input_tokens", "output_tokens", "estimated_cost_usd", "cache_read_tokens",
+                       "cache_write_tokens", "reasoning_tokens", "duration")
+HEATMAP_DAYS, HEATMAP_HOURS = 7, 24
+MAX_PATH_LEN = 4096
+
 #: Wire field names that contain a sensitive fragment ("key") but are plain public vocabulary: the sanitizer
 #: must not redact them (the value is a source-qualified catalog id, never a credential).
 NON_SECRET_WIRE_NAMES = frozenset({"catalog_key"})
+#: Numeric token-counter names of the analytics-depth objects. They contain the fragment "token" and stay
+#: redacted everywhere EXCEPT inside a mapping whose complete key set is one of those objects (``TOKEN_WIRE_SHAPES``,
+#: defined with the wire tables): a raw host payload's ``input_tokens`` is still masked.
+TOKEN_WIRE_NAMES = frozenset({"total_tokens", "cached_input_tokens", "uncached_input_tokens", "reasoning_tokens",
+                              "cache_write_tokens", "output_tokens", "input_tokens", "cache_read_tokens"})
 
 # Fixed, safe public text. Upstream text never reaches a DTO.
 ERROR_MESSAGES = {
@@ -126,10 +138,13 @@ _TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _TS_FRAC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 _PICO_RE = re.compile(r"^(?:0|[1-9][0-9]{0,30})$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_RATE_SOURCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _CATALOG_KEY_RE = re.compile(r"^(?:litellm|openrouter):[\x21-\x7e]{1,200}$")
 _ROW_ID_RE = re.compile(r"^row_[0-9a-f]{64}$")
 _GROUP_ID_RE = re.compile(r'^(?:all|other|profile:\[(?:true|false),"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"\]'
-                          r'|model:null|model:"[\x21\x23-\x5b\x5d-\x7e]{1,128}")$')
+                          r'|model:null|model:"[\x21\x23-\x5b\x5d-\x7e]{1,128}"'
+                          r'|repo:null|repo:"(?:[\x20\x21\x23-\x5b\x5d-\x7e]|\\["\\]|\\u[0-9a-f]{4}){1,768}"'
+                          r'|repo:sha256:[0-9a-f]{64})$')
 
 
 class DtoError(ValueError):
@@ -437,6 +452,44 @@ class PricingInfo:
 
 
 @dataclass(frozen=True)
+class DurationStats:
+    """Completed-session duration percentiles in seconds; every field null with no valid sample (§2/§3)."""
+
+    p50: Optional[float]
+    p90: Optional[float]
+    p99: Optional[float]
+    mean: Optional[float]
+    max: Optional[float]
+
+    def __post_init__(self) -> None:
+        for name in ("p50", "p90", "p99", "mean", "max"):
+            _number(f"durations.{name}", getattr(self, name), minimum=0)
+
+
+def _check_path(name: str, value: Any, nullable: bool = True) -> Optional[str]:
+    """A recorded repository path (sensitive local telemetry): bounded text without NUL/control characters."""
+    if value is None and nullable:
+        return None
+    if not isinstance(value, str) or len(value) > MAX_PATH_LEN or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise DtoError(f"{name}: invalid path")
+    return value
+
+
+def _check_durations(durations: Any, samples: Any) -> None:
+    if durations is not None and not isinstance(durations, DurationStats):
+        raise DtoError("durations")
+    _integer("duration_samples", samples)
+    if (durations is None) != (samples is None):
+        raise DtoError("durations: object and sample count are null together")
+    if durations is not None and samples == 0 and any(v is not None for v in (
+            durations.p50, durations.p90, durations.p99, durations.mean, durations.max)):
+        raise DtoError("durations: stats without samples")
+    if durations is not None and samples and any(v is None for v in (
+            durations.p50, durations.p90, durations.p99, durations.mean, durations.max)):
+        raise DtoError("durations: samples without stats")
+
+
+@dataclass(frozen=True)
 class ProvenanceRow:
     """A daily aggregate for one ``(home, day, model, provider, attribution)``; never raw session content."""
 
@@ -450,6 +503,10 @@ class ProvenanceRow:
     attribution_source: str
     metrics: UsageMetrics
     pricing: RowPricing = NO_ROW_PRICING
+    #: By-repo leaves only (null on every other dimension): the lexical basename (null = unscoped) and the
+    #: sanitized contributing full paths (design §6).
+    repo_basename: Optional[str] = None
+    repo_paths: Optional[Tuple[str, ...]] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not _ROW_ID_RE.match(self.id):
@@ -469,6 +526,12 @@ class ProvenanceRow:
             raise DtoError("row.pricing")
         if (self.pricing.reason is None) != (self.metrics.api_equivalent.amount_pico_usd is not None):
             raise DtoError("row.pricing: reason must be null exactly when priced")
+        _check_path("row.repo_basename", self.repo_basename)
+        if self.repo_paths is not None:
+            if list(self.repo_paths) != sorted(set(self.repo_paths)):
+                raise DtoError("row.repo_paths")
+            for path in self.repo_paths:
+                _check_path("row.repo_paths", path, nullable=False)
 
 
 @dataclass(frozen=True)
@@ -482,6 +545,9 @@ class UsageGroup:
     row_ids: Tuple[str, ...]
     totals: UsageMetrics
     is_other: bool
+    #: Completed-session duration stats of exactly this group's sessions (design §2); null = unavailable.
+    durations: Optional[DurationStats] = None
+    duration_samples: Optional[int] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not _GROUP_ID_RE.match(self.id):
@@ -502,6 +568,7 @@ class UsageGroup:
         _bool("is_other", self.is_other)
         if self.is_other != (self.id == "other") or (self.is_other and self.model_id is not None):
             raise DtoError("group.is_other")
+        _check_durations(self.durations, self.duration_samples)
 
 
 @dataclass(frozen=True)
@@ -525,6 +592,176 @@ class ProviderOption:
         _str("label", self.label, max_len=128)
         if not self.id or not self.label:
             raise DtoError("provider option")
+
+
+@dataclass(frozen=True)
+class HeatCell:
+    """One weekday×hour cell: sessions started in it and their known input+output tokens (null = none known)."""
+
+    sessions: int
+    total_tokens: Optional[int]
+
+    def __post_init__(self) -> None:
+        _count_req("cell.sessions", self.sessions)
+        _integer("cell.total_tokens", self.total_tokens)
+        if self.sessions == 0 and self.total_tokens is not None:
+            raise DtoError("cell: tokens without sessions")
+
+
+@dataclass(frozen=True)
+class HeatStart:
+    """Sufficient statistic for local re-bucketing: sessions/tokens that share one exact start epoch (seconds)."""
+
+    started_at: float
+    sessions: int
+    total_tokens: Optional[int]
+
+    def __post_init__(self) -> None:
+        _number("start.started_at", self.started_at, nullable=False)
+        if isinstance(self.sessions, bool) or not isinstance(self.sessions, int) or self.sessions < 1:
+            raise DtoError("start.sessions")
+        _integer("start.total_tokens", self.total_tokens)
+
+
+def _known_total(values: Any) -> Optional[int]:
+    known = [v for v in values if v is not None]
+    return sum(known) if known else None
+
+
+@dataclass(frozen=True)
+class Heatmap:
+    """``grid`` = UTC Monday..Sunday × 00..23 (deterministic reference); ``starts`` = exact start epochs."""
+
+    grid: Tuple[Tuple[HeatCell, ...], ...]
+    starts: Tuple[HeatStart, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.grid) != HEATMAP_DAYS or any(
+                len(row) != HEATMAP_HOURS or not all(isinstance(c, HeatCell) for c in row) for row in self.grid):
+            raise DtoError("heatmap.grid shape")
+        if not all(isinstance(s, HeatStart) for s in self.starts):
+            raise DtoError("heatmap.starts")
+        epochs = [s.started_at for s in self.starts]
+        if any(b <= a for a, b in zip(epochs, epochs[1:])):
+            raise DtoError("heatmap.starts must be strictly ascending")
+        cells = [c for row in self.grid for c in row]
+        if sum(c.sessions for c in cells) != sum(s.sessions for s in self.starts) \
+                or _known_total(c.total_tokens for c in cells) != _known_total(s.total_tokens for s in self.starts):
+            raise DtoError("heatmap: grid and starts disagree")
+
+
+@dataclass(frozen=True)
+class CacheRow:
+    """Cache economics of one exact model/provider pair (design §5); ratios are null unless fully supported."""
+
+    model: Optional[str]
+    provider_id: Optional[str]
+    hit_rate_pct: Optional[float]
+    cached_input_tokens: Optional[int]
+    uncached_input_tokens: Optional[int]
+    reasoning_tokens: Optional[int]
+    effective_cost_per_mtok: Optional[float]
+    cache_write_tokens: Optional[int]
+    output_tokens: Optional[int]
+    reasoning_share_pct: Optional[float]
+    discount_multiplier: Optional[float]
+    rate_source: Optional[str]
+    reason: Optional[str]
+
+    def __post_init__(self) -> None:
+        _str("cache.model", self.model, nullable=True, max_len=128)
+        _str("cache.provider_id", self.provider_id, nullable=True, max_len=128)
+        for name in ("cached_input_tokens", "uncached_input_tokens", "reasoning_tokens", "cache_write_tokens",
+                     "output_tokens"):
+            _integer(f"cache.{name}", getattr(self, name))
+        for name in ("hit_rate_pct", "reasoning_share_pct"):
+            value = _number(f"cache.{name}", getattr(self, name), minimum=0)
+            if value is not None and value > 100:
+                raise DtoError(f"cache.{name}: above 100")
+        _number("cache.effective_cost_per_mtok", self.effective_cost_per_mtok, minimum=0)
+        _number("cache.discount_multiplier", self.discount_multiplier, minimum=0)
+        if self.rate_source is not None and (not isinstance(self.rate_source, str)
+                                             or not _RATE_SOURCE_RE.match(self.rate_source)):
+            raise DtoError("cache.rate_source")
+        _enum("cache.reason", self.reason, CACHE_REASONS, nullable=True)
+
+
+@dataclass(frozen=True)
+class RepoRow:
+    """One repository rollup row: lexical basename (Unscoped = missing), its path detail and shared-fact totals."""
+
+    repo_basename: str
+    full_path: Optional[str]
+    sessions: int
+    total_tokens: Optional[int]
+    total_cost: Optional[float]
+    full_paths: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _check_path("repo.repo_basename", self.repo_basename, nullable=False)
+        _check_path("repo.full_path", self.full_path)
+        _count_req("repo.sessions", self.sessions)
+        _integer("repo.total_tokens", self.total_tokens)
+        _number("repo.total_cost", self.total_cost, minimum=0)
+        if list(self.full_paths) != sorted(set(self.full_paths)):
+            raise DtoError("repo.full_paths")
+        for path in self.full_paths:
+            _check_path("repo.full_paths", path, nullable=False)
+        if self.full_path is not None and tuple(self.full_paths) != (self.full_path,):
+            raise DtoError("repo.full_path must equal its single full_paths entry")
+
+
+@dataclass(frozen=True)
+class ModelRow:
+    """Conservation reference: one exact model/provider pair over the same session set as the repo rollup."""
+
+    model: Optional[str]
+    provider_id: Optional[str]
+    sessions: int
+    total_tokens: Optional[int]
+    total_cost: Optional[float]
+
+    def __post_init__(self) -> None:
+        _str("model.model", self.model, nullable=True, max_len=128)
+        _str("model.provider_id", self.provider_id, nullable=True, max_len=128)
+        _count_req("model.sessions", self.sessions)
+        _integer("model.total_tokens", self.total_tokens)
+        _number("model.total_cost", self.total_cost, minimum=0)
+
+
+@dataclass(frozen=True)
+class DepthTotals:
+    sessions: int
+    total_tokens: Optional[int]
+    total_cost: Optional[float]
+
+    def __post_init__(self) -> None:
+        _count_req("totals.sessions", self.sessions)
+        _integer("totals.total_tokens", self.total_tokens)
+        _number("totals.total_cost", self.total_cost, minimum=0)
+
+
+@dataclass(frozen=True)
+class DepthStatus:
+    """Source and missing-observation disclosure; null counts = the scan was unavailable (design §2)."""
+
+    partial: bool
+    excluded_started_at: Optional[int]
+    missing: Any  # mapping of DEPTH_MISSING_NAMES -> Optional[int]
+
+    def __post_init__(self) -> None:
+        _bool("depth_status.partial", self.partial)
+        _integer("depth_status.excluded_started_at", self.excluded_started_at)
+        if not isinstance(self.missing, dict) or sorted(self.missing) != sorted(DEPTH_MISSING_NAMES):
+            raise DtoError("depth_status.missing")
+        for name, count in self.missing.items():
+            _integer(f"depth_status.missing.{name}", count)
+
+
+def _count_req(name: str, value: Any) -> int:
+    if value is None:
+        raise DtoError(f"{name}: required")
+    return _integer(name, value)  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -751,19 +988,34 @@ def failure_envelope(error: DeckError, meta: dict) -> dict:
 _WIRE_CLASSES = (
     DeckError, Period, UsageMeter, Holder, DebugInfo, SubscriptionCard, UsagePoint, UsageTimeSeries, HealthStripEntry,
     UsageMetrics, ProvenanceRow, UsageGroup, SourceStatus, ProviderOption, ApiEquivalent, RowPricing, PricingInfo,
+    DurationStats, HeatCell, HeatStart, Heatmap, CacheRow, RepoRow, ModelRow, DepthTotals, DepthStatus,
 )
 
 # Envelope (§3) and per-endpoint ``data`` keys that are not DTO fields.
 _ENVELOPE_KEYS = ("ok", "data", "error", "meta", "schema_version", "request_id", "generated_at", "partial", "errors")
+#: Additive analytics-depth members of ``data`` (design §2); always emitted by the updated server, even when null.
+DEPTH_DATA_KEYS = frozenset(("durations", "duration_samples", "heatmap", "cache_metrics", "repo_rollup",
+                             "model_rollup", "depth_totals", "depth_status"))
 _DATA_KEYS = ("cards", "inventory_state", "view", "window_days", "provider_id", "series", "reason", "entries",
-              "mode", "dimension", "groups", "rows", "totals", "providers", "sources", "complete", "top_n", "pricing")
-USAGE_DATA_KEYS = frozenset(("window_days", "mode", "dimension", "provider_id", "series", "groups", "rows", "totals",
-                             "providers", "sources", "complete", "top_n", "reason", "pricing"))
+              "mode", "dimension", "groups", "rows", "totals", "providers", "sources", "complete", "top_n", "pricing") \
+    + tuple(sorted(DEPTH_DATA_KEYS)) + DEPTH_MISSING_NAMES
+#: The baseline v2 shape (before analytics depth): still accepted, its absent additions read as null.
+BASE_USAGE_DATA_KEYS = frozenset(("window_days", "mode", "dimension", "provider_id", "series", "groups", "rows",
+                                  "totals", "providers", "sources", "complete", "top_n", "reason", "pricing"))
+USAGE_DATA_KEYS = BASE_USAGE_DATA_KEYS | DEPTH_DATA_KEYS
 
 #: Every field name the wire contract defines. Keys outside this set are not
-#: schema: the sanitizer scrubs them like any other string.
+#: schema: the sanitizer scrubs them like any other string. (The token-counter names are never listed here:
+#: they are admitted only by shape, see ``TOKEN_WIRE_SHAPES``.)
 WIRE_KEYS = frozenset(
-    {f.name for cls in _WIRE_CLASSES for f in fields(cls)} | set(_ENVELOPE_KEYS) | set(_DATA_KEYS)
+    ({f.name for cls in _WIRE_CLASSES for f in fields(cls)} | set(_ENVELOPE_KEYS) | set(_DATA_KEYS)) - TOKEN_WIRE_NAMES
+)
+
+#: Complete key sets of the objects that carry token-counter names; only a mapping with EXACTLY one of these key
+#: sets may keep those names unredacted.
+TOKEN_WIRE_SHAPES = frozenset(
+    {frozenset(f.name for f in fields(cls)) for cls in (HeatCell, HeatStart, CacheRow, RepoRow, ModelRow, DepthTotals)}
+    | {frozenset(DEPTH_MISSING_NAMES)}
 )
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -790,7 +1042,7 @@ def _match(pattern):
 WIRE_VALUE_RULES = {
     "confidence": _in(CONFIDENCE_LABELS),
     "state": _in(set(CARD_STATES) | set(SOURCE_STATES)),
-    "reason": _in(set(REASONS) | set(PRICING_REASONS)),
+    "reason": _in(set(REASONS) | set(PRICING_REASONS) | set(CACHE_REASONS)),
     "code": _in(ERROR_CODES),
     "message": _in(set(ERROR_MESSAGES.values()) | {v[1] for v in ERROR_VARIANTS.values()}),
     "unit": _in(UNITS),
@@ -816,6 +1068,7 @@ WIRE_VALUE_RULES = {
     "warnings": _in(PRICING_WARNINGS),  # list items inherit the key
     "unknown_row_ids": _match(_ROW_ID_RE),  # list items inherit the key
     "catalog_revision": _match(_SHA256_RE),
+    "rate_source": _match(_RATE_SOURCE_RE),
     "catalog_key": _match(_CATALOG_KEY_RE),
     "amount_pico_usd": _match(_PICO_RE),
     "fetched_at": _match(_TS_FRAC_RE),
@@ -943,8 +1196,16 @@ def _metrics_from_wire(data: Any) -> UsageMetrics:
 
 def _row_from_wire(data: Any) -> ProvenanceRow:
     data = _exact_keys("row", data, ProvenanceRow)
+    paths = data["repo_paths"]
+    if paths is not None and not isinstance(paths, list):
+        raise DtoError("row.repo_paths: expected list")
     return ProvenanceRow(**{**data, "metrics": _metrics_from_wire(data["metrics"]),
-                            "pricing": RowPricing(**_exact_keys("pricing", data["pricing"], RowPricing))})
+                            "pricing": RowPricing(**_exact_keys("pricing", data["pricing"], RowPricing)),
+                            "repo_paths": None if paths is None else tuple(paths)})
+
+
+def _durations_from_wire(data: Any) -> Optional[DurationStats]:
+    return None if data is None else DurationStats(**_exact_keys("durations", data, DurationStats))
 
 
 def _group_from_wire(data: Any) -> UsageGroup:
@@ -957,13 +1218,94 @@ def _group_from_wire(data: Any) -> UsageGroup:
         "profiles": tuple(_holder_from_wire(h) for h in data["profiles"]),
         "row_ids": tuple(data["row_ids"]),
         "totals": _metrics_from_wire(data["totals"]),
+        "durations": _durations_from_wire(data["durations"]),
     })
 
 
+def _heatmap_from_wire(data: Any) -> Optional[Heatmap]:
+    if data is None:
+        return None
+    data = _exact_keys("heatmap", data, Heatmap)
+    if not isinstance(data["grid"], list) or not isinstance(data["starts"], list) \
+            or not all(isinstance(row, list) for row in data["grid"]):
+        raise DtoError("heatmap: expected lists")
+    return Heatmap(
+        tuple(tuple(HeatCell(**_exact_keys("cell", c, HeatCell)) for c in row) for row in data["grid"]),
+        tuple(HeatStart(**_exact_keys("start", s, HeatStart)) for s in data["starts"]))
+
+
+def _rows_from_wire(name: str, data: Any, cls: Any) -> Optional[tuple]:
+    if data is None:
+        return None
+    if not isinstance(data, list):
+        raise DtoError(f"{name}: expected list")
+    out = []
+    for item in data:
+        item = _exact_keys(name, item, cls)
+        if cls is RepoRow:
+            if not isinstance(item["full_paths"], list):
+                raise DtoError("repo_rollup.full_paths: expected list")
+            item = {**item, "full_paths": tuple(item["full_paths"])}
+        out.append(cls(**item))
+    return tuple(out)
+
+
+def _status_from_wire(data: Any) -> Optional[DepthStatus]:
+    return None if data is None else DepthStatus(**_exact_keys("depth_status", data, DepthStatus))
+
+
+def depth_from_wire(data: dict) -> dict:
+    """Validate the eight additive depth members (design §2) and return their canonical plain image."""
+    durations = _durations_from_wire(data["durations"])
+    samples = _integer("duration_samples", data["duration_samples"])
+    _check_durations(durations, samples)
+    totals = None if data["depth_totals"] is None else DepthTotals(**_exact_keys("depth_totals", data["depth_totals"],
+                                                                                    DepthTotals))
+    out = {
+        "durations": to_plain(durations), "duration_samples": samples,
+        "heatmap": to_plain(_heatmap_from_wire(data["heatmap"])),
+        "cache_metrics": to_plain(_rows_from_wire("cache_metrics", data["cache_metrics"], CacheRow)),
+        "repo_rollup": to_plain(_rows_from_wire("repo_rollup", data["repo_rollup"], RepoRow)),
+        "model_rollup": to_plain(_rows_from_wire("model_rollup", data["model_rollup"], ModelRow)),
+        "depth_totals": to_plain(totals),
+        "depth_status": to_plain(_status_from_wire(data["depth_status"])),
+    }
+    _check_conservation(out)
+    return out
+
+
+def _check_conservation(depth: dict) -> None:
+    """Design §6: repo rollup == model rollup == depth totals over one session set (null-aware)."""
+    totals, repos, models = depth["depth_totals"], depth["repo_rollup"], depth["model_rollup"]
+    if totals is None or repos is None or models is None:
+        return
+    for name, rows in (("repo_rollup", repos), ("model_rollup", models)):
+        if sum(r["sessions"] for r in rows) != totals["sessions"]:
+            raise DtoError(f"usage: {name} sessions do not conserve")
+        tokens = [r["total_tokens"] for r in rows if r["total_tokens"] is not None]
+        if (sum(tokens) if tokens else None) != totals["total_tokens"]:
+            raise DtoError(f"usage: {name} total_tokens do not conserve")
+        costs = [r["total_cost"] for r in rows if r["total_cost"] is not None]
+        got, want = (math.fsum(costs) if costs else None), totals["total_cost"]
+        if (got is None) != (want is None) or (got is not None and abs(got - want) > 1e-9 * max(1.0, abs(want))):
+            raise DtoError(f"usage: {name} total_cost does not conserve")
+
+
 def usage_from_wire(data: Any) -> dict:
-    """Validate (strictly, every key) an expanded usage ``data`` object and return its canonical rebuild."""
-    if not isinstance(data, dict) or frozenset(data) != USAGE_DATA_KEYS:
+    """Validate (strictly, every key) an expanded usage ``data`` object and return its canonical rebuild.
+
+    The baseline v2 shape (no analytics-depth members) is still accepted: the absent additions read as null
+    (design §2). A partial set of the additions is never accepted."""
+    if not isinstance(data, dict) or frozenset(data) not in (USAGE_DATA_KEYS, BASE_USAGE_DATA_KEYS):
         raise DtoError("usage: wire keys differ from schema")
+    legacy = frozenset(data) == BASE_USAGE_DATA_KEYS
+    original = data
+    if legacy:
+        data = {**data, **{k: None for k in DEPTH_DATA_KEYS},
+                "groups": [dict(g, durations=None, duration_samples=None) if isinstance(g, dict) else g
+                           for g in data["groups"]] if isinstance(data["groups"], list) else data["groups"],
+                "rows": [dict(r, repo_basename=None, repo_paths=None) if isinstance(r, dict) else r
+                         for r in data["rows"]] if isinstance(data["rows"], list) else data["rows"]}
     _enum("window_days", data["window_days"], WINDOWS)
     _enum("mode", data["mode"], VIEWS)
     _enum("dimension", data["dimension"], DIMENSIONS)
@@ -996,17 +1338,22 @@ def usage_from_wire(data: Any) -> dict:
         raise DtoError("usage: every row must belong to exactly one group")
     if pricing["unknown_row_ids"] != sorted(r["id"] for r in rows if r["metrics"]["api_equivalent"]["amount_pico_usd"] is None):
         raise DtoError("usage: pricing.unknown_row_ids does not match the unpriced rows")
+    if data["dimension"] == "repo" and any(r["repo_paths"] is None for r in rows):
+        raise DtoError("usage: repo rows carry their path detail")
+    if data["dimension"] != "repo" and any(r["repo_basename"] is not None or r["repo_paths"] is not None for r in rows):
+        raise DtoError("usage: repo detail only exists on the repo dimension")
     out = {**data, "series": series, "groups": groups, "rows": rows, "totals": totals, "providers": providers,
-           "sources": sources, "pricing": pricing}
+           "sources": sources, "pricing": pricing, **depth_from_wire(data)}
     if out != data:
         raise DtoError("usage: wire dict does not round-trip")
-    return data
+    return original
 
 
 _META_KEYS = ("schema_version", "request_id", "generated_at", "partial", "errors")
 _DATA_SHAPES = {
     frozenset(("cards", "inventory_state", "view")): "subscriptions",
     USAGE_DATA_KEYS: "usage",
+    BASE_USAGE_DATA_KEYS: "usage",
     frozenset(("entries",)): "health",
 }
 
@@ -1029,7 +1376,7 @@ def check_envelope(body: Any, endpoint: Optional[str] = None) -> Any:
     if endpoint is not None:
         expected = {USAGE_SCHEMA_VERSION} if endpoint == "usage" else {SCHEMA_VERSION}
     elif body["ok"] is True and isinstance(data, dict):
-        expected = {USAGE_SCHEMA_VERSION} if frozenset(data) == USAGE_DATA_KEYS else {SCHEMA_VERSION}
+        expected = {USAGE_SCHEMA_VERSION} if frozenset(data) in (USAGE_DATA_KEYS, BASE_USAGE_DATA_KEYS) else {SCHEMA_VERSION}
     else:
         expected = {SCHEMA_VERSION, USAGE_SCHEMA_VERSION}
     if type(meta["schema_version"]) is not int or meta["schema_version"] not in expected \

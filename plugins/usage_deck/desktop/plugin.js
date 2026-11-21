@@ -33,7 +33,7 @@ const VIEWS = ['machine', 'profile']
 const DEFAULT_VIEW = 'machine'
 const ALL_PROVIDERS = '__usage_deck_all__'
 // Usage analytics dimension (analytics-dimensions-breakdown §7): how scoped session records are partitioned.
-const DIMENSIONS = ['all', 'profile', 'model']
+const DIMENSIONS = ['all', 'profile', 'model', 'repo']
 const DEFAULT_DIMENSION = 'all'
 const USAGE_SCHEMA_VERSION = 2
 const COPY_SCOPE_MACHINE = 'All local profile session records — not subscription allowance.'
@@ -757,16 +757,18 @@ function validateUsage(env, windowDays, query) {
     top_n: num(d.top_n),
     reason: has(USAGE_REASONS, d.reason) ? d.reason : null,
     pricing: isObj(d.pricing) ? d.pricing : null,
+    depth: decodeDepth(d),
     meta: env.meta
   }
 }
 
-// Dimension options of a mode: machine offers All | By profile | By model, a single profile All | By model.
+// Dimension options of a mode: machine offers All | By profile | By model | By repo, a single profile All | By model | By repo.
 function dimensionOptions(mode) {
   const all = [
     { id: 'all', label: 'All' },
     { id: 'profile', label: 'By profile' },
-    { id: 'model', label: 'By model' }
+    { id: 'model', label: 'By model' },
+    { id: 'repo', label: 'By repo' }
   ]
 
   return mode === 'profile' ? all.filter(o => o.id !== 'profile') : all
@@ -928,6 +930,256 @@ function pricingNotes(data) {
   return w.filter(function (c) { return Object.prototype.hasOwnProperty.call(API_WARNING_TEXT, c); }).map(function (c) { return { code: c, text: API_WARNING_TEXT[c] }; });
 }
 // </api-equivalent-helpers>
+
+// <depth-helpers>
+// Analytics depth (docs/design/analytics-depth-breakdown.md §4-§7). Pure helpers, no rendering: the SAME block
+// (byte for byte) lives in dist/index.js and desktop/plugin.js (tests/frontend/depth.test.js enforces it).
+// null means "not recorded" everywhere: it is never coerced to 0, never averaged and never drawn as a zero cell.
+const DEPTH_FIELDS = ["durations", "duration_samples", "heatmap", "cache_metrics", "repo_rollup", "model_rollup", "depth_totals", "depth_status"];
+const DEPTH_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const DURATION_LABEL = "Completed session duration";
+const CACHE_LABEL = "Effective recorded $/Mtok (weighted diagnostic)";
+const CACHE_TIP = "Recorded cost divided by base-cache-weighted recorded counters. Reasoning may overlap output; not a tariff, invoice, or measured savings.";
+const CACHE_NOTE = "Recorded-cost basis: base-cache weighting of recorded counters. No prices are fetched and nothing here is a bill.";
+const HEAT_NOTE = "Each session is counted once, in the hour it started (never split across midnight or hours).";
+const CACHE_REASON_TEXT = {
+  missing_usage: "Some sessions did not record every token counter.",
+  missing_cost: "Some sessions did not record a cost.",
+  unknown_discount: "No published cache discount for this exact provider and model.",
+  zero_denominator: "No weighted tokens to divide by.",
+  incomplete_source: "Some session stores could not be read; ratios are not computed over a partial set.",
+};
+const DEPTH_MISSING_TEXT = {
+  input_tokens: "input tokens", output_tokens: "output tokens", estimated_cost_usd: "cost", cache_read_tokens: "cache reads",
+  cache_write_tokens: "cache writes", reasoning_tokens: "reasoning tokens", duration: "a completed duration",
+};
+
+function depthCount(v) {
+  return typeof v === "number" && isFinite(v) && v >= 0 && Math.floor(v) === v ? v : null;
+}
+
+function depthNum(v) {
+  return typeof v === "number" && isFinite(v) && v >= 0 ? v : null;
+}
+
+function depthText(v) {
+  return typeof v === "string" ? v : null;
+}
+
+function depthGroup(n) {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+function depthPad(n) {
+  return n < 10 ? "0" + n : String(n);
+}
+
+/** Decode the eight additive members of a usage payload. An older server omits all of them: `supported` is false. */
+function decodeDepth(d) {
+  const own = function (o, k) { return Object.prototype.hasOwnProperty.call(o, k); };
+  const supported = !!d && typeof d === "object" && DEPTH_FIELDS.every(function (k) { return own(d, k); });
+  const out = { supported: supported, durations: null, samples: null, heatmap: null, cache: null, repos: null, totals: null, status: null };
+  if (!supported) return out;
+  const du = d.durations;
+  if (du && typeof du === "object" && !Array.isArray(du)) {
+    out.durations = { p50: depthNum(du.p50), p90: depthNum(du.p90), p99: depthNum(du.p99), mean: depthNum(du.mean), max: depthNum(du.max) };
+    out.samples = depthCount(d.duration_samples);
+  }
+  const hm = d.heatmap;
+  if (hm && typeof hm === "object" && !Array.isArray(hm)) {
+    // `starts` (exact epochs) is what makes a LOCAL rendering correct; without a trustworthy list there is none.
+    let starts = Array.isArray(hm.starts) ? hm.starts : null;
+    if (starts) {
+      starts = starts.map(function (s) {
+        const ok = s && typeof s === "object" && typeof s.started_at === "number" && isFinite(s.started_at)
+          && depthCount(s.sessions) !== null && s.sessions >= 1 && (s.total_tokens === null || depthCount(s.total_tokens) !== null)
+          && !isNaN(new Date(s.started_at * 1000).getTime());
+        return ok ? { t: s.started_at, n: s.sessions, tokens: s.total_tokens } : null;
+      });
+      if (starts.some(function (s) { return s === null; })) starts = null;
+    }
+    out.heatmap = { starts: starts };
+  }
+  out.cache = Array.isArray(d.cache_metrics) ? d.cache_metrics.filter(function (r) { return r && typeof r === "object"; }) : null;
+  out.repos = Array.isArray(d.repo_rollup) ? d.repo_rollup.filter(function (r) { return r && typeof r === "object"; }) : null;
+  const t = d.depth_totals;
+  if (t && typeof t === "object") out.totals = { sessions: depthCount(t.sessions), tokens: depthCount(t.total_tokens), cost: depthNum(t.total_cost) };
+  const s = d.depth_status;
+  if (s && typeof s === "object") {
+    const missing = {};
+    const raw = s.missing && typeof s.missing === "object" ? s.missing : {};
+    Object.keys(DEPTH_MISSING_TEXT).forEach(function (k) { missing[k] = depthCount(raw[k]); });
+    out.status = { partial: s.partial === true, excluded: depthCount(s.excluded_started_at), missing: missing };
+  }
+  return out;
+}
+
+/** Human text for a count of seconds; null is a dash. The exact value is always available as a tooltip. */
+function fmtDuration(sec) {
+  const s = depthNum(sec);
+  if (s === null) return "\u2014";
+  if (s < 60) return String(Math.round(s * 10) / 10) + " s";
+  const whole = Math.round(s);
+  if (whole < 3600) return Math.floor(whole / 60) + "m " + (whole % 60) + "s";
+  return Math.floor(whole / 3600) + "h " + Math.floor((whole % 3600) / 60) + "m";
+}
+
+function exactSeconds(sec) {
+  const s = depthNum(sec);
+  return s === null ? "Not recorded." : String(s) + " seconds";
+}
+
+/** The five stats and the sample count as display items (every null stays a dash). */
+function durationItems(stats, samples) {
+  const st = stats || {};
+  const items = ["p50", "p90", "p99", "mean", "max"].map(function (k) {
+    return { id: k, label: k, text: fmtDuration(st[k]), title: exactSeconds(st[k]) };
+  });
+  const n = depthCount(samples);
+  items.push({ id: "samples", label: "samples", text: n === null ? "\u2014" : depthGroup(n), title: "Completed sessions with a valid start and end." });
+  return items;
+}
+
+/** Browser-local weekday/hour cell of one epoch (seconds), judged by the zone rules of THAT instant. */
+function localCellOf(epochSec) {
+  const d = new Date(epochSec * 1000);
+  return { row: (d.getDay() + 6) % 7, col: d.getHours() };
+}
+
+/** Re-bucket the exact start epochs into the 7x24 local grid (row-major, Monday first). Each start counts once. */
+function localHeat(starts) {
+  const cells = [];
+  for (let i = 0; i < DEPTH_DAYS.length * 24; i++) cells.push({ sessions: 0, tokens: null });
+  (starts || []).forEach(function (s) {
+    const c = localCellOf(s.t);
+    const cell = cells[c.row * 24 + c.col];
+    cell.sessions += s.n;
+    if (s.tokens !== null) cell.tokens = (cell.tokens || 0) + s.tokens;
+  });
+  return cells;
+}
+
+/** Colour level 0..4 and the "not recorded" flag of a cell for the active metric. */
+function heatLevel(cell, metric, max) {
+  if (metric === "tokens" && cell.sessions > 0 && cell.tokens === null) return { level: 0, na: true };
+  const v = metric === "tokens" ? cell.tokens : cell.sessions;
+  if (!v || !max) return { level: 0, na: false };
+  return { level: Math.max(1, Math.min(4, Math.ceil((4 * v) / max))), na: false };
+}
+
+function heatMax(cells, metric) {
+  let max = 0;
+  cells.forEach(function (c) {
+    const v = metric === "tokens" ? c.tokens : c.sessions;
+    if (v !== null && v > max) max = v;
+  });
+  return max;
+}
+
+function heatCellLabel(row, col, cell, partial) {
+  const tokens = cell.tokens === null ? (cell.sessions ? "tokens not recorded" : "no tokens") : depthGroup(cell.tokens) + " tokens";
+  return DEPTH_DAYS[row] + " " + depthPad(col) + ":00, " + cell.sessions + (cell.sessions === 1 ? " session, " : " sessions, ") + tokens + (partial ? " (partial data)" : "");
+}
+
+function localOffset(epochSec) {
+  const m = -new Date(epochSec * 1000).getTimezoneOffset();
+  const a = Math.abs(m);
+  return (m < 0 ? "-" : "+") + depthPad(Math.floor(a / 60)) + ":" + depthPad(a % 60);
+}
+
+/** The start cohorts inside one local cell (ISO instant + the local offset tell a repeated DST hour apart). */
+function heatDetail(starts, row, col) {
+  return (starts || []).filter(function (s) {
+    const c = localCellOf(s.t);
+    return c.row === row && c.col === col;
+  }).sort(function (a, b) { return a.t - b.t; }).map(function (s) {
+    return { t: s.t, iso: new Date(s.t * 1000).toISOString(), offset: localOffset(s.t), sessions: s.n, tokens: s.tokens };
+  });
+}
+
+function localZoneName() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "local time";
+  } catch (e) {
+    return "local time";
+  }
+}
+
+function fmtPct(v) {
+  const n = depthNum(v);
+  return n === null ? "\u2014" : n.toFixed(2) + "%";
+}
+
+function fmtCacheCount(v) {
+  const n = depthCount(v);
+  return n === null ? "\u2014" : depthGroup(n);
+}
+
+function fmtCacheMoney(v) {
+  const n = depthNum(v);
+  return n === null ? "\u2014" : "$" + n.toFixed(4);
+}
+
+/** One cache-economics row for display. Reuses the backend numbers verbatim: no money is recomputed here. */
+function cacheRowView(r) {
+  const eff = depthNum(r.effective_cost_per_mtok);
+  const mult = depthNum(r.discount_multiplier);
+  const reason = depthText(r.reason);
+  return {
+    model: depthText(r.model) === null ? "Unknown model" : r.model,
+    provider: depthText(r.provider_id),
+    hit: fmtPct(r.hit_rate_pct),
+    cached: fmtCacheCount(r.cached_input_tokens),
+    uncached: fmtCacheCount(r.uncached_input_tokens),
+    writes: fmtCacheCount(r.cache_write_tokens),
+    reasoning: fmtCacheCount(r.reasoning_tokens),
+    share: fmtPct(r.reasoning_share_pct),
+    effective: fmtCacheMoney(eff),
+    effectiveTitle: eff === null ? "Not computed." : "Exact: " + String(eff) + " USD per million weighted tokens (recorded-cost basis)",
+    output: fmtCacheCount(r.output_tokens),
+    multiplier: mult === null ? "\u2014" : String(mult),
+    rateSource: depthText(r.rate_source) === null ? "\u2014" : r.rate_source,
+    reason: reason,
+    reasonText: reason !== null && Object.prototype.hasOwnProperty.call(CACHE_REASON_TEXT, reason) ? CACHE_REASON_TEXT[reason] : null,
+  };
+}
+
+/** One-line disclosure of what was not recorded / readable (never replaces the legacy status cards). */
+function depthStatusLine(status) {
+  if (!status) return null;
+  const bits = [];
+  if (status.partial) bits.push("partial data");
+  if (status.excluded) bits.push(status.excluded + " session" + (status.excluded === 1 ? "" : "s") + " without a valid start time left out");
+  Object.keys(DEPTH_MISSING_TEXT).forEach(function (k) {
+    const n = status.missing[k];
+    if (n) bits.push(n + " without " + DEPTH_MISSING_TEXT[k]);
+  });
+  return bits.length ? "Known subtotals only: " + bits.join("; ") + "." : null;
+}
+
+/** The repo rollup row that belongs to a repo group (rollup rows carry no group id; label + shape identify them). */
+function repoRowFor(group, rollup) {
+  if (!group) return null;
+  const label = depthText(group.label);
+  const missing = group.id === "repo:null";
+  const shaped = function (r) {
+    return r.full_path === null && Array.isArray(r.full_paths) && r.full_paths.length === 0;
+  };
+  const named = (rollup || []).filter(function (r) { return r.repo_basename === label; });
+  // "Unscoped" is both the missing bucket and a possible literal repository name: the empty-path row is the former.
+  const hits = label === "Unscoped" && named.some(function (r) { return shaped(r) === missing; })
+    ? named.filter(function (r) { return shaped(r) === missing; }) : named;
+  if (hits.length <= 1) return hits[0] || null;
+  const sessions = group.totals && group.totals.sessions;
+  return hits.filter(function (r) { return r.sessions === sessions; })[0] || hits[0];
+}
+
+function repoPathSummary(r) {
+  const paths = r && Array.isArray(r.full_paths) ? r.full_paths.filter(function (p) { return typeof p === "string"; }) : [];
+  if (paths.length === 0) return { count: 0, text: null, paths: [] };
+  return { count: paths.length, text: paths.length === 1 ? paths[0] : paths.length + " paths", paths: paths };
+}
+// </depth-helpers>
 
 function scopeCopy(mode) {
   return mode === 'machine' ? COPY_SCOPE_MACHINE : COPY_SCOPE_PROFILE
@@ -1882,6 +2134,31 @@ function PricingNotes(props) {
 
 const apiHead = c => h('th', { key: c, scope: 'col', title: c === API_LABEL ? API_TIP : undefined, style: TH }, c)
 
+// Subordinate line of the totals area: completed-session duration percentiles (null stays a dash, never 0).
+function DurationLine(props) {
+  const dp = props.depth
+
+  if (!dp || !dp.supported) {
+    return null
+  }
+
+  if (dp.durations === null) {
+    return h('p', { 'data-duration-summary': 'unavailable', style: { ...MUTED, margin: '0.25rem 0 0' } }, DURATION_LABEL + ': unavailable (session stores could not be read).')
+  }
+
+  const out = [DURATION_LABEL + ': ']
+
+  durationItems(dp.durations, dp.samples).forEach((it, i) => {
+    if (i > 0) {
+      out.push(' · ')
+    }
+
+    out.push(h('span', { key: it.id, title: it.title, 'data-duration': it.id }, it.label + ' ' + it.text))
+  })
+
+  return h('p', { 'data-duration-summary': 'true', style: { ...MUTED, margin: '0.25rem 0 0' } }, out)
+}
+
 // Whole-scope totals: independent of the dimension, the top-N cut and the legend.
 function TotalsBar(props) {
   const t = props.totals
@@ -1913,6 +2190,7 @@ function TotalsBar(props) {
         )
       )
     ),
+    h(DurationLine, { depth: props.depth }),
     h('p', { 'data-api-footnote': 'true', style: { ...MUTED, margin: '0.25rem 0 0' } }, API_FOOTNOTE),
     partial
       ? h(
@@ -1921,6 +2199,301 @@ function TotalsBar(props) {
           '* Some sessions did not record: ' + t.missing_fields.join(', ') + '. Those figures are known subtotals; nothing is estimated for the missing values.'
         )
       : null
+  )
+}
+
+const HEAT_STEPS = [0, 0.18, 0.4, 0.62, 0.85]
+const HEAT_CELL = { width: '1.55rem', height: '1.35rem', padding: 0, borderRadius: '3px', fontSize: '0.7rem', lineHeight: 1, cursor: 'pointer', color: 'inherit', font: 'inherit' }
+const CARD_STYLE = { border: '1px solid ' + STROKE, borderRadius: '0.5rem', padding: '0.85rem', marginTop: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.5rem', minWidth: 0 }
+
+function depthStatusNote(dp) {
+  const line = depthStatusLine(dp.status)
+
+  return line ? h('p', { 'data-depth-status': 'true', style: { ...MUTED, margin: 0 } }, line) : null
+}
+
+// Activity by start time: the exact start epochs are re-bucketed by the machine's local zone rules (never a rotated UTC grid).
+function HeatmapCard(props) {
+  const dp = props.depth
+  const [metric, setMetric] = useState('sessions')
+  const [sel, setSel] = useState(null)
+  const starts = dp && dp.heatmap ? dp.heatmap.starts : null
+  const cells = useMemo(() => (starts ? localHeat(starts) : null), [starts])
+
+  if (!dp || !dp.supported) {
+    return null
+  }
+
+  const partial = !!(dp.status && dp.status.partial)
+  let body
+
+  if (dp.heatmap === null) {
+    body = h('p', { 'data-depth-state': 'unavailable', style: MUTED }, 'Activity heatmap unavailable: the session stores could not be read.')
+  } else if (cells === null) {
+    body = h('p', { 'data-depth-state': 'no-local', style: MUTED }, 'Local heatmap unavailable')
+  } else {
+    const max = heatMax(cells, metric)
+    const picked = sel && cells[sel.row * 24 + sel.col]
+    const detail = sel ? heatDetail(starts, sel.row, sel.col) : []
+
+    body = h(
+      'div',
+      null,
+      h(
+        'div',
+        { style: { overflowX: 'auto' } },
+        h(
+          'table',
+          { 'data-heat-grid': 'local', 'data-heat-metric': metric, style: { borderCollapse: 'separate', borderSpacing: '2px' } },
+          h('caption', { style: SR_ONLY }, 'Sessions started per local weekday and hour'),
+          h('thead', null, h('tr', null, h('th', { scope: 'col', style: TH }, 'Day'), Array.from({ length: 24 }, (_, c) => h('th', { key: c, scope: 'col', style: { ...TH, textAlign: 'center', padding: '0 0.15rem' } }, depthPad(c))))),
+          h(
+            'tbody',
+            null,
+            DEPTH_DAYS.map((day, r) =>
+              h(
+                'tr',
+                { key: day },
+                h('th', { scope: 'row', style: TH }, day),
+                Array.from({ length: 24 }, (_, c) => {
+                  const cell = cells[r * 24 + c]
+                  const lv = heatLevel(cell, metric, max)
+                  const label = heatCellLabel(r, c, cell, partial)
+                  const on = !!sel && sel.row === r && sel.col === c
+
+                  return h(
+                    'td',
+                    { key: c, style: { padding: 0 } },
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        'aria-label': label,
+                        title: label,
+                        'aria-pressed': on ? 'true' : 'false',
+                        'data-heat-cell': r + '-' + c,
+                        'data-sessions': String(cell.sessions),
+                        'data-tokens': cell.tokens === null ? 'null' : String(cell.tokens),
+                        'data-heat-na': lv.na ? 'true' : undefined,
+                        onClick: () => setSel(on ? null : { row: r, col: c }),
+                        style: {
+                          ...HEAT_CELL,
+                          border: (lv.na ? '1px dashed ' : '1px solid ') + (on ? ACCENT : STROKE),
+                          background: lv.level > 0 ? 'color-mix(in srgb, ' + ACCENT + ' ' + Math.round(HEAT_STEPS[lv.level] * 100) + '%, transparent)' : 'transparent'
+                        }
+                      },
+                      lv.na ? '?' : cell.sessions > 0 ? String(cell.sessions) : ''
+                    )
+                  )
+                })
+              )
+            )
+          )
+        )
+      ),
+      sel && picked
+        ? h(
+            'div',
+            { 'data-heat-detail': sel.row + '-' + sel.col, role: 'region', 'aria-label': 'Sessions started ' + DEPTH_DAYS[sel.row] + ' ' + depthPad(sel.col) + ':00', style: { borderTop: '1px solid ' + STROKE, paddingTop: '0.5rem' } },
+            h('p', { style: { ...SMALL, margin: 0 } }, heatCellLabel(sel.row, sel.col, picked, partial)),
+            detail.length === 0
+              ? h('p', { style: MUTED }, 'No sessions started in this hour.')
+              : h(
+                  'table',
+                  { style: { borderCollapse: 'collapse' } },
+                  h('thead', null, h('tr', null, ['Start (instant)', 'Local offset', 'Sessions', 'Tokens'].map(c => h('th', { key: c, scope: 'col', style: TH }, c)))),
+                  h(
+                    'tbody',
+                    null,
+                    detail.map(e =>
+                      h(
+                        'tr',
+                        { key: e.t, 'data-heat-start': String(e.t) },
+                        h('td', { style: TD }, e.iso),
+                        h('td', { style: TD }, e.offset),
+                        h('td', { style: TD }, String(e.sessions)),
+                        h('td', { style: TD }, e.tokens === null ? '—' : depthGroup(e.tokens))
+                      )
+                    )
+                  )
+                )
+          )
+        : null
+    )
+  }
+
+  return h(
+    'section',
+    { 'data-depth-card': 'heatmap', 'aria-labelledby': 'ud-h-heat', style: CARD_STYLE },
+    h('h3', { id: 'ud-h-heat', style: { margin: 0, fontSize: '0.95rem', fontWeight: 600 } }, 'Activity by start time (local)'),
+    h('p', { 'data-heat-caption': 'true', style: { ...MUTED, margin: 0 } }, 'Time zone: ' + localZoneName() + '. ' + HEAT_NOTE),
+    h(
+      'div',
+      { role: 'group', 'aria-label': 'Heatmap intensity', style: { display: 'flex', gap: '0.4rem' } },
+      ['sessions', 'tokens'].map(m =>
+        h(
+          ui.Button,
+          { key: m, type: 'button', variant: metric === m ? 'default' : 'outline', size: 'sm', 'aria-pressed': metric === m ? 'true' : 'false', 'data-heat-toggle': m, onClick: () => setMetric(m) },
+          m === 'sessions' ? 'Sessions' : 'Tokens'
+        )
+      )
+    ),
+    body,
+    depthStatusNote(dp)
+  )
+}
+
+// Cache economics per exact model/provider pair (recorded-cost basis): no top-N, no price fetch, no JS money.
+function CacheCard(props) {
+  const dp = props.depth
+
+  if (!dp || !dp.supported) {
+    return null
+  }
+
+  const cols = ['Model', 'Provider', 'Hit %', 'Cached input', 'Uncached input', 'Cache writes', 'Reasoning', 'Reasoning share', CACHE_LABEL, 'Details']
+  let body
+
+  if (dp.cache === null) {
+    body = h('p', { 'data-depth-state': 'unavailable', style: MUTED }, 'Cache economics unavailable: the session stores could not be read.')
+  } else if (dp.cache.length === 0) {
+    body = h('p', { 'data-depth-state': 'empty', style: MUTED }, 'No sessions in this scope.')
+  } else {
+    body = h(
+      'div',
+      { style: { overflow: 'auto', maxHeight: '24rem' } },
+      h(
+        'table',
+        { 'data-cache-table': 'true', style: { borderCollapse: 'collapse', width: '100%' } },
+        h('thead', null, h('tr', null, cols.map(c => h('th', { key: c, scope: 'col', title: c === CACHE_LABEL ? CACHE_TIP : undefined, style: TH }, c)))),
+        h(
+          'tbody',
+          null,
+          dp.cache.map((r, i) => {
+            const v = cacheRowView(r)
+
+            return h(
+              'tr',
+              { key: i, 'data-cache-row': v.model + '|' + (v.provider || ''), 'data-cache-reason': v.reason || undefined },
+              h('td', { style: TD }, v.model),
+              h('td', { style: TD }, v.provider === null ? 'Unknown' : providerLabelOf(props.providers, v.provider)),
+              h('td', { 'data-field': 'hit_rate_pct', style: TD }, v.hit),
+              h('td', { 'data-field': 'cached_input_tokens', style: TD }, v.cached),
+              h('td', { 'data-field': 'uncached_input_tokens', style: TD }, v.uncached),
+              h('td', { 'data-field': 'cache_write_tokens', style: TD }, v.writes),
+              h('td', { 'data-field': 'reasoning_tokens', style: TD }, v.reasoning),
+              h('td', { 'data-field': 'reasoning_share_pct', style: TD }, v.share),
+              h('td', { 'data-field': 'effective_cost_per_mtok', title: v.effectiveTitle, style: TD }, v.effective),
+              h(
+                'td',
+                { style: TD },
+                h(
+                  'details',
+                  null,
+                  h('summary', { style: { ...SMALL, cursor: 'pointer' } }, 'Details'),
+                  h(
+                    'dl',
+                    { style: { ...SMALL, margin: '0.3rem 0 0' } },
+                    h('dt', { style: MUTED }, 'Output tokens'),
+                    h('dd', { 'data-field': 'output_tokens', style: { margin: 0 } }, v.output),
+                    h('dt', { style: MUTED }, 'Cache discount multiplier'),
+                    h('dd', { 'data-field': 'discount_multiplier', style: { margin: 0 } }, v.multiplier),
+                    h('dt', { style: MUTED }, 'Rate snapshot'),
+                    h('dd', { 'data-field': 'rate_source', style: { margin: 0 } }, v.rateSource),
+                    v.reasonText ? h('dt', { style: MUTED }, 'Why a value is missing') : null,
+                    v.reasonText ? h('dd', { 'data-field': 'reason', style: { margin: 0 } }, v.reasonText) : null
+                  )
+                )
+              )
+            )
+          })
+        )
+      )
+    )
+  }
+
+  return h(
+    'section',
+    { 'data-depth-card': 'cache', 'aria-labelledby': 'ud-h-cache', style: CARD_STYLE },
+    h('h3', { id: 'ud-h-cache', style: { margin: 0, fontSize: '0.95rem', fontWeight: 600 } }, 'Cache economics · recorded-cost basis'),
+    h('p', { style: { ...MUTED, margin: 0 } }, CACHE_NOTE + ' ' + CACHE_TIP),
+    body,
+    depthStatusNote(dp)
+  )
+}
+
+// Per-group duration table and repository path detail (text nodes only).
+function GroupDurations(props) {
+  const dp = props.depth
+
+  if (!dp || !dp.supported) {
+    return null
+  }
+
+  const withStats = props.views.filter(v => isObj(v.group.durations))
+
+  if (withStats.length === 0) {
+    return null
+  }
+
+  return h(
+    'details',
+    { 'data-group-durations': 'true' },
+    h('summary', { style: { ...SMALL, cursor: 'pointer' } }, DURATION_LABEL + ' by group'),
+    h(
+      'div',
+      { style: { overflowX: 'auto' } },
+      h(
+        'table',
+        { style: { borderCollapse: 'collapse', width: '100%' } },
+        h('thead', null, h('tr', null, ['Group', 'p50', 'p90', 'p99', 'mean', 'max', 'samples'].map(c => h('th', { key: c, scope: 'col', style: TH }, c)))),
+        h(
+          'tbody',
+          null,
+          withStats.map(v =>
+            h(
+              'tr',
+              { key: v.group.id, 'data-group-id': v.group.id },
+              h('td', { style: TD }, str(v.group.label)),
+              durationItems(v.group.durations, v.group.duration_samples).map(it => h('td', { key: it.id, title: it.title, 'data-duration': it.id, style: TD }, it.text))
+            )
+          )
+        )
+      )
+    )
+  )
+}
+
+function RepoPaths(props) {
+  const dp = props.depth
+
+  if (!dp || !dp.repos) {
+    return null
+  }
+
+  const items = props.views.map(v => ({ v, p: repoPathSummary(repoRowFor(v.group, dp.repos)) })).filter(x => x.p.count > 0)
+
+  if (items.length === 0) {
+    return null
+  }
+
+  return h(
+    'details',
+    { 'data-repo-paths': 'true' },
+    h('summary', { style: { ...SMALL, cursor: 'pointer' } }, 'Repository paths (' + items.length + ')'),
+    h(
+      'ul',
+      { style: SMALL },
+      items.map(x =>
+        h(
+          'li',
+          { key: x.v.group.id, 'data-repo-group': x.v.group.id },
+          x.p.count === 1
+            ? str(x.v.group.label) + ' — ' + x.p.text
+            : h('details', null, h('summary', null, str(x.v.group.label) + ' — ' + x.p.text), h('ul', null, x.p.paths.map(p => h('li', { key: p }, p))))
+        )
+      )
+    )
   )
 }
 
@@ -2107,7 +2680,7 @@ function pointTip(view, p) {
   )
 }
 
-// By profile / By model: one shared legend drives both charts and the grouped tables (no refetch).
+// By profile / By model / By repo: one shared legend drives both charts and the grouped tables (no refetch).
 function GroupedView(props) {
   const d = props.data
   const views = useMemo(() => groupViews(d), [d])
@@ -2115,6 +2688,10 @@ function GroupedView(props) {
   const visible = views.filter(v => !hidden[v.group.id])
   const anyHidden = views.some(v => hidden[v.group.id])
   const byProfile = d.dimension === 'profile'
+  const byRepo = d.dimension === 'repo'
+  const noun = byRepo ? 'repository' : byProfile ? 'profile' : 'model'
+  const depthInfo = d.depth || null
+  const repoOf = v => (byRepo && depthInfo && depthInfo.repos ? repoPathSummary(repoRowFor(v.group, depthInfo.repos)) : null)
   const tokenLines = []
   const spendLines = []
   const toggle = id =>
@@ -2156,7 +2733,7 @@ function GroupedView(props) {
     { 'data-dimension-view': d.dimension, style: { display: 'flex', flexDirection: 'column', gap: '0.75rem' } },
     h(
       'div',
-      { role: 'group', 'aria-label': byProfile ? 'Profiles' : 'Models', style: { display: 'flex', flexWrap: 'wrap', gap: '0.4rem' } },
+      { role: 'group', 'aria-label': byRepo ? 'Repositories' : byProfile ? 'Profiles' : 'Models', style: { display: 'flex', flexWrap: 'wrap', gap: '0.4rem' } },
       views.map(v =>
         h(
           ui.Button,
@@ -2190,15 +2767,17 @@ function GroupedView(props) {
       h(
         'table',
         { 'data-summary-table': d.dimension, style: { borderCollapse: 'collapse', width: '100%' } },
-        h('thead', null, h('tr', null, ['Group', 'Input', 'Output', 'Total tokens', 'Est. USD', API_LABEL, 'Sessions', 'API calls'].map(apiHead))),
+        h('thead', null, h('tr', null, [byRepo ? 'Repository' : 'Group', 'Input', 'Output', 'Total tokens', 'Est. USD', API_LABEL, 'Sessions', 'API calls'].map(apiHead))),
         h(
           'tbody',
           null,
-          visible.map(v =>
-            h(
+          visible.map(v => {
+            const repo = repoOf(v)
+
+            return h(
               'tr',
               { key: v.group.id, 'data-group-id': v.group.id },
-              h('td', { style: TD }, str(v.group.label)),
+              h('td', { style: TD }, str(v.group.label), repo && repo.text ? h('div', { 'data-repo-path': repo.count === 1 ? 'single' : 'multi', style: MUTED }, repo.text) : null),
               h(MetricCell, { metrics: v.group.totals, field: 'input_count' }),
               h(MetricCell, { metrics: v.group.totals, field: 'output_count' }),
               h(TotalTokensCell, { metrics: v.group.totals }),
@@ -2207,14 +2786,16 @@ function GroupedView(props) {
               h(MetricCell, { metrics: v.group.totals, field: 'sessions' }),
               h(MetricCell, { metrics: v.group.totals, field: 'api_calls' })
             )
-          )
+          })
         )
       )
     ),
+    h(GroupDurations, { views, depth: depthInfo }),
+    byRepo ? h(RepoPaths, { views, depth: depthInfo }) : null,
     h(
       'details',
       { 'data-grouped-rows': 'true' },
-      h('summary', { style: { ...SMALL, cursor: 'pointer' } }, 'Daily rows by ' + (byProfile ? 'profile' : 'model') + ' (' + mainRows.length + ')'),
+      h('summary', { style: { ...SMALL, cursor: 'pointer' } }, 'Daily rows by ' + noun + ' (' + mainRows.length + ')'),
       h(RowsTable, { rows: mainRows, providers: props.providers, withGroup: true, name: 'grouped', groupLabel: r => str(groupOfRow[r.id] && groupOfRow[r.id].label) })
     ),
     otherView
@@ -2364,7 +2945,7 @@ function UsageZone(props) {
       inner = h(GroupedView, { key: [d.mode, d.dimension, d.window_days, d.provider_id].join('|'), data: d, providers: d.providers })
     }
 
-    content = h('div', { 'aria-busy': rs.refreshing ? 'true' : undefined }, err, h(CoverageNote, { data: d }), inner, h(TotalsBar, { totals: d.totals, rowCount: d.rows.length }), h(PricingNotes, { data: d }), h(UnpricedModels, { data: d }))
+    content = h('div', { 'aria-busy': rs.refreshing ? 'true' : undefined }, err, h(CoverageNote, { data: d }), inner, h(TotalsBar, { totals: d.totals, rowCount: d.rows.length, depth: d.depth }), h(HeatmapCard, { depth: d.depth }), h(CacheCard, { depth: d.depth, providers: d.providers }), h(PricingNotes, { data: d }), h(UnpricedModels, { data: d }))
   }
 
   return h(

@@ -22,8 +22,14 @@ from plugins.usage_deck.service import UsageDeckService
 from .helpers import FakeTransport
 from .test_analytics_dimensions import NOW, S, DirectSqlAnalytics, Machine
 
-# Additive keys of the API-equivalent feature (docs/design/api-equivalent-pricing.md §7).
-ANNOTATION_KEYS = frozenset({"api_equivalent_usd", "api_equivalent", "pricing"})
+# Additive keys of the API-equivalent feature (docs/design/api-equivalent-pricing.md §7) and of analytics depth
+# (docs/design/analytics-depth-breakdown.md §2, §6): the declared additions, whitelisted by name so every other
+# pre-feature field must stay byte-identical.
+ANNOTATION_KEYS = frozenset({
+    "api_equivalent_usd", "api_equivalent", "pricing",
+    "durations", "duration_samples", "heatmap", "cache_metrics", "repo_rollup", "model_rollup", "depth_totals",
+    "depth_status", "repo_basename", "repo_paths",
+})
 
 SEVEN = ["gpt-6-luna", "gpt-6.1-sol", "claude-sonnet-5-5", "qwen3.8-flash-next", "qwen3.6:35b",
          "cyber-tiel-coder:35b", "qwen3.8-hauhau-aggressive-27b-iq3-gpu-96k-b8k"]
