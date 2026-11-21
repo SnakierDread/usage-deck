@@ -24,7 +24,7 @@ import math
 import re
 from typing import AbstractSet, Any, Iterable, Optional
 
-from .dto import NON_SECRET_WIRE_NAMES, WIRE_KEYS, preserves_wire_value
+from .dto import NON_SECRET_WIRE_NAMES, TOKEN_WIRE_NAMES, TOKEN_WIRE_SHAPES, WIRE_KEYS, preserves_wire_value
 
 REDACTED = "[REDACTED]"
 
@@ -132,10 +132,11 @@ def _walk(value: Any, secrets: frozenset, depth: int, schema_keys: frozenset,
     if isinstance(value, dict):
         out = {}
         names = tuple(value)
+        counters_ok = frozenset(names) in TOKEN_WIRE_SHAPES  # an analytics-depth object: its counters are public
         for name, item in value.items():
             if not isinstance(name, str):
                 raise RedactionError("non-string key")
-            if is_sensitive_name(name):
+            if is_sensitive_name(name) and not (counters_ok and name in TOKEN_WIRE_NAMES):
                 out[name] = REDACTED
                 continue
             out_name = name if name in schema_keys else scrub_string(name, secrets)

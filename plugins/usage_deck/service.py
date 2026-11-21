@@ -29,6 +29,7 @@ from .adapters.base import AdapterContext, AnalyticsReader, EndpointCache
 from .adapters.cloud import ANTHROPIC_PROVIDER_ID, ANTHROPIC_TARGET, CODEX_PROVIDER_ID, CODEX_TARGET, OPENROUTER_TARGET
 from .adapters.credentials import default_resolver
 from .adapters import dimensions as dims
+from .adapters import analytics_depth as depth
 from .adapters.fallback import SessionAnalyticsAdapter
 from .adapters.session_db import (
     STATE_ABSENT,
@@ -41,6 +42,7 @@ from .adapters.session_db import (
     SessionDbReader,
     catalog_identity,
     normalize_provider,
+    provider_matches,
     sum_known as _known_sum,
     sum_metrics,
 )
@@ -240,8 +242,11 @@ class UsageDeckService:
         token_resolver: Any = None,
         session_reader_factory: Optional[Callable[[], SessionDbReader]] = None,
         pricing_factory: Optional[Callable[[Any], PricingInputs]] = None,
+        depth_rates_factory: Optional[Callable[[], "depth.RateTable"]] = None,
     ):
         self._inventory_factory = inventory_factory or host_inventory_source
+        # Packaged cache-discount projection (design §5); a test may inject a table.
+        self._depth_rates_factory = depth_rates_factory or depth.load_rate_table
         # Read-only state.db reader for the dimensions payload (tests inject one with a SQL trace).
         self._session_reader_factory = session_reader_factory or SessionDbReader
         # API-equivalent resolver inputs (catalog snapshot + aliases + resolve); tests inject a double.
@@ -383,10 +388,11 @@ class UsageDeckService:
         catalog = tuple((name, is_global, catalog_identity(directory)) for name, is_global, directory in homes)
         priced = self._pricing(source)  # frozen once: this request prices every leaf against one snapshot
         price_id = (priced.catalog.revision, alias_digest(priced.aliases)) if priced else (_UNAVAILABLE_REVISION, "")
+        rates = self._depth_rates()  # frozen once per request, like the pricing snapshot
         key = (self._source_key(source), query.profile or "", "usage", mode, dimension, query.window, query.provider,
-               catalog, truncated, tuple(rejected[0]), rejected[1], price_id)
+               catalog, truncated, tuple(rejected[0]), rejected[1], price_id, rates.digest)
         data, errors = self._cached(
-            key, lambda: self._compute_usage(query, mode, dimension, homes, truncated, rejected, priced))
+            key, lambda: self._compute_usage(query, mode, dimension, homes, truncated, rejected, priced, rates))
         return self._ok(data, errors, USAGE_SCHEMA_VERSION)
 
     def _pricing(self, source: Any) -> Optional[PricingInputs]:
@@ -423,7 +429,9 @@ class UsageDeckService:
         return [(query.profile, False, root / "profiles" / query.profile)], False, ([], False)
 
     def _compute_usage(self, query: Query, mode: str, dimension: str, homes: list, truncated: bool,
-                       rejected: tuple, priced: Optional[PricingInputs] = None) -> Tuple[dict, List[dict]]:
+                       rejected: tuple, priced: Optional[PricingInputs] = None,
+                       rates: Optional["depth.RateTable"] = None) -> Tuple[dict, List[dict]]:
+        rates = rates if rates is not None else self._depth_rates()
         now = self._clock()  # one frozen clock for every DB, group and timestamp of this response
         cutoff = now.timestamp() - query.window * 86400
         reads = self._session_reader_factory().read_homes(homes, cutoff)
@@ -457,7 +465,18 @@ class UsageDeckService:
             wanted, bad = normalize_provider(query.provider)
             if bad or wanted is None or wanted not in dims.known_provider_ids(rows_all, reads):
                 raise ApiError(404, "provider_not_found")
-        rows = dims.filter_rows(rows_all, wanted)
+        # The depth projection is scoped with the SAME home set, window predicate, attribution and provider
+        # predicate as the counters above: every dimension sees one identical authorized session set.
+        all_facts, scan = depth.facts_from_reads(reads)
+        facts = depth.filter_facts(all_facts, (lambda p: provider_matches(p, wanted)) if wanted else (lambda p: True))
+        if dimension == "repo":
+            # The repository view is built from the facts: a home whose projection failed cannot be shown.
+            if scan.scanned == 0 and scan.unavailable > 0:
+                raise ApiError(503, "analytics_unavailable")
+            incomplete = incomplete or scan.unavailable > 0
+            rows = dims.repo_rows(facts)
+        else:
+            rows = dims.filter_rows(rows_all, wanted)
         if priced is not None:  # price each authorized, filtered leaf once; groups/series/totals only sum these
             rows = dims.annotate_rows(rows, lambda model, tokens_in, tokens_out: priced.resolve(
                 model, tokens_in, tokens_out, catalog=priced.catalog, aliases=priced.aliases, now=now))
@@ -476,6 +495,22 @@ class UsageDeckService:
         else:
             totals = row_metrics
         part = dims.partition(rows, dimension, mode, query.window, now, wanted, label_of, override_all)
+        kept = {g.id for g in part.groups}
+
+        def group_of(fact: depth.SessionFact) -> Optional[str]:
+            """The id of the ``data.groups`` entry a session belongs to (model Other = every unlisted model)."""
+            if dimension == "all":
+                return "all"
+            if dimension == "profile":
+                return dims.profile_group_id(*fact.holder)
+            if dimension == "repo":
+                return depth.repo_group_id(depth.repo_key(fact.repo_root))
+            gid = dims.model_group_id(fact.model)
+            return gid if gid in kept else "other"
+
+        depth_result = depth.build_depth(facts, dimension=dimension, rate_table=rates, scan=scan,
+                                         source_incomplete=incomplete, group_of=group_of)
+        groups = [self._with_durations(g, depth_result) for g in part.groups]
         has_data = bool(override.points) if override is not None else bool(rows)
         reason = "source_unavailable" if incomplete else (None if has_data else "no_observations")
         totals_dto = dims.metrics_dto(totals, rows)
@@ -492,7 +527,7 @@ class UsageDeckService:
             "dimension": dimension,
             "provider_id": wanted,
             "series": [to_plain(s) for s in part.series],
-            "groups": [to_plain(g) for g in part.groups],
+            "groups": [to_plain(g) for g in groups],
             "rows": [to_plain(dims.row_dto(r)) for r in rows],
             "totals": to_plain(totals_dto),
             "providers": [{"id": pid, "label": label} for pid, label
@@ -502,9 +537,27 @@ class UsageDeckService:
             "top_n": TOP_N_MODELS if dimension == "model" else None,
             "reason": reason,
             "pricing": to_plain(pricing_info),
+            **depth_result.data,
         }
         errors = [to_plain(make_error("analytics_unavailable"))] if incomplete else []
         return data, errors
+
+    @staticmethod
+    def _with_durations(group: Any, result: "depth.DepthResult") -> Any:
+        """Attach the group's own duration stats (computed from its true session membership, never from other
+        groups' percentiles); stays null while the depth projection is unavailable."""
+        if result.data["durations"] is None:
+            return group
+        stats, samples = result.group_durations.get(group.id, (depth.duration_stats(())[0], 0))
+        return replace(group, durations=stats, duration_samples=samples)
+
+    def _depth_rates(self) -> "depth.RateTable":
+        """The packaged cache-discount table; a broken file degrades to 'no known discount', never to an error."""
+        try:
+            return self._depth_rates_factory()
+        except Exception as exc:  # noqa: BLE001 - cache economics is additive; usage must keep working
+            log.warning("usage_deck cache discounts unavailable: %s", type(exc).__name__)
+            return depth.EMPTY_RATE_TABLE
 
     def _read_series(self, query: Query, now: Optional[datetime] = None) -> Optional[Any]:
         now = now or self._clock()

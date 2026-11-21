@@ -12,6 +12,7 @@ import hashlib
 import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from ..models.dto import (
@@ -28,6 +29,7 @@ from ..models.dto import (
     api_usd,
 )
 from .base import AnalyticsDay
+from .analytics_depth import SessionFact, display_label, repo_group_id, repo_key, repo_paths_of
 from .fallback import PROFILE_SERIES_ID, build_series
 from .session_db import (
     STATE_OK,
@@ -58,6 +60,11 @@ class Row:
     metrics: Metrics
     #: ``pricing.PriceResolution`` of this leaf once annotated (``annotate_rows``); None = not priced.
     price: Optional[Any] = None
+    #: By-repo leaves only: display basename (None = unscoped) and the sanitized contributing full paths.
+    repo_basename: Optional[str] = None
+    repo_paths: Optional[Tuple[str, ...]] = None
+    #: By-repo leaves only: the group identity (``(basename,)`` for a repository, ``()`` for unscoped).
+    repo_key: Optional[Tuple[str, ...]] = None
 
     @property
     def holder(self) -> Tuple[bool, str]:
@@ -90,6 +97,53 @@ def filter_rows(rows: Sequence[Row], provider: Optional[str]) -> List[Row]:
     if provider is None:
         return list(rows)
     return [r for r in rows if provider_matches(r.provider_id, provider)]
+
+
+def _leaf_metrics(members: Sequence[SessionFact]) -> Metrics:
+    """Legacy counter formulas (including the old ``COALESCE(SUM(cost), 0)``) over one repo leaf's facts.
+
+    Only the by-repo view uses this; on complete valid data it equals the SQL counters of the same sessions."""
+    absent = members[0].absent
+    n = len(members)
+    missing = set()
+    ins = [f.input_tokens for f in members if f.input_tokens is not None]
+    outs = [f.output_tokens for f in members if f.output_tokens is not None]
+    if "input_tokens" in absent or len(ins) < n:
+        missing.add("input_count")
+    if "output_tokens" in absent or len(outs) < n:
+        missing.add("output_count")
+    usd: Optional[float] = None
+    if "estimated_cost_usd" in absent:
+        missing.add("estimated_usd")
+    else:
+        usd = float(sum((f.cost for f in members if f.cost is not None), Decimal(0)))
+    calls: Optional[int] = None
+    if "api_call_count" in absent:
+        missing.add("api_calls")
+    else:
+        calls = sum(f.api_calls or 0 for f in members)
+    return Metrics(input_count=sum(ins) if ins else None, output_count=sum(outs) if outs else None,
+                   estimated_usd=usd, sessions=n, api_calls=calls, missing=frozenset(missing))
+
+
+def repo_rows(facts: Iterable[SessionFact]) -> List[Row]:
+    """By-repo provenance leaves keyed ``(home, local day, exact model, attributed provider, repo key)`` (§6).
+
+    New leaves with their own ids: the legacy rows (and their ids) of the other dimensions are untouched."""
+    merged: Dict[tuple, List[SessionFact]] = {}
+    for fact in facts:
+        merged.setdefault((fact.holder, fact.day, fact.model, fact.provider, fact.attribution,
+                           repo_key(fact.repo_root)), []).append(fact)
+    rows = []
+    for (holder, day, model, provider, source, key), members in merged.items():
+        rows.append(Row(
+            _row_id([holder[0], holder[1], day, model, provider, source, "repo", key]), day, holder[1], holder[0],
+            model, provider, source, _leaf_metrics(members), None,
+            display_label(key) if key is not None else None, repo_paths_of(members),
+            (key,) if key is not None else ()))
+    rows.sort(key=lambda r: (r.day, not r.is_global, r.profile, r.model_id is None, r.model_id or "",
+                             r.provider_id, r.attribution_source, not r.repo_key, r.repo_key))
+    return rows
 
 
 def known_provider_ids(rows: Sequence[Row], reads: Iterable[HomeRead]) -> Set[str]:
@@ -182,7 +236,8 @@ def metrics_dto(m: Metrics, rows: Iterable[Row] = ()) -> UsageMetrics:
 
 def row_dto(r: Row) -> ProvenanceRow:
     return ProvenanceRow(r.id, r.day, r.profile, r.is_global, "state.db", r.model_id, r.provider_id,
-                         r.attribution_source, metrics_dto(r.metrics, (r,)), row_pricing(r.price))
+                         r.attribution_source, metrics_dto(r.metrics, (r,)), row_pricing(r.price),
+                         r.repo_basename, r.repo_paths)
 
 
 def daily_days(rows: Iterable[Row]) -> Tuple[AnalyticsDay, ...]:
@@ -294,6 +349,21 @@ def partition(rows: Sequence[Row], dimension: str, mode: str, window: int, now, 
             members = by_holder[holder]
             gid = profile_group_id(*holder)
             groups.append(_group_dto(gid, profile_label(*holder), gid, None, members, False))
+            series.append(series_of(gid, members))
+        return Partition(tuple(groups), tuple(series))
+    if dimension == "repo":  # design §6: every repository (no top-N, no Other); missing bucket last
+        by_repo: Dict[Tuple[str, ...], List[Row]] = {}
+        for r in rows:
+            by_repo.setdefault(r.repo_key or (), []).append(r)
+
+        def repo_rank(key: Tuple[str, ...]):
+            total = known_tokens(sum_metrics(r.metrics for r in by_repo[key]))
+            return (not key, total is None, -(total or 0), key[0] if key else "")
+
+        for key in sorted(by_repo, key=repo_rank):
+            members = by_repo[key]
+            gid = repo_group_id(key[0] if key else None)
+            groups.append(_group_dto(gid, display_label(key[0] if key else None), gid, None, members, False))
             series.append(series_of(gid, members))
         return Partition(tuple(groups), tuple(series))
     ranked = rank_models(rows)  # dimension == "model"

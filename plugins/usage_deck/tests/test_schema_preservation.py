@@ -34,7 +34,29 @@ SERIES_KEYS = {"id", "provider_id", "account_id", "scope", "confidence", "source
                "bucket", "timezone", "coverage", "points", "checked_at", "stale", "error"}
 # Usage v2 (analytics-dimensions-breakdown §4): exact key sets, deliberately independent of dto.py.
 USAGE_KEYS = {"window_days", "mode", "dimension", "provider_id", "series", "groups", "rows", "totals", "providers",
-              "sources", "complete", "top_n", "reason", "pricing"}
+              "sources", "complete", "top_n", "reason", "pricing",
+              # analytics-depth additions (analytics-depth-breakdown §2): always emitted, null when unavailable
+              "durations", "duration_samples", "heatmap", "cache_metrics", "repo_rollup", "model_rollup",
+              "depth_totals", "depth_status"}
+DEPTH_KEYS = {"durations", "duration_samples", "heatmap", "cache_metrics", "repo_rollup", "model_rollup",
+              "depth_totals", "depth_status"}
+DURATION_KEYS = {"p50", "p90", "p99", "mean", "max"}
+HEATMAP_KEYS = {"grid", "starts"}
+HEATCELL_KEYS = {"sessions", "total_tokens"}
+HEATSTART_KEYS = {"started_at", "sessions", "total_tokens"}
+CACHE_ROW_KEYS = {"model", "provider_id", "hit_rate_pct", "cached_input_tokens", "uncached_input_tokens",
+                  "reasoning_tokens", "effective_cost_per_mtok", "cache_write_tokens", "output_tokens",
+                  "reasoning_share_pct", "discount_multiplier", "rate_source", "reason"}
+CACHE_REASONS = {None, "missing_usage", "missing_cost", "unknown_discount", "zero_denominator", "incomplete_source"}
+REPO_ROW_KEYS = {"repo_basename", "full_path", "sessions", "total_tokens", "total_cost", "full_paths"}
+MODEL_ROW_KEYS = {"model", "provider_id", "sessions", "total_tokens", "total_cost"}
+DEPTH_TOTALS_KEYS = {"sessions", "total_tokens", "total_cost"}
+DEPTH_STATUS_KEYS = {"partial", "excluded_started_at", "missing"}
+DEPTH_MISSING_KEYS = {"input_tokens", "output_tokens", "estimated_cost_usd", "cache_read_tokens",
+                      "cache_write_tokens", "reasoning_tokens", "duration"}
+#: Token-counter names are admitted only inside the depth objects (never listed as global wire keys).
+DEPTH_COUNTER_NAMES = {"total_tokens", "cached_input_tokens", "uncached_input_tokens", "reasoning_tokens",
+                       "cache_write_tokens", "output_tokens", "input_tokens", "cache_read_tokens"}
 METRICS_KEYS = {"input_count", "output_count", "estimated_usd", "sessions", "api_calls", "missing_fields",
                 "api_equivalent_usd", "api_equivalent"}
 # API-equivalent pricing annotation (docs/design/api-equivalent-pricing.md §7), independent of dto.py.
@@ -42,8 +64,9 @@ API_EQUIVALENT_KEYS = {"amount_pico_usd", "priced_rows", "unpriced_rows", "proxy
 ROW_PRICING_KEYS = {"catalog_key", "method", "alias_kind", "note", "reason", "source", "fetched_at", "stale"}
 DATA_PRICING_KEYS = {"catalog_revision", "origin", "warnings", "unknown_row_ids"}
 ROW_KEYS = {"id", "day", "profile", "is_global", "source", "model_id", "provider_id", "attribution_source", "metrics",
-            "pricing"}
-GROUP_KEYS = {"id", "label", "series_id", "model_id", "provider_ids", "profiles", "row_ids", "totals", "is_other"}
+            "pricing", "repo_basename", "repo_paths"}
+GROUP_KEYS = {"id", "label", "series_id", "model_id", "provider_ids", "profiles", "row_ids", "totals", "is_other",
+              "durations", "duration_samples"}
 SOURCE_KEYS = {"profile", "is_global", "state"}
 PROVIDER_KEYS = {"id", "label"}
 HEALTH_KEYS = {"endpoint_id", "provider_id", "display_name", "status", "confidence", "metrics_available",
@@ -190,6 +213,74 @@ class SchemaAsserts(unittest.TestCase):
         self.assertEqual([g["series_id"] for g in data["groups"]], [s["id"] for s in data["series"]])
         grouped = sorted(rid for g in data["groups"] for rid in g["row_ids"])
         self.assertEqual(grouped, sorted(r["id"] for r in data["rows"]))  # every row in exactly one group
+        self.assert_exact_depth(data)
+
+    def assert_exact_depth(self, data):
+        """Independent copy of the analytics-depth contract (design §2): exact keys, types, null doctrine."""
+        def count(v, nullable=True):
+            return (v is None and nullable) or (type(v) is int and v >= 0)
+
+        def num(v):
+            return v is None or (isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 and v == v
+                                 and v not in (float("inf"),))
+
+        def stats_ok(d, n):
+            self.assertEqual(set(d), DURATION_KEYS)
+            self.assertTrue(all(num(v) for v in d.values()))
+            self.assertTrue(count(n))
+            if n == 0:
+                self.assertTrue(all(v is None for v in d.values()))
+            else:
+                self.assertTrue(all(v is not None for v in d.values()))
+
+        for g in data["groups"]:
+            self.assertEqual(g["durations"] is None, g["duration_samples"] is None)
+            if g["durations"] is not None:
+                stats_ok(g["durations"], g["duration_samples"])
+        for r in data["rows"]:
+            self.assertTrue(r["repo_basename"] is None or isinstance(r["repo_basename"], str))
+            self.assertTrue(r["repo_paths"] is None or all(isinstance(p, str) for p in r["repo_paths"]))
+        if data["durations"] is None:
+            self.assertEqual({k: data[k] for k in ("duration_samples", "heatmap", "cache_metrics", "repo_rollup",
+                                                   "model_rollup", "depth_totals")},
+                             dict.fromkeys(("duration_samples", "heatmap", "cache_metrics", "repo_rollup",
+                                            "model_rollup", "depth_totals")))
+            self.assertEqual(set(data["depth_status"]), DEPTH_STATUS_KEYS)
+            self.assertIs(data["depth_status"]["partial"], True)
+            return
+        stats_ok(data["durations"], data["duration_samples"])
+        heat = data["heatmap"]
+        self.assertEqual(set(heat), HEATMAP_KEYS)
+        self.assertEqual((len(heat["grid"]), {len(row) for row in heat["grid"]}), (7, {24}))
+        cells = [c for row in heat["grid"] for c in row]
+        for c in cells:
+            self.assertEqual(set(c), HEATCELL_KEYS)
+            self.assertTrue(count(c["sessions"], False) and count(c["total_tokens"]))
+        self.assertEqual(sum(s["sessions"] for s in heat["starts"]), sum(c["sessions"] for c in cells))
+        self.assertEqual([s["started_at"] for s in heat["starts"]], sorted({s["started_at"] for s in heat["starts"]}))
+        for s in heat["starts"]:
+            self.assertEqual(set(s), HEATSTART_KEYS)
+        for row in data["cache_metrics"]:
+            self.assertEqual(set(row), CACHE_ROW_KEYS)
+            self.assertIn(row["reason"], CACHE_REASONS)
+            for k in ("hit_rate_pct", "reasoning_share_pct"):
+                self.assertTrue(row[k] is None or 0 <= row[k] <= 100, k)
+            self.assertTrue(num(row["effective_cost_per_mtok"]) and num(row["discount_multiplier"]))
+        for row in data["repo_rollup"]:
+            self.assertEqual(set(row), REPO_ROW_KEYS)
+            self.assertTrue(row["full_path"] is None or row["full_paths"] == [row["full_path"]])
+        for row in data["model_rollup"]:
+            self.assertEqual(set(row), MODEL_ROW_KEYS)
+        self.assertEqual(set(data["depth_totals"]), DEPTH_TOTALS_KEYS)
+        status = data["depth_status"]
+        self.assertEqual(set(status), DEPTH_STATUS_KEYS)
+        self.assertEqual(set(status["missing"]), DEPTH_MISSING_KEYS)
+        # Conservation (design §6) restated independently of the code under test.
+        tot = data["depth_totals"]
+        for rows in (data["repo_rollup"], data["model_rollup"]):
+            self.assertEqual(sum(r["sessions"] for r in rows), tot["sessions"])
+            toks = [r["total_tokens"] for r in rows if r["total_tokens"] is not None]
+            self.assertEqual(sum(toks) if toks else None, tot["total_tokens"])
 
     def assert_exact_envelope(self, endpoint, status, body):
         self.assertEqual(status, 200, body)
@@ -214,7 +305,7 @@ class SchemaAsserts(unittest.TestCase):
             self.assertIn(data["window_days"], (7, 30, 90))
             self.assertIn(data["reason"], (None, "no_observations", "source_unavailable"))
             self.assertIn(data["mode"], ENUMS["view"])
-            self.assertIn(data["dimension"], ("all", "profile", "model"))
+            self.assertIn(data["dimension"], ("all", "profile", "model", "repo"))
             self.assertIsInstance(data["complete"], bool)
             self.assertEqual(data["top_n"], 8 if data["dimension"] == "model" else None)
             for s in data["series"]:
@@ -254,10 +345,18 @@ class SanitizeSchemaTests(unittest.TestCase):
         contract = (CARD_KEYS | METER_KEYS | PERIOD_KEYS | ERROR_KEYS | DEBUG_KEYS | POINT_KEYS | SERIES_KEYS
                     | HEALTH_KEYS | META_KEYS | HOLDER_KEYS | METRICS_KEYS | ROW_KEYS | GROUP_KEYS | SOURCE_KEYS
                     | PROVIDER_KEYS | USAGE_KEYS | API_EQUIVALENT_KEYS | ROW_PRICING_KEYS | DATA_PRICING_KEYS
+                    | ((DURATION_KEYS | HEATMAP_KEYS | HEATCELL_KEYS | HEATSTART_KEYS | CACHE_ROW_KEYS | REPO_ROW_KEYS
+                        | MODEL_ROW_KEYS | DEPTH_TOTALS_KEYS | DEPTH_STATUS_KEYS | DEPTH_MISSING_KEYS)
+                       - DEPTH_COUNTER_NAMES)
                     | {"ok", "data", "error", "meta", "cards", "inventory_state", "view",
                        "entries", "window_days", "series", "reason", "provider_id"})
         self.assertEqual(set(dto.WIRE_KEYS), contract)
         self.assertEqual([k for k in dto.WIRE_KEYS if is_sensitive_name(k)], [])
+        # The counters containing "token" stay redacted in raw mappings; only an exact depth-object shape keeps them.
+        self.assertEqual(sanitize({"total_tokens": 5})["total_tokens"], REDACTED)
+        self.assertEqual(sanitize({"sessions": 1, "total_tokens": 5}), {"sessions": 1, "total_tokens": 5})
+        self.assertEqual(sanitize({"sessions": 1, "total_tokens": 5, "extra": 1})["total_tokens"], REDACTED)
+        self.assertEqual(sanitize({n: 1 for n in DEPTH_MISSING_KEYS}), {n: 1 for n in DEPTH_MISSING_KEYS})
 
     def test_enum_and_format_values_survive_every_colliding_secret(self):
         sample = {"confidence": "self_hosted", "state": "opaque", "reason": "unsupported", "kind": "self_hosted",
