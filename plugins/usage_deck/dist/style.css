@@ -258,3 +258,29 @@
 .usage-deck .ud-table-scroll { overflow-x: auto; }
 .usage-deck .ud-totals { border-top: 1px solid var(--ud-border); padding-top: 0.5rem; }
 .usage-deck .ud-zone-head .ud-controls { row-gap: 0.4rem; }
+
+/* Analytics depth (analytics-depth-breakdown §7): start-time heatmap, cache economics, durations. Host tokens only. */
+.usage-deck .ud-depth-card { margin-top: 0.75rem; }
+.usage-deck .ud-depth-card h3 { margin: 0; font-size: 0.95rem; font-weight: 600; }
+.usage-deck .ud-sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.usage-deck .ud-heat { border-collapse: separate; border-spacing: 2px; font-size: 0.7rem; font-variant-numeric: tabular-nums; }
+.usage-deck .ud-heat th { font-weight: 500; color: var(--ud-muted); padding: 0 0.15rem; text-align: center; }
+.usage-deck .ud-heat tbody th { text-align: left; padding-right: 0.4rem; }
+.usage-deck .ud-heat td { padding: 0; }
+.usage-deck .ud-heat-cell {
+  width: 1.55rem; height: 1.35rem; padding: 0; border: 1px solid var(--ud-border); border-radius: 3px;
+  background: transparent; color: inherit; font: inherit; cursor: pointer; line-height: 1;
+}
+.usage-deck .ud-heat-cell:focus-visible { outline: 2px solid var(--ud-ring); outline-offset: 1px; }
+.usage-deck .ud-heat-cell[aria-pressed="true"] { outline: 2px solid var(--ud-accent); outline-offset: 1px; }
+.usage-deck .ud-heat-l1 { background: color-mix(in srgb, var(--ud-accent) 18%, transparent); }
+.usage-deck .ud-heat-l2 { background: color-mix(in srgb, var(--ud-accent) 40%, transparent); }
+.usage-deck .ud-heat-l3 { background: color-mix(in srgb, var(--ud-accent) 62%, transparent); }
+.usage-deck .ud-heat-l4 { background: color-mix(in srgb, var(--ud-accent) 85%, transparent); }
+.usage-deck .ud-heat-na { background: transparent; border-style: dashed; color: var(--ud-muted); }
+.usage-deck .ud-heat-detail { border-top: 1px solid var(--ud-border); padding-top: 0.5rem; }
+.usage-deck .ud-cache-scroll { max-height: 24rem; overflow: auto; }
+.usage-deck .ud-cache-scroll thead th { position: sticky; top: 0; background: var(--ud-card, transparent); }
+.usage-deck .ud-cache-detail dl { margin: 0.3rem 0 0; text-align: left; }
+.usage-deck .ud-cache-detail dt { color: var(--ud-muted); }
+.usage-deck .ud-cache-detail dd { margin: 0 0 0.25rem; }
