@@ -32,6 +32,11 @@ KINDS = {
     "qwen3.8-flash-next": "proxy", "qwen3.6:35b": "proxy", "cyber-tiel-coder:35b": "proxy",
     "qwen3.8-hauhau-aggressive-27b-iq3-gpu-96k-b8k": "proxy",
 }
+# Added after the live host check (t_5561a3ef): (recorded id, seeded twin, kind). Not part of the design's seven.
+FOLLOWUP = (
+    ("claude-sonnet-5.5", "claude-sonnet-5-5", "equivalent"),
+    ("cybertiel-q5", "cyber-tiel-coder:35b", "proxy"),
+)
 TARGETS = {
     "gpt-6-luna": "litellm:azure_ai/gpt-6-luna",
     "gpt-6.1-sol": "litellm:azure_ai/gpt-6.1-sol",
@@ -290,6 +295,37 @@ class InventoryResolutionTests(unittest.TestCase):
             self.assertEqual(r.method, "none", model_id)
             self.assertIsNone(r.api_equivalent_usd)
             self.assertIn(r.reason, ("no_catalog_match", "ambiguous_model"))
+
+    def test_followup_spellings_alias_to_the_same_targets_with_visible_method_and_key(self):
+        # Ids stay verbatim (brief decision 1): each recorded spelling carries its own alias line.
+        for model_id, twin, kind in FOLLOWUP:
+            with self.subTest(model_id):
+                aliases = p.load_aliases_strict()
+                self.assertEqual(aliases[model_id].catalog_key, aliases[twin].catalog_key)
+                self.assertEqual(aliases[model_id].kind, kind)
+                r = resolve(model_id, 1_234_567, 89_012, cat=self.cat, aliases=self.aliases, now=T0)
+                t = resolve(twin, 1_234_567, 89_012, cat=self.cat, aliases=self.aliases, now=T0)
+                self.assertEqual((r.method, r.catalog_key, r.alias_kind), ("alias", TARGETS[twin], kind))
+                self.assertEqual(r.amount_pico_usd, t.amount_pico_usd)
+                self.assertGreater(r.amount_pico_usd, 0)
+                self.assertIsNone(r.reason)
+                self.assertTrue(r.note)
+
+    def test_cybertiel_q5_is_a_visible_proxy_that_discloses_the_quantized_variant(self):
+        r = resolve("cybertiel-q5", cat=self.cat, aliases=self.aliases)
+        self.assertEqual(r.alias_kind, "proxy")
+        self.assertIn("Quantized", r.note)
+        self.assertIn("no catalog identity", r.note)
+        self.assertEqual(r.catalog_key, "litellm:aihubmix/qwen3.6-35b-a3b")
+
+    def test_followup_ids_without_an_alias_never_get_a_fabricated_price(self):
+        r = resolve("cybertiel-q5", cat=self.cat, aliases={})
+        self.assertEqual(r.method, "none")
+        self.assertIsNone(r.api_equivalent_usd)
+        self.assertIn(r.reason, ("no_catalog_match", "ambiguous_model"))
+        # near-miss spellings are not silently folded onto the alias
+        for near in ("cybertiel-q4", "cybertiel", "claude-sonnet-5.50"):
+            self.assertNotEqual(resolve(near, cat=self.cat, aliases=self.aliases).method, "alias", near)
 
     def test_hauhau_reduces_to_27b_and_gets_no_fictitious_36_match(self):
         self.assertEqual(p.query_tokens("qwen3.8-hauhau-aggressive-27b-iq3-gpu-96k-b8k"),
