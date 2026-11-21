@@ -80,7 +80,7 @@ UsageDeck data dir is `<authorized root>/plugin-data/usage-deck` (consistent wit
 }
 ```
 
-Example is deliberately abbreviated, not a fabricated full seed. `sources` may contain both source IDs; source objects have exactly these four fields. Diagnostics/retry times live in manager state, not in rate records. Derive entry identity/signature from `source_key`; all entries use the six fields above. Validate source/key prefix agreement. Catalog `revision` is SHA-256 of canonical normalized entries (sorted keys, compact UTF-8 JSON); it changes on rates/entry timestamps and is internal, not an upstream version.
+Example is deliberately abbreviated, not a fabricated full seed. `sources` may contain both source IDs; source objects have exactly these three fields. Diagnostics/retry times live in manager state, not in rate records. Derive entry identity/signature from `source_key`; all entries use the five fields above. Validate source/key prefix agreement. Catalog `revision` is SHA-256 of canonical normalized entries (sorted keys, compact UTF-8 JSON); it changes on rates/entry timestamps and is internal, not an upstream version.
 
 Ship a real fetched/normalized snapshot, not hand-invented prices: all usable entries from both sources, **at minimum all seven alias target records**. Include retrieval timestamps/digests and source attribution. Build must fail if any seeded alias target is missing or invalid. Seed age is original retrieval time, never install/build time; seed refresh requires deliberate repository update. Runtime cache can overlay it, never overwrite packaged assets. JSON avoids adding a YAML parser dependency.
 
