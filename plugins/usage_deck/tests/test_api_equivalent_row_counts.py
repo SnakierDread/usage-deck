@@ -1,15 +1,16 @@
 """API-equivalent row counters across dimensions (design: analytics-depth-breakdown §6, api-equivalent-pricing §7).
 
-The money (``amount_pico_usd``) is conserved across every dimension; the row counters count the canonical
-provenance leaves of the response's own ``rows``. all/profile/model share the legacy leaves, so their blocks are
-identical. ``repo`` splits a legacy leaf ``(home, day, model, provider, attribution)`` into one leaf per repository,
-so its counters may exceed the others by exactly the extra leaves, and only in a dollar-neutral way:
+The row counters count the canonical provenance leaves of the response's own ``rows``. all/profile/model share
+the legacy leaves, so their blocks are identical. ``repo`` splits a legacy leaf ``(home, day, model, provider,
+attribution)`` into one leaf per repository, so its counters can differ from the others.
 
-* a split part with recorded zero tokens prices to a genuine 0 (priced, and proxy when the model is a proxy alias);
-* a split part whose sessions recorded no tokens at all is unpriced (``tokens_missing``) while the legacy merge
-  prices the known sums of its siblings.
-
-These tests pin that reconciliation (the live ``priced +1 / proxy +1`` finding) so a change to either side is loud.
+Dollars are conserved across dimensions only when every split part has *complete* recorded tokens (input AND output
+both recorded, zeros included). That covers the live ``priced +1 / proxy +1`` finding, where the extra part is a
+recorded 0/0 session: it prices to a genuine 0. When a part is missing its input or its output count, the legacy
+leaf sums each token column independently over the known values (``sum_known``) and prices the merged sums, while
+a repo leaf requires both counts on its own sums and is otherwise unpriced (``tokens_missing``); money then differs
+between dimensions. That is existing behavior, outside this card's scope; it is pinned here so a change is loud
+and so the documentation cannot overclaim.
 """
 
 import collections
@@ -47,17 +48,14 @@ class RowCountReconciliation(DepthServiceBase):
         m.write_db(None, specs, columns=DEPTH_COLUMNS)
         return m
 
-    def assert_reconciled(self, by_dim):
-        """The invariant, stated independently of how the service builds the blocks. Returns the per-counter
-        excess of the repo view over the legacy view."""
+    def assert_structure(self, by_dim):
+        """What holds in EVERY case, missing tokens included: the legacy dimensions share the legacy leaves, so the
+        WHOLE block agrees, and every dimension's counters describe its own rows."""
         base = by_dim["all"]["totals"]["api_equivalent"]
-        for dim in LEGACY:  # the legacy leaves are shared: the WHOLE block agrees, counters included
+        for dim in LEGACY:
             self.assertEqual({k: by_dim[dim]["totals"]["api_equivalent"][k] for k in BLOCK},
                              {k: base[k] for k in BLOCK}, dim)
-        repo = by_dim["repo"]
-        self.assertEqual(repo["totals"]["api_equivalent"]["amount_pico_usd"], base["amount_pico_usd"])
-        self.assertEqual(repo["totals"]["api_equivalent_usd"], by_dim["all"]["totals"]["api_equivalent_usd"])
-        for dim, data in by_dim.items():  # counters are over the response's own rows, in every dimension
+        for dim, data in by_dim.items():
             api = data["totals"]["api_equivalent"]
             self.assertEqual(api["priced_rows"] + api["unpriced_rows"], len(data["rows"]), dim)
             self.assertLessEqual(api["proxy_rows"], api["priced_rows"], dim)
@@ -65,6 +63,16 @@ class RowCountReconciliation(DepthServiceBase):
             self.assertEqual(sorted(data["pricing"]["unknown_row_ids"]),
                              sorted(r["id"] for r in data["rows"]
                                     if r["metrics"]["api_equivalent"]["amount_pico_usd"] is None), dim)
+
+    def assert_reconciled(self, by_dim):
+        """The dollar-conserving invariant, valid when every split part has complete recorded tokens (zeros count
+        as recorded), stated independently of how the service builds the blocks. Returns the per-counter excess of
+        the repo view over the legacy view."""
+        self.assert_structure(by_dim)
+        base = by_dim["all"]["totals"]["api_equivalent"]
+        repo = by_dim["repo"]
+        self.assertEqual(repo["totals"]["api_equivalent"]["amount_pico_usd"], base["amount_pico_usd"])
+        self.assertEqual(repo["totals"]["api_equivalent_usd"], by_dim["all"]["totals"]["api_equivalent_usd"])
         # reconcile leaf by leaf: every repo leaf descends from exactly one legacy leaf and the money of the
         # parts equals the money of the whole
         legacy = {legacy_key(r): r for r in by_dim["all"]["rows"]}
@@ -151,6 +159,55 @@ class RowCountReconciliation(DepthServiceBase):
         self.assertEqual(self.assert_reconciled(by_dim), {"priced": 0, "unpriced": 1, "proxy": 0})
         self.assertFalse(by_dim["all"]["totals"]["api_equivalent"]["partial"])
         self.assertTrue(by_dim["repo"]["totals"]["api_equivalent"]["partial"])
+
+    # ---------------------------------------------------------------- one-sided missing counts: dollars DIFFER
+    # Existing behavior, pinned as a known limitation (not remediated here): the legacy leaf sums each token
+    # column over its known values independently (sum_known) and prices the merged pair; a repo leaf is priced only
+    # when its OWN input and output sums are both recorded. The same data therefore prices differently per dimension.
+
+    def test_one_sided_missing_tokens_complementary_parts_money_differs_by_dimension(self):
+        m = self.machine([
+            D("c1", 3, "cybertiel-q5", "custom:box", 10, None, 0.0, "/work/alpha"),
+            D("c2", 3, "cybertiel-q5", "custom:box", None, 5, 0.0, "/work/beta"),
+        ])
+        by_dim = self.blocks(30, machine=m)
+        self.assert_structure(by_dim)
+        base = by_dim["all"]["totals"]["api_equivalent"]
+        repo = by_dim["repo"]["totals"]["api_equivalent"]
+        self.assertEqual({k: base[k] for k in BLOCK},
+                         {"amount_pico_usd": "10160000", "priced_rows": 1, "unpriced_rows": 0, "proxy_rows": 1,
+                          "partial": False, "stale": False})
+        self.assertEqual({k: repo[k] for k in BLOCK},
+                         {"amount_pico_usd": None, "priced_rows": 0, "unpriced_rows": 2, "proxy_rows": 0,
+                          "partial": True, "stale": False})
+        self.assertIsNone(by_dim["repo"]["totals"]["api_equivalent_usd"])
+        self.assertEqual([r["pricing"]["reason"] for r in by_dim["repo"]["rows"]], ["tokens_missing"] * 2)
+
+    def test_one_sided_missing_tokens_incomplete_part_drops_from_repo_money(self):
+        m = self.machine([
+            D("i1", 3, "cybertiel-q5", "custom:box", 10, 5, 0.0, "/work/alpha"),
+            D("i2", 3, "cybertiel-q5", "custom:box", 100, None, 0.0, "/work/beta"),
+        ])
+        by_dim = self.blocks(30, machine=m)
+        self.assert_structure(by_dim)
+        base = by_dim["all"]["totals"]["api_equivalent"]
+        repo = by_dim["repo"]["totals"]["api_equivalent"]
+        self.assertEqual((base["amount_pico_usd"], base["priced_rows"], base["unpriced_rows"], base["partial"]),
+                         ("35560000", 1, 0, False))
+        self.assertEqual((repo["amount_pico_usd"], repo["priced_rows"], repo["unpriced_rows"], repo["partial"]),
+                         ("10160000", 1, 1, True))
+        self.assertLess(int(repo["amount_pico_usd"]), int(base["amount_pico_usd"]))
+
+    def test_complete_tokens_control_conserves_money_with_the_same_prices(self):
+        # same two models/rates as above but every count recorded: dollars conserve, one extra priced+proxy leaf
+        m = self.machine([
+            D("k1", 3, "cybertiel-q5", "custom:box", 10, 5, 0.0, "/work/alpha"),
+            D("k2", 3, "cybertiel-q5", "custom:box", 100, 5, 0.0, "/work/beta"),
+        ])
+        by_dim = self.blocks(30, machine=m)
+        self.assertEqual(self.assert_reconciled(by_dim), {"priced": 1, "unpriced": 0, "proxy": 1})
+        self.assertEqual(by_dim["all"]["totals"]["api_equivalent"]["amount_pico_usd"], "43180000")
+        self.assertEqual(by_dim["repo"]["totals"]["api_equivalent"]["amount_pico_usd"], "43180000")
 
 
 if __name__ == "__main__":
