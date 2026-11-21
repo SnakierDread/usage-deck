@@ -111,15 +111,20 @@ class SelfHostedHealthTests(unittest.TestCase):
         a, t = adapter({})
         health = a.get_health()
         self.assertEqual((health.status, health.confidence, health.latency_ms), ("offline", "opaque", None))
-        self.assertEqual(health.error.code, "upstream_unavailable")
-        self.assertEqual(a.probe().reachable, False)
-        self.assertEqual(a.get_usage(30).error.code, "upstream_unavailable")
+        # C2: an unreachable box is a normal condition: quiet opaque "box_offline", never an error
+        self.assertEqual((health.error, health.reason), (None, "box_offline"))
+        probe = a.probe()
+        self.assertEqual((probe.reachable, probe.error, probe.reason), (False, None, "box_offline"))
+        usage = a.get_usage(30)
+        self.assertEqual((usage.error, usage.confidence, usage.reason, list(usage.meters)),
+                         (None, "opaque", "box_offline", []))
         self.assertEqual(len(t.requests), 2)  # metrics + one health attempt; a dead host is not hammered
 
-    def test_offline_timeout_code(self):
+    def test_offline_timeout_is_quiet_too(self):
         a, _ = adapter({BASE + "/metrics": TransportError(TransportError.TIMEOUT),
                         BASE + "/v1/models": TransportError(TransportError.TIMEOUT)})
-        self.assertEqual(a.get_health().error.code, "timeout")
+        health = a.get_health()
+        self.assertEqual((health.status, health.error, health.reason), ("offline", None, "box_offline"))
 
     def test_unknown_when_responses_are_invalid_not_connection_failures(self):
         a, _ = adapter({BASE + "/metrics": raw_response("<html>", status=200),

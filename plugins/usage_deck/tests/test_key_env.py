@@ -277,12 +277,12 @@ class OpenRouterRejectedTests(Base):
         self.assertEqual(card["auth_status"], "rejected")
         self.assertEqual(card["error"]["code"], "auth_required")
 
-    def test_openrouter_without_a_key_makes_no_request_and_stays_missing(self):
+    def test_openrouter_without_a_key_is_not_listed_and_makes_no_request(self):
         self.s.write_auth({"credential_pool": {"openrouter": [{"id": "or1"}]}})
         box = AuthBoxTransport()
         cards, _, _ = self.deck(box)
         self.assertEqual(box.requests, [])
-        self.assertEqual((cards[0]["auth_status"], cards[0]["reason"], cards[0]["error"]), ("missing", "credentials_missing", None))
+        self.assertEqual(cards, [])  # C1: a pool row without any credential is a slot, not an account
 
 
 if __name__ == "__main__":

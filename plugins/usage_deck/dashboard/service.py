@@ -53,8 +53,10 @@ from .discovery import (
     GLOBAL_PROFILE,
     InventoryItem,
     InventoryUnavailable,
-    discover,
-    discover_machine,
+    configured_label,
+    configured_names,
+    discover_detailed,
+    discover_machine_detailed,
     home_candidates,
     home_rejects,
     host_inventory_source,
@@ -265,6 +267,9 @@ class UsageDeckService:
         self._max_workers = max_workers
         self._deadline = deadline
         self._cache: Dict[tuple, Tuple[float, Any]] = {}
+        # endpoint id -> last time a probe in this process reached it (in memory only: "last seen" is honest
+        # about its horizon, a restart forgets it)
+        self._last_seen: Dict[str, datetime] = {}
         self._locks: Dict[tuple, threading.Lock] = {}
         self._guard = threading.Lock()
 
@@ -393,11 +398,12 @@ class UsageDeckService:
         root_of = getattr(source, "root_dir", None)
         # Rule 2 of the repo attribution reads ONLY the request-scoped root's boards (never another home's).
         kanban_dir = Path(root_of()) / "kanban" if callable(root_of) else None
+        names = configured_names(source, mode == "machine")  # C3: configured spelling of custom provider ids
         key = (self._source_key(source), query.profile or "", "usage", mode, dimension, query.window, query.provider,
-               catalog, truncated, tuple(rejected[0]), rejected[1], price_id, rates.digest)
+               catalog, truncated, tuple(rejected[0]), rejected[1], price_id, rates.digest, tuple(sorted(names.values())))
         data, errors = self._cached(
             key, lambda: self._compute_usage(query, mode, dimension, homes, truncated, rejected, priced, rates,
-                                             kanban_dir))
+                                             names, kanban_dir))
         return self._ok(data, errors, USAGE_SCHEMA_VERSION)
 
     def _pricing(self, source: Any) -> Optional[PricingInputs]:
@@ -436,6 +442,7 @@ class UsageDeckService:
     def _compute_usage(self, query: Query, mode: str, dimension: str, homes: list, truncated: bool,
                        rejected: tuple, priced: Optional[PricingInputs] = None,
                        rates: Optional["depth.RateTable"] = None,
+                       names: Optional[Dict[str, str]] = None,
                        kanban_dir: Optional[Path] = None) -> Tuple[dict, List[dict]]:
         rates = rates if rates is not None else self._depth_rates()
         now = self._clock()  # one frozen clock for every DB, group and timestamp of this response
@@ -463,7 +470,9 @@ class UsageDeckService:
             raise ApiError(503, "analytics_unavailable")  # nothing readable and something broken
 
         def label_of(provider_id: str) -> str:
-            return "Unknown" if provider_id == UNKNOWN else provider_label_for(provider_id, frozenset())
+            if provider_id == UNKNOWN:
+                return "Unknown"
+            return configured_label(provider_id, names or {}) or provider_label_for(provider_id, frozenset())
 
         rows_all = dims.observation_rows(reads)
         wanted = None
@@ -594,7 +603,7 @@ class UsageDeckService:
         return self._cached(key, lambda: self._build_deck(source, query, view))
 
     def _build_deck(self, source: Any, query: Query, view: str = "profile") -> _Snapshot:
-        items = discover_machine(source) if view == "machine" else discover(source)
+        items, skipped = discover_machine_detailed(source) if view == "machine" else discover_detailed(source)
         captures = self._capture_factory(source)
         now = self._clock()
         reader = MemoAnalyticsReader(self._analytics_factory(query.profile))
@@ -618,7 +627,7 @@ class UsageDeckService:
                 owns_health = bool(item.endpoint_id) and health_owner.get(item.endpoint_id) == item.account_id
                 ctx = contextvars.copy_context()  # a Context may only be entered once at a time
                 futures[executor.submit(ctx.run, self._run_item, item, reader, now, owns_health, endpoints, captures,
-                                        view == "machine")] = item
+                                        view == "machine", skipped.get(item.provider_id, 0))] = item
             done, _pending = wait(list(futures), timeout=self._deadline)
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
@@ -637,6 +646,11 @@ class UsageDeckService:
                     card_dict = self._error_card(item, now, "internal_error")
                     if owns:
                         health_dict = self._unknown_health(item, now, "internal_error")
+            elif item.kind == "self_hosted":
+                # A box that did not answer within the refresh deadline is unreachable, not a failure (C2).
+                card_dict = self._offline_card(item, now, skipped.get(item.provider_id, 0))
+                if owns:
+                    health_dict = self._offline_health(item, now)
             else:
                 card_dict = self._error_card(item, now, "timeout")
                 if owns:
@@ -709,11 +723,15 @@ class UsageDeckService:
 
     def _run_item(self, item: InventoryItem, reader: AnalyticsReader, now: datetime,
                   owns_health: bool, endpoints: Optional[EndpointCache] = None,
-                  captures: Optional[CaptureStore] = None, machine_view: bool = False) -> Tuple[dict, Optional[dict]]:
+                  captures: Optional[CaptureStore] = None, machine_view: bool = False,
+                  skipped_slots: int = 0) -> Tuple[dict, Optional[dict]]:
         adapter = create_adapter(self._context(item, reader, now, endpoints, captures, machine_view))
         probe = adapter.probe()
+        seen = self._note_seen(item, probe.reachable is True, now)
         usage = adapter.get_usage(DEFAULT_WINDOW)
         health: Optional[HealthStripEntry] = adapter.get_health() if owns_health else None
+        if health is not None:
+            health = replace(health, last_seen_at=fmt_ts(seen))
         confidence = adapter.get_confidence()
 
         error = probe.error
@@ -748,12 +766,53 @@ class UsageDeckService:
             checked_at=fmt_ts(now),
             stale=False,
             error=error,
-            debug=DebugInfo(adapter=adapter.adapter_name, capabilities=caps, source=adapter.source_label),
+            debug=DebugInfo(adapter=adapter.adapter_name, capabilities=caps, source=adapter.source_label,
+                            skipped_slots=skipped_slots),
             holders=item.holders,
+            last_seen_at=fmt_ts(seen),
         )
         card_dict = check_wire("card", sanitize(to_plain(card), item.secrets))
         health_dict = check_wire("health", sanitize(to_plain(health), item.secrets)) if health is not None else None
         return card_dict, health_dict
+
+    def _note_seen(self, item: InventoryItem, reached: bool, now: datetime) -> Optional[datetime]:
+        """Record (when ``reached``) and return the last time a probe reached the item's endpoint.
+
+        Only self-hosted endpoints have a last-seen time; it lives in this process alone."""
+        if not item.endpoint_id or item.kind != "self_hosted":
+            return None
+        with self._guard:
+            if reached:
+                self._last_seen[item.endpoint_id] = now
+            return self._last_seen.get(item.endpoint_id)
+
+    def _seen_at(self, item: InventoryItem) -> Optional[str]:
+        with self._guard:
+            seen = self._last_seen.get(item.endpoint_id) if item.endpoint_id else None
+        return fmt_ts(seen)
+
+    def _offline_card(self, item: InventoryItem, now: datetime, skipped_slots: int = 0) -> dict:
+        """Quiet opaque card of a box that cannot be reached right now: no error, no meters (C2)."""
+        card = SubscriptionCard(
+            id=item.account_id, provider_id=item.provider_id, account_id=item.account_id,
+            provider_label=item.provider_label, account_label=item.account_label, kind=item.kind,
+            plan_name=item.plan_name, plan_source=item.plan_source, auth_status=item.auth_status,
+            endpoint_id=item.endpoint_id, state="opaque", confidence="opaque", reason="box_offline",
+            meters=(), checked_at=fmt_ts(now), stale=False, error=None,
+            debug=DebugInfo(adapter="none", capabilities=(), source="none", skipped_slots=skipped_slots),
+            holders=item.holders, last_seen_at=self._seen_at(item),
+        )
+        return check_wire("card", sanitize(to_plain(card), item.secrets))
+
+    def _offline_health(self, item: InventoryItem, now: datetime) -> dict:
+        entry = HealthStripEntry(
+            endpoint_id=item.endpoint_id or "", provider_id=item.provider_id,
+            display_name=item.provider_label, status="offline", confidence="opaque",
+            metrics_available=False, latency_ms=None, cpu_percent=None, memory_bytes=None,
+            checked_at=fmt_ts(now), stale=False, reason="box_offline", error=None,
+            last_seen_at=self._seen_at(item),
+        )
+        return check_wire("health", sanitize(to_plain(entry), item.secrets))
 
     def _error_card(self, item: InventoryItem, now: datetime, code: str) -> dict:
         card = SubscriptionCard(

@@ -117,7 +117,7 @@ class SubscriptionsTests(ServiceBase):
         for c in cards:
             self.assertEqual(set(c), {"id", "provider_id", "account_id", "provider_label", "account_label", "kind",
                                       "plan_name", "plan_source", "auth_status", "endpoint_id", "state", "confidence",
-                                      "reason", "meters", "checked_at", "stale", "error", "debug", "holders"})
+                                      "reason", "meters", "checked_at", "stale", "error", "debug", "holders", "last_seen_at"})
         self.assertFalse(body["meta"]["partial"])
 
     def test_no_secret_substrings_anywhere(self):
@@ -243,16 +243,17 @@ class SubscriptionsTests(ServiceBase):
         status, body = self.call(svc, "subscriptions")
         self.assertLess(time.monotonic() - started, 3)
         gpu = [c for c in body["data"]["cards"] if c["provider_id"] == "custom:gpu"][0]
-        self.assertEqual((gpu["state"], gpu["error"]["code"], gpu["error"]["retryable"]), ("error", "timeout", True))
+        # a box that misses the deadline is unreachable: quiet opaque "box offline" (C2), never a red card
+        self.assertEqual((gpu["state"], gpu["error"], gpu["reason"]), ("opaque", None, "box_offline"))
         orc = [c for c in body["data"]["cards"] if c["provider_id"] == "openrouter"][0]
         self.assertEqual(orc["state"], "ready")  # finished siblings are kept
-        _, hbody = self.call(svc, "health")  # cached snapshot, still the timeout one
-        self.assertEqual(hbody["data"]["entries"][0]["status"], "unknown")
-        self.assertEqual(hbody["data"]["entries"][0]["error"]["code"], "timeout")
+        _, hbody = self.call(svc, "health")  # cached snapshot, still the deadline one
+        self.assertEqual(hbody["data"]["entries"][0]["status"], "offline")
+        self.assertEqual(hbody["data"]["entries"][0]["error"], None)
         release.set()
         time.sleep(0.3)
         _, again = self.call(svc, "subscriptions")
-        self.assertEqual([c for c in again["data"]["cards"] if c["provider_id"] == "custom:gpu"][0]["state"], "error")
+        self.assertEqual([c for c in again["data"]["cards"] if c["provider_id"] == "custom:gpu"][0]["state"], "opaque")
 
     def test_snapshot_cache_30s_and_expiry(self):
         self.seed_fleet()
@@ -304,9 +305,11 @@ class HealthTests(ServiceBase):
         self.custom = [{"name": "dead", "base_url": "http://dead.lan:1/v1"}]
         status, body = self.call(self.make(), "health")
         e = body["data"]["entries"][0]
-        self.assertEqual((status, e["status"], e["latency_ms"], e["error"]["code"]), (200, "offline", None, "upstream_unavailable"))
-        self.assertTrue(body["meta"]["partial"])
-        self.assertEqual(body["meta"]["errors"], [e["error"]])
+        # C2: a dead box is "box offline", not an error: no error object, response not partial
+        self.assertEqual((status, e["status"], e["latency_ms"], e["error"], e["reason"]),
+                         (200, "offline", None, None, "box_offline"))
+        self.assertFalse(body["meta"]["partial"])
+        self.assertEqual(body["meta"]["errors"], [])
 
     def test_no_self_hosted_means_empty_entries(self):
         self.s.write_auth({"credential_pool": {"nous": [{"id": "n", "access_token": "t-123456"}]}})

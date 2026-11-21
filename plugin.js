@@ -101,7 +101,14 @@ const REASON_TEXT = {
   attribution_unavailable: 'Provider attribution unavailable from session analytics.',
   no_observations: 'No observations for this period.',
   metrics_unavailable: 'This endpoint does not expose supported metrics.',
-  source_unavailable: 'The data source is currently unavailable.'
+  source_unavailable: 'The data source is currently unavailable.',
+  box_offline: 'Box offline: the endpoint is not reachable right now.'
+}
+// "Last seen" text of a self-hosted card or health entry (server-process memory; null = never seen since start).
+function lastSeenText(obj) {
+  if (!isObj(obj)) return null
+  const seen = str(obj.last_seen_at)
+  return seen ? 'Last seen ' + fmtTime(seen) : 'Not seen since the server started'
 }
 // Fixed local copy for backend error codes (models/dto.py ERROR_CODES).
 const DECK_ERROR_TEXT = {
@@ -1740,6 +1747,7 @@ function SubscriptionCard(props) {
       { 'data-opaque': 'true' },
       h('p', { style: { fontSize: '0.8rem', fontWeight: 500, margin: '0 0 0.25rem' } }, 'Usage unavailable'),
       h('p', { style: { ...SMALL, margin: '0 0 0.25rem' } }, 'Data unavailable' + (reasonText ? ': ' + reasonText : ' from this source.')),
+      card.reason === 'box_offline' ? h('p', { 'data-field': 'last-seen', style: { ...MUTED, margin: '0 0 0.25rem' } }, lastSeenText(card)) : null,
       h(
         'p',
         { style: { ...MUTED, margin: '0 0 0.25rem' } },
@@ -3083,6 +3091,7 @@ function HealthRow(props) {
     stale ? h(StaleTag, { refreshing: false }) : null,
     !metricsOk && !errCode ? h('span', { style: MUTED }, 'Metrics unavailable') : null,
     reason && !errCode ? h('span', { style: MUTED }, reason) : null,
+    e.reason === 'box_offline' ? h('span', { 'data-field': 'last-seen', style: MUTED }, lastSeenText(e)) : null,
     props.machine && statusKey === 'unknown' && e.reason === 'source_unavailable' && !errCode
       ? h('span', { style: MUTED, 'data-machine-only-note': 'true', title: MACHINE_ONLY_NOTE }, 'Not probed')
       : null,

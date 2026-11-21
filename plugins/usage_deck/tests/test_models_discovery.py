@@ -137,7 +137,8 @@ class DtoTests(unittest.TestCase):
                                      "2026-11-06T00:00:00Z", False, None, None)
         self.assertEqual(set(dto.to_plain(entry)), {
             "endpoint_id", "provider_id", "display_name", "status", "confidence", "metrics_available",
-            "latency_ms", "cpu_percent", "memory_bytes", "checked_at", "stale", "reason", "error"})
+            "latency_ms", "cpu_percent", "memory_bytes", "checked_at", "stale", "reason", "error",
+            "last_seen_at"})
 
     def test_series_points_must_ascend(self):
         a = dto.UsagePoint("2026-01-02", 1, 1, 0.0, 1, 1, "estimated")
@@ -237,8 +238,9 @@ class DiscoveryTests(unittest.TestCase):
         custom = [{"name": "Lab-Box", "base_url": "http://gpu.lan:8000/v1/"}]
         items = discover(self.source(cfg, custom))
         by = {i.provider_id: i for i in items}
-        self.assertEqual(set(by), {"openrouter", "custom:Lab-Box"})
-        self.assertEqual((by["openrouter"].auth_status, by["openrouter"].kind), ("missing", "cloud"))
+        # C1: a configured cloud provider with no credential is a slot abstraction: never listed. A self-hosted
+        # endpoint is a box, not a credential, and stays listed.
+        self.assertEqual(set(by), {"custom:Lab-Box"})
         lab = by["custom:Lab-Box"]
         self.assertEqual((lab.kind, lab.auth_status, lab.provider_label), ("self_hosted", "missing", "Lab-Box"))
         self.assertEqual(lab.endpoint.normalized, "http://gpu.lan:8000/v1")

@@ -28,6 +28,7 @@ REASONS = (
     "no_observations",
     "metrics_unavailable",
     "source_unavailable",
+    "box_offline",  # a self-hosted box that does not answer: a normal condition, never an error
 )
 CAPABILITIES = ("quota", "usage", "metrics", "session_analytics")
 ERROR_CODES = (
@@ -770,6 +771,9 @@ class DebugInfo:
     capabilities: Tuple[str, ...]
     source: str
     sanitized: bool = True
+    #: Credential slots of this card's provider that were skipped because no credential resolves for them
+    #: (empty pools, orphan provider-level entries). Debug count only: a skipped slot never gets a card.
+    skipped_slots: int = 0
 
     def __post_init__(self) -> None:
         _str("adapter", self.adapter)
@@ -778,6 +782,8 @@ class DebugInfo:
         _str("source", self.source)
         if self.sanitized is not True:
             raise DtoError("sanitized")
+        if _integer("skipped_slots", self.skipped_slots) is None:
+            raise DtoError("skipped_slots")
 
 
 @dataclass(frozen=True)
@@ -802,8 +808,12 @@ class SubscriptionCard:
     debug: DebugInfo
     #: Machine view only: the homes holding this account (empty in profile view).
     holders: Tuple[Holder, ...] = ()
+    #: Self-hosted cards: the last time a probe in this server process reached the endpoint (null = never seen
+    #: since the process started; always null for cloud accounts).
+    last_seen_at: Optional[str] = None
 
     def __post_init__(self) -> None:
+        _ts("last_seen_at", self.last_seen_at)
         _str("id", self.id)
         if self.id != self.account_id:
             raise DtoError("card id must equal account_id")
@@ -904,8 +914,11 @@ class HealthStripEntry:
     stale: bool
     reason: Optional[str]
     error: Optional[DeckError]
+    #: Last time a probe in this server process reached the endpoint (null = never seen since start).
+    last_seen_at: Optional[str] = None
 
     def __post_init__(self) -> None:
+        _ts("last_seen_at", self.last_seen_at)
         _str("endpoint_id", self.endpoint_id)
         _str("provider_id", self.provider_id)
         _str("display_name", self.display_name)
@@ -1078,6 +1091,7 @@ WIRE_VALUE_RULES = {
     "start": _match(_TS_RE),
     "end": _match(_TS_RE),
     "resets_at": _match(_TS_RE),
+    "last_seen_at": _match(_TS_RE),
     "day": _match(_DATE_RE),
     "request_id": _match(_UUID_RE),
     "account_id": _match(_HASH_ID_RE),
@@ -1142,7 +1156,8 @@ def card_from_wire(data: Any) -> SubscriptionCard:
         **data,
         "meters": tuple(_meter_from_wire(m) for m in data["meters"]),
         "error": _error_from_wire(data["error"]),
-        "debug": DebugInfo(debug["adapter"], tuple(debug["capabilities"]), debug["source"], debug["sanitized"]),
+        "debug": DebugInfo(debug["adapter"], tuple(debug["capabilities"]), debug["source"], debug["sanitized"],
+                           debug["skipped_slots"]),
         "holders": tuple(_holder_from_wire(h) for h in data["holders"]),
     })
 

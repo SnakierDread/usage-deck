@@ -485,24 +485,56 @@ function setVisibility(state) {
   document.dispatchEvent(new dom.window.Event("visibilitychange"));
 }
 
+// Manual interval clock: the poll cadence is driven by tick(), never by wall time, so the
+// test cannot race the (load-dependent) mount/render duration. Only setInterval/clearInterval
+// are replaced; React's own scheduling and the test's setTimeout flushes are untouched.
+function installManualIntervals() {
+  const real = { set: globalThis.setInterval, clear: globalThis.clearInterval };
+  const timers = new Map();
+  let next = 1;
+  globalThis.setInterval = (fn) => { const id = next++; timers.set(id, fn); return id; };
+  globalThis.clearInterval = (id) => { timers.delete(id); };
+  return {
+    active: () => timers.size,
+    tick: async () => { await act(async () => { for (const fn of Array.from(timers.values())) fn(); }); },
+    restore: () => { globalThis.setInterval = real.set; globalThis.clearInterval = real.clear; },
+  };
+}
+
 test("polls while visible and stops while hidden", async () => {
-  const m = await mount({ routes: routesFor(), pollMs: 30 });
-  const subsCalls = () => m.calls.filter((u) => u === B + "/subscriptions?view=machine").length;
-  assert.equal(subsCalls(), 1);
-  await m.flush(80);
-  const visibleCount = subsCalls();
-  assert.ok(visibleCount >= 2, "polled while visible, got " + visibleCount);
-  await act(async () => { setVisibility("hidden"); });
-  const atHide = subsCalls();
-  await m.flush(120);
-  assert.equal(subsCalls(), atHide, "no polling while hidden");
-  await act(async () => { setVisibility("visible"); });
-  await m.flush(80);
-  assert.ok(subsCalls() > atHide, "polling resumed on visible");
-  await m.unmount();
-  const afterUnmount = subsCalls();
-  await new Promise((r) => setTimeout(r, 90));
-  assert.equal(subsCalls(), afterUnmount, "timers cleared on unmount");
+  const clock = installManualIntervals();
+  let m = null;
+  try {
+    m = await mount({ routes: routesFor(), pollMs: 30 });
+    const subsCalls = () => m.calls.filter((u) => u === B + "/subscriptions?view=machine").length;
+    assert.equal(subsCalls(), 1, "one initial fetch");
+    assert.equal(clock.active(), 3, "one poll timer per zone while visible");
+    await clock.tick();
+    await m.flush(0);
+    const visibleCount = subsCalls();
+    assert.equal(visibleCount, 2, "polled while visible, got " + visibleCount);
+    await act(async () => { setVisibility("hidden"); });
+    assert.equal(clock.active(), 0, "poll timers cleared while hidden");
+    const atHide = subsCalls();
+    await clock.tick();
+    await m.flush(0);
+    assert.equal(subsCalls(), atHide, "no polling while hidden");
+    await act(async () => { setVisibility("visible"); });
+    await m.flush(0);
+    assert.equal(clock.active(), 3, "poll timers restarted on visible");
+    const atResume = subsCalls(); // (an immediate catch-up fetch on visible is time-gated; not asserted)
+    await clock.tick();
+    await m.flush(0);
+    assert.ok(subsCalls() > atResume, "polling resumed on visible");
+    await m.unmount();
+    m = null;
+    assert.equal(clock.active(), 0, "timers cleared on unmount");
+  } finally {
+    // Always tear down: a failed assertion must not leave a mounted tree polling (act-warning flood).
+    if (m) await m.unmount();
+    setVisibility("visible");
+    clock.restore();
+  }
 });
 
 test("manual Refresh re-requests all three zones and explains the cache", async () => {
@@ -529,5 +561,35 @@ test("card shows missing vs rejected credential state with a tooltip", async () 
   assert.equal(rSpan.dataset.authStatus, "rejected");
   assert.equal(rSpan.textContent, "Credential rejected");
   assert.match(rSpan.getAttribute("title"), /answered 401/);
+  await m.unmount();
+});
+
+test("an offline self-hosted box renders quiet opaque with last-seen text, never an error card", async () => {
+  const seen = F.card({
+    id: "acct_off", account_id: "acct_off", provider_id: "custom", provider_label: "Desktop", kind: "self_hosted",
+    endpoint_id: "ep_off", state: "opaque", confidence: "opaque", reason: "box_offline", meters: [], error: null,
+    last_seen_at: "2026-11-21T10:00:00Z",
+  });
+  const never = F.card({
+    id: "acct_off2", account_id: "acct_off2", provider_id: "custom", provider_label: "PGX", kind: "self_hosted",
+    endpoint_id: "ep_off2", state: "opaque", confidence: "opaque", reason: "box_offline", meters: [], error: null,
+    last_seen_at: null,
+  });
+  const entry = F.healthEntry({ endpoint_id: "ep_off", display_name: "Desktop", status: "offline", confidence: "opaque",
+    metrics_available: false, latency_ms: null, cpu_percent: null, memory_bytes: null, reason: "box_offline", error: null,
+    last_seen_at: "2026-11-21T10:00:00Z" });
+  const m = await mount({ routes: routesFor({
+    subs: () => envelope({ cards: [seen, never], inventory_state: "detected" }),
+    health: () => envelope({ entries: [entry] }),
+  }) });
+  const card = m.$("[data-card-id=acct_off]");
+  assert.equal(card.dataset.view, "unavailable");
+  assert.ok(card.querySelector("[data-error]") === null && !/UsageDeck error|could not be reached/i.test(card.textContent));
+  assert.match(card.textContent, /Box offline/);
+  assert.match(card.querySelector("[data-field=last-seen]").textContent, /^Last seen /);
+  assert.match(m.$("[data-card-id=acct_off2] [data-field=last-seen]").textContent, /Not seen since the server started/);
+  assert.equal(card.querySelectorAll("[role=progressbar]").length, 0);
+  assert.match(m.$("[data-endpoint-id=ep_off] [data-field=last-seen]").textContent, /^Last seen /);
+  assert.ok(!/UsageDeck error|could not be reached/i.test(m.$("[data-endpoint-id=ep_off]").textContent));
   await m.unmount();
 });
