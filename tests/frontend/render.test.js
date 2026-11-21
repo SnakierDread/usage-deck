@@ -531,3 +531,33 @@ test("card shows missing vs rejected credential state with a tooltip", async () 
   assert.match(rSpan.getAttribute("title"), /answered 401/);
   await m.unmount();
 });
+
+test("an offline self-hosted box renders quiet opaque with last-seen text, never an error card", async () => {
+  const seen = F.card({
+    id: "acct_off", account_id: "acct_off", provider_id: "custom", provider_label: "Desktop", kind: "self_hosted",
+    endpoint_id: "ep_off", state: "opaque", confidence: "opaque", reason: "box_offline", meters: [], error: null,
+    last_seen_at: "2026-11-21T10:00:00Z",
+  });
+  const never = F.card({
+    id: "acct_off2", account_id: "acct_off2", provider_id: "custom", provider_label: "PGX", kind: "self_hosted",
+    endpoint_id: "ep_off2", state: "opaque", confidence: "opaque", reason: "box_offline", meters: [], error: null,
+    last_seen_at: null,
+  });
+  const entry = F.healthEntry({ endpoint_id: "ep_off", display_name: "Desktop", status: "offline", confidence: "opaque",
+    metrics_available: false, latency_ms: null, cpu_percent: null, memory_bytes: null, reason: "box_offline", error: null,
+    last_seen_at: "2026-11-21T10:00:00Z" });
+  const m = await mount({ routes: routesFor({
+    subs: () => envelope({ cards: [seen, never], inventory_state: "detected" }),
+    health: () => envelope({ entries: [entry] }),
+  }) });
+  const card = m.$("[data-card-id=acct_off]");
+  assert.equal(card.dataset.view, "unavailable");
+  assert.ok(card.querySelector("[data-error]") === null && !/UsageDeck error|could not be reached/i.test(card.textContent));
+  assert.match(card.textContent, /Box offline/);
+  assert.match(card.querySelector("[data-field=last-seen]").textContent, /^Last seen /);
+  assert.match(m.$("[data-card-id=acct_off2] [data-field=last-seen]").textContent, /Not seen since the server started/);
+  assert.equal(card.querySelectorAll("[role=progressbar]").length, 0);
+  assert.match(m.$("[data-endpoint-id=ep_off] [data-field=last-seen]").textContent, /^Last seen /);
+  assert.ok(!/UsageDeck error|could not be reached/i.test(m.$("[data-endpoint-id=ep_off]").textContent));
+  await m.unmount();
+});

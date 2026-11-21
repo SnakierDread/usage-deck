@@ -105,7 +105,14 @@
     no_observations: "No observations for this period.",
     metrics_unavailable: "This endpoint does not expose supported metrics.",
     source_unavailable: "The data source is currently unavailable.",
+    box_offline: "Box offline: the endpoint is not reachable right now.",
   };
+  /** "Last seen …" text of a self-hosted card or health entry (server-process memory, null = never seen). */
+  function lastSeenText(obj) {
+    if (!isObj(obj)) return null;
+    const seen = str(obj.last_seen_at);
+    return seen ? "Last seen " + fmtTime(seen) : "Not seen since the server started";
+  }
   const KNOWN_ERROR_CODES = {
     invalid_query: 1, provider_not_found: 1, auth_required: 1, permission_denied: 1,
     timeout: 1, upstream_unavailable: 1, malformed_response: 1, inventory_unavailable: 1,
@@ -1219,6 +1226,7 @@ function repoPathSummary(r) {
         body = h("div", { className: "ud-opaque", "data-opaque": "true" },
           h("p", { className: "ud-opaque-title" }, "Usage unavailable"),
           h("p", { className: "ud-small" }, "Data unavailable" + (reasonText ? ": " + reasonText : " from this source.")),
+          card.reason === "box_offline" ? h("p", { className: "ud-muted ud-small", "data-field": "last-seen" }, lastSeenText(card)) : null,
           h("p", { className: "ud-muted ud-small" },
             card.kind === "self_hosted"
               ? "Endpoint health appears in the health strip below."
@@ -1949,6 +1957,7 @@ function repoPathSummary(r) {
         stale ? h(StaleTag, { stale: true }) : null,
         !metricsOk && !de ? h("span", { className: "ud-muted ud-small" }, "Metrics unavailable") : null,
         reason && !de ? h("span", { className: "ud-muted ud-small" }, reason) : null,
+        e.reason === "box_offline" ? h("span", { className: "ud-muted ud-small", "data-field": "last-seen" }, lastSeenText(e)) : null,
         props.machine && statusKey === "unknown" && e.reason === "source_unavailable" && !de
           ? h("span", { className: "ud-muted ud-small", "data-machine-only-note": "true", title: MACHINE_ONLY_NOTE }, "Not probed") : null,
         de ? h("span", { className: "ud-small ud-health-err", role: "note" }, "⚠ " + de.message) : null);

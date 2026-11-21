@@ -268,9 +268,9 @@ class CredentialUseIsolation(MachineBase, SchemaAsserts):
                                   custom_provider_loader=lambda c: [], env_lookup=lambda n: "ENV-OR-KEY")
         items = {i.holders[0].profile: i for i in only(discover_machine(src), "openrouter")}
         self.assertEqual(items["work"].credential.reveal(), "ENV-OR-KEY")
-        self.assertIsNone(items["verifier"].credential)
-        self.assertFalse(items["verifier"].live_source)
-        self.assertNotIn("ENV-OR-KEY", items["verifier"].secrets)
+        # the other profile's token-less row gets no credential from this process env: not listed at all (C1),
+        # so the env value can never reach it
+        self.assertEqual(set(items), {"work"})
 
     def test_merged_card_selects_the_eligible_member_not_the_first_one(self):
         first = codex_token("acct-1", "user-1", "business", "global-copy")
