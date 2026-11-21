@@ -461,11 +461,22 @@ class HostilePathTests(DepthServiceBase):
 
 
 class ParityRegressionTests(DepthServiceBase):
-    """C6: existing views are byte-identical for the same data once only the declared additions are removed."""
+    """C6: existing views are byte-identical for the same data once only the declared additions are removed.
+
+    ``fixtures/depth_parity_golden.json`` tracks the pre-depth BASELINE, i.e. the last main commit before the depth
+    code (origin/main 41c3bf4), not a frozen pre-pricing tree. The projection keeps the api_equivalent members and
+    the ``pricing`` block, so any upstream change to pricing aliases/catalog data for a model the depth fixture
+    uses (``claude-sonnet-5.5`` etc.) legitimately moves these hashes. Refresh trigger: a pricing PR that turns a
+    fixture model priced/unpriced fails this test with only api_equivalent/pricing deltas. Regenerate by running
+    ``depth_fixture.run_golden`` (TZ=UTC, ``fx.seed(Machine(...))``) on a checkout of the new pre-depth baseline
+    (the depth fixture imports nothing from ``analytics_depth``, so it runs on that tree unchanged), update
+    ``baseline_commit`` here and in the JSON, and prove the delta is api_equivalent/pricing only (tokens, cost,
+    sessions, row ids and ordering must stay byte-identical). Same doctrine as ``spend_golden_v1.json``.
+    """
 
     def test_baseline_projection_matches_the_pre_depth_goldens(self):
         golden = json.loads(GOLDEN.read_text())
-        self.assertEqual(golden["baseline_commit"], "1db08ed6876471e36fca35caf4cfc5a84dd36315")
+        self.assertEqual(golden["baseline_commit"], "41c3bf47ae03cffb00058052b469882d64e1fd21")
         got = fx.run_golden(self.m, lambda home: self.m.service(home=home))
         self.assertEqual(set(got), set(golden["hashes"]))
         self.assertEqual(len(got), 63)
