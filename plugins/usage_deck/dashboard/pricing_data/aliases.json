@@ -4,9 +4,11 @@
     "gpt-6-luna": {"catalog_key": "litellm:azure_ai/gpt-6-luna", "kind": "equivalent", "note": "Prices as the cataloged Azure AI GPT-6 Luna text tariff; not subscription spend."},
     "gpt-6.1-sol": {"catalog_key": "litellm:azure_ai/gpt-6.1-sol", "kind": "equivalent", "note": "Prices as the cataloged Azure AI GPT-6.1 Sol text tariff; not subscription spend."},
     "claude-sonnet-5-5": {"catalog_key": "litellm:claude-sonnet-5-5", "kind": "equivalent", "note": "Exact LiteLLM model key; original session ID remains unchanged."},
+    "claude-sonnet-5.5": {"catalog_key": "litellm:claude-sonnet-5-5", "kind": "equivalent", "note": "Dot spelling of claude-sonnet-5-5; prices as the same exact LiteLLM model key. Original session ID remains unchanged."},
     "qwen3.8-flash-next": {"catalog_key": "litellm:dashscope/qwen3.8-flash", "kind": "proxy", "note": "Prices as Qwen3.8 Flash; custom -next identity is not independently verified."},
     "qwen3.6:35b": {"catalog_key": "litellm:aihubmix/qwen3.6-35b-a3b", "kind": "proxy", "note": "Prices as Qwen3.6 35B A3B; recorded 35b does not prove A3B variant."},
     "cyber-tiel-coder:35b": {"catalog_key": "litellm:aihubmix/qwen3.6-35b-a3b", "kind": "proxy", "note": "Design-selected 35B coding price proxy, Qwen3.6 35B A3B. Cyber-tiel brand has no catalog identity; this is not a verified underlying model."},
+    "cybertiel-q5": {"catalog_key": "litellm:aihubmix/qwen3.6-35b-a3b", "kind": "proxy", "note": "Quantized (UD-Q5_K_XL) variant of Cyber-Tiel-Coder 35B-A3B served on llama-mac; prices as the Qwen3.6 35B A3B proxy, same as cyber-tiel-coder:35b. Cyber-tiel brand has no catalog identity; quantization does not change the API-equivalent price."},
     "qwen3.8-hauhau-aggressive-27b-iq3-gpu-96k-b8k": {"catalog_key": "litellm:aiand/qwen/qwen3.8-27b", "kind": "proxy", "note": "Prices as full Qwen3.8 27B regardless of iq3/GPU settings; custom hauhau-aggressive variant identity is unverified."}
   }
 }

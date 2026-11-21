@@ -263,7 +263,8 @@ class ResolverInventoryTests(unittest.TestCase):
                                         aliases=kw.get("aliases", self.aliases), now=T0)
 
     def test_the_inventory_is_exactly_the_seven_expected_ids(self):
-        self.assertEqual(set(self.raw_aliases), set(SEVEN))
+        # The design's seven plus the two follow-up spellings found by the live host check (t_5561a3ef).
+        self.assertEqual(set(self.raw_aliases), set(SEVEN) | {"claude-sonnet-5.5", "cybertiel-q5"})
         self.assertEqual(len(SEVEN), 7)
 
     def test_each_inventory_model_resolves_to_a_non_null_price_matching_the_raw_seed(self):
