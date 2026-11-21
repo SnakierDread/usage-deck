@@ -13,6 +13,7 @@ import math
 import re
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Optional, Tuple
 
 SCHEMA_VERSION = 1
@@ -62,6 +63,21 @@ USAGE_REASONS = ("no_observations", "source_unavailable")
 USAGE_METRICS = ("api_calls", "estimated_usd", "input_count", "output_count", "sessions")
 TOP_N_MODELS = 8
 
+# API-equivalent pricing annotation (docs/design/api-equivalent-pricing.md §7): fixed vocabularies.
+PRICING_METHODS = ("alias", "heuristic", "none")
+PRICING_ALIAS_KINDS = ("equivalent", "proxy")
+PRICING_REASONS = ("tokens_missing", "tokens_invalid", "model_unknown", "no_catalog_match", "ambiguous_model",
+                   "alias_target_missing")
+PRICING_SOURCES = ("litellm", "openrouter")
+PRICING_ORIGINS = ("seed", "cache", "network")
+PRICING_WARNINGS = ("pricing_aliases_invalid", "pricing_cache_invalid", "pricing_cache_unwritable",
+                    "pricing_refresh_failed", "pricing_seed_invalid", "pricing_stale")
+PICO = 10 ** 12  # one USD in the authoritative integer unit (pico-USD)
+
+#: Wire field names that contain a sensitive fragment ("key") but are plain public vocabulary: the sanitizer
+#: must not redact them (the value is a source-qualified catalog id, never a credential).
+NON_SECRET_WIRE_NAMES = frozenset({"catalog_key"})
+
 # Fixed, safe public text. Upstream text never reaches a DTO.
 ERROR_MESSAGES = {
     "invalid_query": "The request parameters are not valid.",
@@ -107,6 +123,10 @@ ERROR_VARIANTS = {
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_TS_FRAC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
+_PICO_RE = re.compile(r"^(?:0|[1-9][0-9]{0,30})$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_CATALOG_KEY_RE = re.compile(r"^(?:litellm|openrouter):[\x21-\x7e]{1,200}$")
 _ROW_ID_RE = re.compile(r"^row_[0-9a-f]{64}$")
 _GROUP_ID_RE = re.compile(r'^(?:all|other|profile:\[(?:true|false),"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"\]'
                           r'|model:null|model:"[\x21\x23-\x5b\x5d-\x7e]{1,128}")$')
@@ -292,6 +312,43 @@ class Holder:
 
 
 @dataclass(frozen=True)
+class ApiEquivalent:
+    """Additive API-equivalent summary of one leaf or aggregate (design §7). ``amount_pico_usd`` is a base-10
+    integer string (authoritative, exact) or None when no leaf is priced; counters count provenance rows."""
+
+    amount_pico_usd: Optional[str]
+    priced_rows: int
+    unpriced_rows: int
+    proxy_rows: int
+    partial: bool
+    stale: bool
+
+    def __post_init__(self) -> None:
+        if self.amount_pico_usd is not None and (not isinstance(self.amount_pico_usd, str)
+                                                 or not _PICO_RE.match(self.amount_pico_usd)):
+            raise DtoError("api_equivalent.amount_pico_usd")
+        for name in ("priced_rows", "unpriced_rows", "proxy_rows"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise DtoError(f"api_equivalent.{name}")
+        _bool("api_equivalent.partial", self.partial)
+        _bool("api_equivalent.stale", self.stale)
+        if self.proxy_rows > self.priced_rows or (self.amount_pico_usd is None) != (self.priced_rows == 0) \
+                or self.partial != (self.unpriced_rows > 0) or (self.stale and self.priced_rows == 0):
+            raise DtoError("api_equivalent: inconsistent")
+
+
+EMPTY_API_EQUIVALENT = ApiEquivalent(None, 0, 0, 0, False, False)
+
+
+def api_usd(amount_pico_usd: Optional[str]) -> Optional[float]:
+    """The display float of an integer pico-USD string (never used for sums)."""
+    if amount_pico_usd is None:
+        return None
+    return float(Decimal(amount_pico_usd) / PICO)
+
+
+@dataclass(frozen=True)
 class UsageMetrics:
     """One aggregate of the baseline daily counters (``None`` = unavailable, never a computed zero)."""
 
@@ -301,6 +358,9 @@ class UsageMetrics:
     sessions: Optional[int]
     api_calls: Optional[int]
     missing_fields: Tuple[str, ...]
+    #: Hypothetical current base text API tariff (pricing annotation; None = no priced observation).
+    api_equivalent_usd: Optional[float] = None
+    api_equivalent: ApiEquivalent = EMPTY_API_EQUIVALENT
 
     def __post_init__(self) -> None:
         for name in ("input_count", "output_count", "sessions", "api_calls"):
@@ -309,6 +369,71 @@ class UsageMetrics:
         fields_ = tuple(self.missing_fields)
         if list(fields_) != sorted(set(fields_)) or any(f not in USAGE_METRICS for f in fields_):
             raise DtoError("missing_fields")
+        _api_pair(self.api_equivalent_usd, self.api_equivalent)
+
+
+def _api_pair(usd: Any, api: Any) -> None:
+    """``api_equivalent_usd`` must be the float image of the integer amount (null iff null)."""
+    _number("api_equivalent_usd", usd, minimum=0)
+    if not isinstance(api, ApiEquivalent):
+        raise DtoError("api_equivalent")
+    if (usd is None) != (api.amount_pico_usd is None):
+        raise DtoError("api_equivalent_usd: null mismatch")
+    if usd is not None and abs(usd - api_usd(api.amount_pico_usd)) > 1e-12:
+        raise DtoError("api_equivalent_usd: amount mismatch")
+
+
+@dataclass(frozen=True)
+class RowPricing:
+    """How one provenance row was priced (exactly eight wire fields; null metadata per ``PriceResolution``)."""
+
+    catalog_key: Optional[str]
+    method: str
+    alias_kind: Optional[str]
+    note: Optional[str]
+    reason: Optional[str]
+    source: Optional[str]
+    fetched_at: Optional[str]
+    stale: bool
+
+    def __post_init__(self) -> None:
+        if self.catalog_key is not None and (not isinstance(self.catalog_key, str)
+                                             or not _CATALOG_KEY_RE.match(self.catalog_key)):
+            raise DtoError("pricing.catalog_key")
+        _enum("pricing.method", self.method, PRICING_METHODS)
+        _enum("pricing.alias_kind", self.alias_kind, PRICING_ALIAS_KINDS, nullable=True)
+        _str("pricing.note", self.note, nullable=True, max_len=512)
+        _enum("pricing.reason", self.reason, PRICING_REASONS, nullable=True)
+        _enum("pricing.source", self.source, PRICING_SOURCES, nullable=True)
+        if self.fetched_at is not None and (not isinstance(self.fetched_at, str)
+                                            or not _TS_FRAC_RE.match(self.fetched_at)):
+            raise DtoError("pricing.fetched_at")
+        _bool("pricing.stale", self.stale)
+        if self.method == "none" and (self.catalog_key is not None or self.alias_kind is not None):
+            raise DtoError("pricing: none method carries no identity")
+
+
+NO_ROW_PRICING = RowPricing(None, "none", None, None, "no_catalog_match", None, None, False)
+
+
+@dataclass(frozen=True)
+class PricingInfo:
+    """``data.pricing`` of a usage response: the frozen catalog identity and the explicit unpriced bucket."""
+
+    catalog_revision: str
+    origin: str
+    warnings: Tuple[str, ...]
+    unknown_row_ids: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.catalog_revision, str) or not _SHA256_RE.match(self.catalog_revision):
+            raise DtoError("pricing.catalog_revision")
+        _enum("pricing.origin", self.origin, PRICING_ORIGINS)
+        if list(self.warnings) != sorted(set(self.warnings)) or any(w not in PRICING_WARNINGS for w in self.warnings):
+            raise DtoError("pricing.warnings")
+        if list(self.unknown_row_ids) != sorted(set(self.unknown_row_ids)) \
+                or not all(isinstance(r, str) and _ROW_ID_RE.match(r) for r in self.unknown_row_ids):
+            raise DtoError("pricing.unknown_row_ids")
 
 
 @dataclass(frozen=True)
@@ -324,6 +449,7 @@ class ProvenanceRow:
     provider_id: str
     attribution_source: str
     metrics: UsageMetrics
+    pricing: RowPricing = NO_ROW_PRICING
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not _ROW_ID_RE.match(self.id):
@@ -339,6 +465,10 @@ class ProvenanceRow:
         _enum("attribution_source", self.attribution_source, ATTRIBUTION_SOURCES)
         if not isinstance(self.metrics, UsageMetrics):
             raise DtoError("row.metrics")
+        if not isinstance(self.pricing, RowPricing):
+            raise DtoError("row.pricing")
+        if (self.pricing.reason is None) != (self.metrics.api_equivalent.amount_pico_usd is not None):
+            raise DtoError("row.pricing: reason must be null exactly when priced")
 
 
 @dataclass(frozen=True)
@@ -470,6 +600,9 @@ class UsagePoint:
     sessions: Optional[int]
     api_calls: Optional[int]
     confidence: str
+    #: Matching leaf amounts of this day/group (pricing annotation); None = no priced leaf that day.
+    api_equivalent_usd: Optional[float] = None
+    api_equivalent: ApiEquivalent = EMPTY_API_EQUIVALENT
 
     def __post_init__(self) -> None:
         if not isinstance(self.day, str) or not _DATE_RE.match(self.day):
@@ -480,6 +613,7 @@ class UsagePoint:
         _integer("sessions", self.sessions)
         _integer("api_calls", self.api_calls)
         _enum("confidence", self.confidence, CONFIDENCE_LABELS)
+        _api_pair(self.api_equivalent_usd, self.api_equivalent)
 
 
 @dataclass(frozen=True)
@@ -616,15 +750,15 @@ def failure_envelope(error: DeckError, meta: dict) -> dict:
 
 _WIRE_CLASSES = (
     DeckError, Period, UsageMeter, Holder, DebugInfo, SubscriptionCard, UsagePoint, UsageTimeSeries, HealthStripEntry,
-    UsageMetrics, ProvenanceRow, UsageGroup, SourceStatus, ProviderOption,
+    UsageMetrics, ProvenanceRow, UsageGroup, SourceStatus, ProviderOption, ApiEquivalent, RowPricing, PricingInfo,
 )
 
 # Envelope (§3) and per-endpoint ``data`` keys that are not DTO fields.
 _ENVELOPE_KEYS = ("ok", "data", "error", "meta", "schema_version", "request_id", "generated_at", "partial", "errors")
 _DATA_KEYS = ("cards", "inventory_state", "view", "window_days", "provider_id", "series", "reason", "entries",
-              "mode", "dimension", "groups", "rows", "totals", "providers", "sources", "complete", "top_n")
+              "mode", "dimension", "groups", "rows", "totals", "providers", "sources", "complete", "top_n", "pricing")
 USAGE_DATA_KEYS = frozenset(("window_days", "mode", "dimension", "provider_id", "series", "groups", "rows", "totals",
-                             "providers", "sources", "complete", "top_n", "reason"))
+                             "providers", "sources", "complete", "top_n", "reason", "pricing"))
 
 #: Every field name the wire contract defines. Keys outside this set are not
 #: schema: the sanitizer scrubs them like any other string.
@@ -656,12 +790,12 @@ def _match(pattern):
 WIRE_VALUE_RULES = {
     "confidence": _in(CONFIDENCE_LABELS),
     "state": _in(set(CARD_STATES) | set(SOURCE_STATES)),
-    "reason": _in(REASONS),
+    "reason": _in(set(REASONS) | set(PRICING_REASONS)),
     "code": _in(ERROR_CODES),
     "message": _in(set(ERROR_MESSAGES.values()) | {v[1] for v in ERROR_VARIANTS.values()}),
     "unit": _in(UNITS),
     "scope": _in(set(METER_SCOPES) | set(SERIES_SCOPES)),
-    "source": _in(set(METER_SOURCES) | {"state.db"}),
+    "source": _in(set(METER_SOURCES) | {"state.db"} | set(PRICING_SOURCES)),
     "plan_source": _in(PLAN_SOURCES),
     "auth_status": _in(AUTH_STATUSES),
     "kind": _in(KINDS),
@@ -676,6 +810,15 @@ WIRE_VALUE_RULES = {
     "bucket": _in(("day",)),
     "timezone": _in(("server_local",)),
     "coverage": _in(("partial", "complete")),
+    "method": _in(PRICING_METHODS),
+    "alias_kind": _in(PRICING_ALIAS_KINDS),
+    "origin": _in(PRICING_ORIGINS),
+    "warnings": _in(PRICING_WARNINGS),  # list items inherit the key
+    "unknown_row_ids": _match(_ROW_ID_RE),  # list items inherit the key
+    "catalog_revision": _match(_SHA256_RE),
+    "catalog_key": _match(_CATALOG_KEY_RE),
+    "amount_pico_usd": _match(_PICO_RE),
+    "fetched_at": _match(_TS_FRAC_RE),
     "checked_at": _match(_TS_RE),
     "observed_at": _match(_TS_RE),
     "generated_at": _match(_TS_RE),
@@ -756,6 +899,15 @@ def health_from_wire(data: Any) -> HealthStripEntry:
     return HealthStripEntry(**{**data, "error": _error_from_wire(data["error"])})
 
 
+def _api_from_wire(data: Any) -> ApiEquivalent:
+    return ApiEquivalent(**_exact_keys("api_equivalent", data, ApiEquivalent))
+
+
+def _point_from_wire(data: Any) -> UsagePoint:
+    data = _exact_keys("point", data, UsagePoint)
+    return UsagePoint(**{**data, "api_equivalent": _api_from_wire(data["api_equivalent"])})
+
+
 def series_from_wire(data: Any) -> UsageTimeSeries:
     data = _exact_keys("series", data, UsageTimeSeries)
     if not isinstance(data["points"], list):
@@ -763,7 +915,7 @@ def series_from_wire(data: Any) -> UsageTimeSeries:
     return UsageTimeSeries(**{
         **data,
         "period": _period_from_wire(data["period"]),
-        "points": tuple(UsagePoint(**_exact_keys("point", p, UsagePoint)) for p in data["points"]),
+        "points": tuple(_point_from_wire(p) for p in data["points"]),
         "error": _error_from_wire(data["error"]),
     })
 
@@ -785,12 +937,14 @@ def _metrics_from_wire(data: Any) -> UsageMetrics:
     data = _exact_keys("metrics", data, UsageMetrics)
     if not isinstance(data["missing_fields"], list):
         raise DtoError("metrics: expected list")
-    return UsageMetrics(**{**data, "missing_fields": tuple(data["missing_fields"])})
+    return UsageMetrics(**{**data, "missing_fields": tuple(data["missing_fields"]),
+                           "api_equivalent": _api_from_wire(data["api_equivalent"])})
 
 
 def _row_from_wire(data: Any) -> ProvenanceRow:
     data = _exact_keys("row", data, ProvenanceRow)
-    return ProvenanceRow(**{**data, "metrics": _metrics_from_wire(data["metrics"])})
+    return ProvenanceRow(**{**data, "metrics": _metrics_from_wire(data["metrics"]),
+                            "pricing": RowPricing(**_exact_keys("pricing", data["pricing"], RowPricing))})
 
 
 def _group_from_wire(data: Any) -> UsageGroup:
@@ -827,6 +981,11 @@ def usage_from_wire(data: Any) -> dict:
     totals = to_plain(_metrics_from_wire(data["totals"]))
     providers = [to_plain(ProviderOption(**_exact_keys("provider", p, ProviderOption))) for p in data["providers"]]
     sources = [to_plain(SourceStatus(**_exact_keys("source", s, SourceStatus))) for s in data["sources"]]
+    pricing = _exact_keys("pricing", data["pricing"], PricingInfo)
+    if not all(isinstance(pricing[k], list) for k in ("warnings", "unknown_row_ids")):
+        raise DtoError("usage.pricing: expected lists")
+    pricing = to_plain(PricingInfo(**{**pricing, "warnings": tuple(pricing["warnings"]),
+                                      "unknown_row_ids": tuple(pricing["unknown_row_ids"])}))
     if [g["series_id"] for g in groups] != [s["id"] for s in series]:
         raise DtoError("usage: groups and series are not one-to-one")
     row_ids = [r["id"] for r in rows]
@@ -835,8 +994,10 @@ def usage_from_wire(data: Any) -> dict:
     grouped = [rid for g in groups for rid in g["row_ids"]]
     if sorted(grouped) != sorted(row_ids):
         raise DtoError("usage: every row must belong to exactly one group")
+    if pricing["unknown_row_ids"] != sorted(r["id"] for r in rows if r["metrics"]["api_equivalent"]["amount_pico_usd"] is None):
+        raise DtoError("usage: pricing.unknown_row_ids does not match the unpriced rows")
     out = {**data, "series": series, "groups": groups, "rows": rows, "totals": totals, "providers": providers,
-           "sources": sources}
+           "sources": sources, "pricing": pricing}
     if out != data:
         raise DtoError("usage: wire dict does not round-trip")
     return data

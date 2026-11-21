@@ -38,7 +38,8 @@ def build_series(rows: Tuple[AnalyticsDay, ...], window: int, now, series_id: st
             continue
         seen.add(row.day)
         points.append(UsagePoint(row.day, row.input_count, row.output_count, row.estimated_usd,
-                                 row.sessions, row.api_calls, "estimated"))
+                                 row.sessions, row.api_calls, "estimated",
+                                 row.api_equivalent_usd, row.api_equivalent))
     end = now
     start = end - timedelta(days=window)
     return UsageTimeSeries(

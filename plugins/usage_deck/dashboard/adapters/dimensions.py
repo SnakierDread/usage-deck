@@ -10,16 +10,22 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from ..models.dto import (
+    EMPTY_API_EQUIVALENT,
+    NO_ROW_PRICING,
     TOP_N_MODELS,
+    ApiEquivalent,
     Holder,
     ProvenanceRow,
+    RowPricing,
     UsageGroup,
     UsageMetrics,
     UsageTimeSeries,
+    api_usd,
 )
 from .base import AnalyticsDay
 from .fallback import PROFILE_SERIES_ID, build_series
@@ -50,6 +56,8 @@ class Row:
     provider_id: str
     attribution_source: str
     metrics: Metrics
+    #: ``pricing.PriceResolution`` of this leaf once annotated (``annotate_rows``); None = not priced.
+    price: Optional[Any] = None
 
     @property
     def holder(self) -> Tuple[bool, str]:
@@ -106,28 +114,101 @@ def provider_options(rows: Sequence[Row], reads: Iterable[HomeRead], selected: O
     return sorted(((p, label_of(p)) for p in ids), key=lambda o: (o[0] == UNKNOWN, o[1].lower(), o[0]))
 
 
+# ------------------------------------------------------------------ API-equivalent annotation
+
+
+def annotate_rows(rows: Iterable[Row], resolve: Callable[[Optional[str], Optional[int], Optional[int]], Any]) -> List[Row]:
+    """Price every provenance leaf exactly once (design §6): ``resolve(model_id, input, output)`` is the pure
+    resolver bound to one frozen catalog/alias snapshot. The stored counters are never touched."""
+    return [replace(r, price=resolve(r.model_id, r.metrics.input_count, r.metrics.output_count)) for r in rows]
+
+
+def _amount(price: Any) -> Optional[int]:
+    """Integer pico-USD of one leaf, None when unpriced (never zero for unknown)."""
+    amount = getattr(price, "amount_pico_usd", None) if price is not None else None
+    return amount if isinstance(amount, int) and not isinstance(amount, bool) else None
+
+
+def api_aggregate(rows: Iterable[Row]) -> Tuple[Optional[float], ApiEquivalent]:
+    """Aggregate the leaf integers of ``rows``: known amounts sum exactly, unknown leaves are excluded (never
+    priced at zero) and counted; no known leaf -> null amount."""
+    total: Optional[int] = None
+    priced = unpriced = proxy = 0
+    stale = False
+    for r in rows:
+        amount = _amount(r.price)
+        if amount is None:
+            unpriced += 1
+            continue
+        total = amount if total is None else total + amount
+        priced += 1
+        proxy += 1 if getattr(r.price, "alias_kind", None) == "proxy" else 0
+        stale = stale or bool(getattr(r.price, "stale", False))
+    text = None if total is None else str(total)
+    return api_usd(text), ApiEquivalent(text, priced, unpriced, proxy, unpriced > 0, stale)
+
+
+def _fmt_fetched(moment: Optional[datetime]) -> Optional[str]:
+    if moment is None:
+        return None
+    utc = moment.astimezone(timezone.utc)
+    base = utc.strftime("%Y-%m-%dT%H:%M:%S")
+    return base + (f".{utc.microsecond:06d}" if utc.microsecond else "") + "Z"
+
+
+def row_pricing(price: Any) -> RowPricing:
+    """The eight-field wire description of one resolution (the not-annotated row reads as unresolved)."""
+    if price is None:
+        return NO_ROW_PRICING
+    return RowPricing(
+        catalog_key=price.catalog_key, method=price.method, alias_kind=price.alias_kind, note=price.note,
+        reason=None if _amount(price) is not None else (price.reason or "no_catalog_match"),
+        source=price.source, fetched_at=_fmt_fetched(price.fetched_at), stale=bool(price.stale))
+
+
+def unknown_row_ids(rows: Iterable[Row]) -> Tuple[str, ...]:
+    return tuple(sorted(r.id for r in rows if _amount(r.price) is None))
+
+
 # ------------------------------------------------------------------ DTO helpers
 
 
-def metrics_dto(m: Metrics) -> UsageMetrics:
+def metrics_dto(m: Metrics, rows: Iterable[Row] = ()) -> UsageMetrics:
+    """Baseline counters (old fields unchanged) plus the API-equivalent aggregate of the member leaves."""
+    usd, api = api_aggregate(rows)
     return UsageMetrics(m.input_count, m.output_count, m.estimated_usd, m.sessions, m.api_calls,
-                        tuple(sorted(m.missing)))
+                        tuple(sorted(m.missing)), usd, api)
 
 
 def row_dto(r: Row) -> ProvenanceRow:
     return ProvenanceRow(r.id, r.day, r.profile, r.is_global, "state.db", r.model_id, r.provider_id,
-                         r.attribution_source, metrics_dto(r.metrics))
+                         r.attribution_source, metrics_dto(r.metrics, (r,)), row_pricing(r.price))
 
 
 def daily_days(rows: Iterable[Row]) -> Tuple[AnalyticsDay, ...]:
-    by_day: Dict[str, List[Metrics]] = {}
+    by_day: Dict[str, List[Row]] = {}
     for r in rows:
-        by_day.setdefault(r.day, []).append(r.metrics)
+        by_day.setdefault(r.day, []).append(r)
     out = []
     for day in sorted(by_day):
-        m = sum_metrics(by_day[day])
-        out.append(AnalyticsDay(day, m.input_count, m.output_count, m.estimated_usd, m.sessions, m.api_calls))
+        m = sum_metrics(r.metrics for r in by_day[day])
+        usd, api = api_aggregate(by_day[day])
+        out.append(AnalyticsDay(day, m.input_count, m.output_count, m.estimated_usd, m.sessions, m.api_calls,
+                                usd, api))
     return tuple(out)
+
+
+def with_row_api(series: UsageTimeSeries, rows: Sequence[Row]) -> UsageTimeSeries:
+    """Replace ONLY the API-equivalent fields of a legacy (host) series with the scoped session leaves of the
+    same day; every old point field is preserved and a day with no matching leaf is null."""
+    by_day: Dict[str, List[Row]] = {}
+    for r in rows:
+        by_day.setdefault(r.day, []).append(r)
+    points = []
+    for p in series.points:
+        usd, api = api_aggregate(by_day.get(p.day, ()))
+        points.append(replace(p, api_equivalent_usd=usd, api_equivalent=api))
+    return replace(series, points=tuple(points))
 
 
 def _holders(rows: Iterable[Row]) -> Tuple[Holder, ...]:
@@ -140,7 +221,7 @@ def _group_dto(group_id: str, label: str, series_id: str, model_id: Optional[str
         id=group_id, label=label, series_id=series_id, model_id=model_id,
         provider_ids=tuple(sorted({r.provider_id for r in rows})), profiles=_holders(rows),
         row_ids=tuple(sorted(r.id for r in rows)),
-        totals=metrics_dto(totals if totals is not None else sum_metrics(r.metrics for r in rows)),
+        totals=metrics_dto(totals if totals is not None else sum_metrics(r.metrics for r in rows), rows),
         is_other=is_other)
 
 
@@ -198,6 +279,7 @@ def partition(rows: Sequence[Row], dimension: str, mode: str, window: int, now, 
         series_id = PROFILE_SERIES_ID if mode == "profile" else "all"
         if override_all is not None:
             legacy_series, legacy_totals = override_all
+            legacy_series = with_row_api(legacy_series, rows)
             return Partition((_group_dto("all", "All", series_id, None, rows, False, legacy_totals),), (legacy_series,))
         return Partition((_group_dto("all", "All", series_id, None, rows, False),), (series_of(series_id, rows),))
     if not rows:

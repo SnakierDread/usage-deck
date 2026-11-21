@@ -422,6 +422,7 @@
       complete: d.complete !== false,
       top_n: num(d.top_n),
       reason: has(USAGE_REASONS, d.reason) ? d.reason : null,
+      pricing: isObj(d.pricing) ? d.pricing : null,
       meta: env.meta,
     };
   }
@@ -448,6 +449,141 @@
   function fmtMetric(v, unit) {
     return num(v) === null ? "—" : fmtNumber(v, unit || "count");
   }
+
+// <api-equivalent-helpers>
+// API-equivalent cost (docs/design/api-equivalent-pricing.md §7). Pure helpers, no rendering: the SAME block (byte
+// for byte) lives in dist/index.js and desktop/plugin.js (tests/frontend/api_equivalent.test.js enforces it). The
+// frontend never fetches prices or resolves models: it only formats the backend's integer pico-USD strings.
+const API_LABEL = "API-equivalent ($)";
+const API_TIP = "Hypothetical cost at current base text API rates; not actual spend. Excludes cache discounts, context tiers and extra fees.";
+const API_FOOTNOTE = "API-equivalent ($) is what the recorded input and output tokens would cost at current public base text API rates. It is a hypothetical figure, not actual spend, an invoice or a subscription cost, and it excludes cache discounts, context tiers, batch discounts and tool or media fees. A model with no known price shows \u2014 and is left out of every sum; a price proxy is a stand-in tariff, not a verified identity.";
+const API_REASON_TEXT = {
+  tokens_missing: "token counts not recorded",
+  tokens_invalid: "token counts invalid",
+  model_unknown: "no usable model id",
+  no_catalog_match: "no price known for this model id",
+  ambiguous_model: "several different prices match this model id",
+  alias_target_missing: "the price entry its alias points to is missing",
+};
+const API_WARNING_TEXT = {
+  pricing_stale: "Stale prices: some catalog prices are more than 7 days old. Amounts are kept, not blanked.",
+  pricing_refresh_failed: "Price refresh failed; showing the last known prices.",
+  pricing_cache_invalid: "The local price cache was unreadable; showing the packaged prices.",
+  pricing_cache_unwritable: "The price cache could not be saved; prices refresh in memory only.",
+  pricing_aliases_invalid: "The alias table was invalid; only catalog matches can price a model.",
+  pricing_seed_invalid: "No usable price catalog is available; every model is unpriced.",
+};
+const API_PICO_RE = /^(?:0|[1-9][0-9]{0,30})$/;
+const API_PICO_PER_USD = BigInt("1000000000000");
+const API_PICO_PER_CENT = BigInt("10000000000");
+
+/** Exact integer pico-USD string of a metrics object, or null (null is "no priced observation", never zero). */
+function apiPico(m) {
+  const a = m && m.api_equivalent;
+  const s = a && typeof a === "object" && !Array.isArray(a) ? a.amount_pico_usd : null;
+  return typeof s === "string" && API_PICO_RE.test(s) ? s : null;
+}
+
+/** Exact decimal USD text of a pico-USD integer string ("1234567" -> "0.000001234567"). */
+function picoToUsd(s) {
+  const v = BigInt(s);
+  const frac = (v % API_PICO_PER_USD).toString().padStart(12, "0").replace(/0+$/, "");
+  return (v / API_PICO_PER_USD).toString() + (frac ? "." + frac : "");
+}
+
+/** Screen label: null -> dash, exact zero -> $0.00, nonzero under one cent -> <$0.01, else two decimals. */
+function fmtApi(pico) {
+  if (pico === null) return "\u2014";
+  const v = BigInt(pico);
+  if (v === BigInt(0)) return "$0.00";
+  if (v < API_PICO_PER_CENT) return "<$0.01";
+  const cents = (v + API_PICO_PER_CENT / BigInt(2)) / API_PICO_PER_CENT;
+  const whole = (cents / BigInt(100)).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return "$" + whole + "." + (cents % BigInt(100)).toString().padStart(2, "0");
+}
+
+function apiCount(v) {
+  return typeof v === "number" && isFinite(v) && v >= 0 ? Math.floor(v) : 0;
+}
+
+/** Programmatic view of one metrics object: state is "null" | "zero" | "value" (never conflated). */
+function apiView(m) {
+  const raw = m && m.api_equivalent;
+  const a = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const pico = apiPico(m);
+  return {
+    state: pico === null ? "null" : pico === "0" ? "zero" : "value",
+    pico: pico,
+    text: fmtApi(pico),
+    exact: pico === null ? null : "$" + picoToUsd(pico),
+    priced: apiCount(a.priced_rows),
+    unpriced: apiCount(a.unpriced_rows),
+    proxy: apiCount(a.proxy_rows),
+    partial: a.partial === true,
+    stale: a.stale === true,
+  };
+}
+
+/** Visible qualifiers: partial subtotal, unpriced count, price proxy, stale prices. */
+function apiFlags(v) {
+  const out = [];
+  if (v.partial && v.pico !== null) out.push({ id: "partial", text: "Partial \u00b7 " + v.unpriced + " unpriced" });
+  else if (v.pico === null && v.unpriced > 0) out.push({ id: "unpriced", text: v.unpriced + " unpriced" });
+  if (v.proxy > 0) out.push({ id: "proxy", text: v.priced > 1 ? "Price proxy \u00b7 " + v.proxy + " of " + v.priced : "Price proxy" });
+  if (v.stale) out.push({ id: "stale", text: "Stale prices" });
+  return out;
+}
+
+/** Hover/tooltip text: a row explains its resolved key and method; an aggregate lists its row counts. */
+function apiTitle(v, row, rowCount) {
+  const lines = [];
+  const p = row && row.pricing && typeof row.pricing === "object" ? row.pricing : null;
+  if (row) lines.push("Model: " + (typeof row.model_id === "string" ? row.model_id : "Unknown model"));
+  if (p && typeof p.catalog_key === "string") {
+    lines.push("Priced as " + p.catalog_key + " (" + (typeof p.method === "string" ? p.method : "unknown method") +
+      (typeof p.alias_kind === "string" ? ", " + p.alias_kind : "") + ")");
+    if (typeof p.note === "string" && p.note) lines.push(p.note);
+    if (typeof p.fetched_at === "string") lines.push("Prices fetched " + p.fetched_at + (p.stale === true ? " \u2014 stale (older than 7 days)" : ""));
+  }
+  if (v.pico === null) {
+    const why = p && typeof p.reason === "string" && Object.prototype.hasOwnProperty.call(API_REASON_TEXT, p.reason) ? API_REASON_TEXT[p.reason] : "no priced observation";
+    lines.push("Not priced: " + why + ". Excluded from every API-equivalent sum; not zero.");
+  } else {
+    lines.push("Exact: " + v.exact + " (" + v.pico + " pico-USD)");
+  }
+  if (!row) {
+    lines.push(v.priced + " priced, " + v.unpriced + " unpriced" + (v.proxy ? ", " + v.proxy + " on a price proxy" : "") +
+      (typeof rowCount === "number" ? " of " + rowCount + " daily rows" : "") + ".");
+  }
+  lines.push(API_TIP);
+  return lines.join("\n");
+}
+
+/** The explicit unpriced bucket: rows in data.pricing.unknown_row_ids, grouped by exact model id and reason. */
+function unpricedModels(data) {
+  const rows = data && Array.isArray(data.rows) ? data.rows : [];
+  const ids = data && data.pricing && Array.isArray(data.pricing.unknown_row_ids) ? data.pricing.unknown_row_ids : null;
+  const byId = {};
+  rows.forEach(function (r) { if (r && typeof r.id === "string") byId[r.id] = r; });
+  // No data.pricing block (older backend) means "not reported", never "unpriced": no bucket is invented.
+  const list = ids ? ids.map(function (id) { return byId[id]; }).filter(Boolean) : [];
+  const groups = {};
+  list.forEach(function (r) {
+    const model = typeof r.model_id === "string" ? r.model_id : null;
+    const code = r.pricing && typeof r.pricing.reason === "string" ? r.pricing.reason : null;
+    const key = JSON.stringify([model, code]);
+    if (!groups[key]) groups[key] = { model: model === null ? "Unknown model" : model, code: code, reason: code && Object.prototype.hasOwnProperty.call(API_REASON_TEXT, code) ? API_REASON_TEXT[code] : "not priced", rows: 0 };
+    groups[key].rows += 1;
+  });
+  return Object.keys(groups).map(function (k) { return groups[k]; }).sort(function (a, b) { return a.model < b.model ? -1 : a.model > b.model ? 1 : 0; });
+}
+
+/** Human text for the response's pricing warning codes (known vocabulary only). */
+function pricingNotes(data) {
+  const w = data && data.pricing && Array.isArray(data.pricing.warnings) ? data.pricing.warnings : [];
+  return w.filter(function (c) { return Object.prototype.hasOwnProperty.call(API_WARNING_TEXT, c); }).map(function (c) { return { code: c, text: API_WARNING_TEXT[c] }; });
+}
+// </api-equivalent-helpers>
 
   function scopeCopy(mode) {
     return mode === "machine" ? COPY_SCOPE_MACHINE : COPY_SCOPE_PROFILE;
@@ -1015,6 +1151,56 @@
         t.value === null ? "—" : fmtNumber(t.value, "count"), t.partial ? h("span", { "aria-hidden": "true" }, "*") : null);
     }
 
+    /** Visible API-equivalent qualifiers (partial / unpriced / price proxy / stale prices). */
+    function ApiFlags(props) {
+      return apiFlags(props.view).map(function (f) {
+        return h("span", { key: f.id, className: "ud-api-flag", "data-api-flag": f.id }, f.text);
+      });
+    }
+
+    /** API-equivalent ($) cell: dash for null, $0.00 for an exact zero (data-api-state tells them apart). */
+    function ApiCell(props) {
+      const v = apiView(props.metrics);
+      return h("td", { className: "ud-api-cell", "data-field": "api_equivalent_usd", "data-api-state": v.state,
+        "data-api-pico": v.pico === null ? undefined : v.pico, "data-partial": v.partial ? "true" : undefined,
+        "data-row-count": typeof props.rowCount === "number" ? String(props.rowCount) : undefined,
+        title: apiTitle(v, props.row, props.rowCount) },
+      h("span", { className: "ud-api-amount" }, v.text), h(ApiFlags, { view: v }));
+    }
+
+    /** The same value inside the totals card. */
+    function ApiTotal(props) {
+      const v = apiView(props.metrics);
+      return h("span", { className: "ud-api-cell", "data-field": "api_equivalent_usd", "data-api-state": v.state,
+        "data-api-pico": v.pico === null ? undefined : v.pico, "data-partial": v.partial ? "true" : undefined,
+        title: apiTitle(v, null, props.rowCount) },
+      h("span", { className: "ud-api-amount" }, v.text), h(ApiFlags, { view: v }));
+    }
+
+    /** Explicit unpriced bucket: exact model ids that no price could be found for, with the reason; never summed. */
+    function UnpricedModels(props) {
+      const groups = unpricedModels(props.data);
+      if (groups.length === 0) return null;
+      const total = groups.reduce(function (n, g) { return n + g.rows; }, 0);
+      return h("details", { className: "ud-table-wrap", "data-unpriced-models": "true" },
+        h("summary", null, "Unpriced models (" + total + " daily row" + (total === 1 ? "" : "s") + ")"),
+        h("p", { className: "ud-muted ud-small" }, "These rows have no API-equivalent value. They are shown as \u2014 and are excluded from every sum; they are not zero."),
+        h("ul", { className: "ud-small" }, groups.map(function (g) {
+          return h("li", { key: g.model + "|" + (g.code || ""), "data-unpriced-model": g.model, "data-reason": g.code || undefined },
+            g.model + " \u2014 " + g.reason + " (" + g.rows + " daily row" + (g.rows === 1 ? "" : "s") + ")");
+        })));
+    }
+
+    function PricingNotes(props) {
+      return pricingNotes(props.data).map(function (n) {
+        return h("p", { key: n.code, className: "ud-muted ud-small", "data-pricing-warning": n.code }, n.text);
+      });
+    }
+
+    function apiHead(c) {
+      return h("th", { key: c, scope: "col", title: c === API_LABEL ? API_TIP : undefined }, c);
+    }
+
     /** Whole-scope totals: independent of the dimension, the top-N cut and the legend. */
     function TotalsBar(props) {
       const t = props.totals;
@@ -1025,14 +1211,16 @@
         ["Output", fmtMetric(t.output_count, "count")],
         ["Total tokens", tt.value === null ? "—" : fmtNumber(tt.value, "count")],
         ["Est. USD", fmtMetric(t.estimated_usd, "usd")],
+        [API_LABEL, h(ApiTotal, { metrics: t, rowCount: props.rowCount }), API_TIP],
         ["Sessions", fmtMetric(t.sessions, "count")],
         ["API calls", fmtMetric(t.api_calls, "count")],
       ];
       return h("div", { className: "ud-totals", "data-usage-totals": "true" },
         h("p", { className: "ud-muted ud-small" }, "Totals for the whole filtered scope, including any group hidden in the legend."),
         h("dl", { className: "ud-vals" }, items.map(function (it) {
-          return h("div", { key: it[0] }, h("dt", null, it[0]), h("dd", null, it[1]));
+          return h("div", { key: it[0] }, h("dt", { title: it[2] }, it[0]), h("dd", null, it[1]));
         })),
+        h("p", { className: "ud-muted ud-small", "data-api-footnote": "true" }, API_FOOTNOTE),
         partial ? h("p", { className: "ud-muted ud-small", "data-totals-partial": "true" },
           "* Some sessions did not record: " + t.missing_fields.join(", ") + ". Those figures are known subtotals; nothing is estimated for the missing values.") : null);
     }
@@ -1057,10 +1245,10 @@
         return (a.day < b.day ? -1 : a.day > b.day ? 1 : 0) || (str(a.profile) < str(b.profile) ? -1 : 1);
       });
       const shown = rows.slice(0, 500);
-      const cols = (props.withGroup ? ["Group"] : []).concat(["Day", "Profile DB", "Model", "Provider", "Input", "Output", "Est. USD", "Sessions", "API calls"]);
+      const cols = (props.withGroup ? ["Group"] : []).concat(["Day", "Profile DB", "Model", "Provider", "Input", "Output", "Est. USD", API_LABEL, "Sessions", "API calls"]);
       return h("div", { className: "ud-table-scroll" },
         h("table", { className: "ud-table", "data-rows-table": props.name || "rows" },
-          h("thead", null, h("tr", null, cols.map(function (c) { return h("th", { key: c, scope: "col" }, c); }))),
+          h("thead", null, h("tr", null, cols.map(apiHead))),
           h("tbody", null, shown.map(function (r) {
             const attr = str(r.attribution_source);
             const note = attr === "billing_provider" ? " (billing)" : attr === "models_json" ? " (catalog)" : "";
@@ -1074,6 +1262,7 @@
               h(MetricCell, { metrics: r.metrics, field: "input_count" }),
               h(MetricCell, { metrics: r.metrics, field: "output_count" }),
               h(MetricCell, { metrics: r.metrics, field: "estimated_usd", unit: "usd" }),
+              h(ApiCell, { metrics: r.metrics, row: r }),
               h(MetricCell, { metrics: r.metrics, field: "sessions" }),
               h(MetricCell, { metrics: r.metrics, field: "api_calls" }));
           }))),
@@ -1112,13 +1301,14 @@
         sorted.length === 0 ? null : h("details", { className: "ud-table-wrap" },
           h("summary", null, "Data table"),
           h("table", { className: "ud-table" },
-            h("thead", null, h("tr", null, ["Day", "Input", "Output", "Est. USD", "Sessions", "API calls"].map(function (c) { return h("th", { key: c, scope: "col" }, c); }))),
+            h("thead", null, h("tr", null, ["Day", "Input", "Output", "Est. USD", API_LABEL, "Sessions", "API calls"].map(apiHead))),
             h("tbody", null, sorted.map(function (p) {
               return h("tr", { key: p.day },
                 h("td", null, p.day),
                 h("td", null, fmtNumber(p.input_count, "count")),
                 h("td", null, fmtNumber(p.output_count, "count")),
                 h("td", null, fmtNumber(p.estimated_usd, "usd")),
+                h(ApiCell, { metrics: p }),
                 h("td", null, fmtNumber(p.sessions, "count")),
                 h("td", null, fmtNumber(p.api_calls, "count")));
             })))),
@@ -1223,7 +1413,7 @@
           h(GroupChart, { title: "Estimated spend (USD)", unit: "usd", lines: spendLines })),
         h("div", { className: "ud-table-scroll" },
           h("table", { className: "ud-table", "data-summary-table": d.dimension },
-            h("thead", null, h("tr", null, ["Group", "Input", "Output", "Total tokens", "Est. USD", "Sessions", "API calls"].map(function (c) { return h("th", { key: c, scope: "col" }, c); }))),
+            h("thead", null, h("tr", null, ["Group", "Input", "Output", "Total tokens", "Est. USD", API_LABEL, "Sessions", "API calls"].map(apiHead))),
             h("tbody", null, sumRows.map(function (v) {
               const t = v.group.totals;
               return h("tr", { key: v.group.id, "data-group-id": v.group.id },
@@ -1232,6 +1422,7 @@
                 h(MetricCell, { metrics: t, field: "output_count" }),
                 h(TotalTokensCell, { metrics: t }),
                 h(MetricCell, { metrics: t, field: "estimated_usd", unit: "usd" }),
+                h(ApiCell, { metrics: t, rowCount: v.group.row_ids.length }),
                 h(MetricCell, { metrics: t, field: "sessions" }),
                 h(MetricCell, { metrics: t, field: "api_calls" }));
             })))),
@@ -1268,7 +1459,8 @@
         } else {
           inner = h(GroupedView, { key: [d.mode, d.dimension, d.window_days, d.provider_id].join("|"), data: d, providers: d.providers });
         }
-        content = h("div", { "aria-busy": st.refreshing ? "true" : undefined }, err, h(CoverageNote, { data: d }), inner, h(TotalsBar, { totals: d.totals }));
+        content = h("div", { "aria-busy": st.refreshing ? "true" : undefined }, err, h(CoverageNote, { data: d }), inner, h(TotalsBar, { totals: d.totals, rowCount: d.rows.length }),
+          h(PricingNotes, { data: d }), h(UnpricedModels, { data: d }));
       }
       const options = dimensionOptions(mode);
       const selected = providers.filter(function (p) { return p.id === props.provider; })[0];
@@ -1477,6 +1669,13 @@
     fmtMetric: fmtMetric,
     scopeCopy: scopeCopy,
     groupViews: groupViews,
+    apiView: apiView,
+    fmtApi: fmtApi,
+    picoToUsd: picoToUsd,
+    apiFlags: apiFlags,
+    apiTitle: apiTitle,
+    unpricedModels: unpricedModels,
+    pricingNotes: pricingNotes,
   };
 
   if (typeof module !== "undefined" && module.exports) {
