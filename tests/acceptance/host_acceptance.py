@@ -88,7 +88,8 @@ METER_KEYS = {"id", "label", "value", "limit", "remaining", "unit", "scope", "pe
 PERIOD_KEYS = {"start", "end", "label"}
 ERROR_KEYS = {"code", "message", "retryable", "provider_id", "account_id"}
 DEBUG_KEYS = {"adapter", "capabilities", "source", "sanitized"}
-POINT_KEYS = {"day", "input_count", "output_count", "estimated_usd", "sessions", "api_calls", "confidence"}
+POINT_KEYS = {"day", "input_count", "output_count", "estimated_usd", "sessions", "api_calls", "confidence",
+              "api_equivalent_usd", "api_equivalent"}  # last two: API-equivalent annotation (design §7)
 SERIES_KEYS = {"id", "provider_id", "account_id", "scope", "confidence", "source", "period", "window_days", "bucket",
                "timezone", "coverage", "points", "checked_at", "stale", "error"}
 HEALTH_KEYS = {"endpoint_id", "provider_id", "display_name", "status", "confidence", "metrics_available", "latency_ms",
