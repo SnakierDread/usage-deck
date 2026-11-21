@@ -1,0 +1,105 @@
+{
+  "all": {
+    "totals_est_usd": "$1,246.12",
+    "tables": [
+      {
+        "table": "daily#0",
+        "column": "Est. USD",
+        "cells": [
+          "$1,234.57",
+          "$9.99",
+          "$0.3125",
+          "$1.25"
+        ]
+      },
+      {
+        "table": "provenance",
+        "column": "Est. USD",
+        "cells": [
+          "$1,234.57",
+          "$0.00",
+          "$9.99",
+          "$0.00",
+          "$0.3125",
+          "$0.00",
+          "$0.00",
+          "$1.25"
+        ]
+      }
+    ],
+    "charts": [
+      "Estimated spend (USD), 4 days with data"
+    ]
+  },
+  "profile": {
+    "totals_est_usd": "$1,246.12",
+    "tables": [
+      {
+        "table": "profile",
+        "column": "Est. USD",
+        "cells": [
+          "$1.25",
+          "$1,244.87"
+        ]
+      },
+      {
+        "table": "grouped",
+        "column": "Est. USD",
+        "cells": [
+          "$1,234.57",
+          "$0.00",
+          "$9.99",
+          "$0.00",
+          "$0.3125",
+          "$0.00",
+          "$0.00",
+          "$1.25"
+        ]
+      }
+    ],
+    "charts": [
+      "Estimated spend (USD), 2 lines"
+    ]
+  },
+  "model": {
+    "totals_est_usd": "$1,246.12",
+    "tables": [
+      {
+        "table": "model",
+        "column": "Est. USD",
+        "cells": [
+          "$0.00",
+          "$0.3125",
+          "$0.00",
+          "$9.99",
+          "$0.00",
+          "$1,234.57",
+          "$1.25"
+        ]
+      },
+      {
+        "table": "grouped",
+        "column": "Est. USD",
+        "cells": [
+          "$1,234.57",
+          "$9.99",
+          "$0.00",
+          "$0.3125",
+          "$0.00",
+          "$0.00"
+        ]
+      },
+      {
+        "table": "other",
+        "column": "Est. USD",
+        "cells": [
+          "$0.00",
+          "$1.25"
+        ]
+      }
+    ],
+    "charts": [
+      "Estimated spend (USD), 7 lines"
+    ]
+  }
+}
