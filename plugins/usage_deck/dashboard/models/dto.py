@@ -916,8 +916,13 @@ class HealthStripEntry:
     error: Optional[DeckError]
     #: Last time a probe in this server process reached the endpoint (null = never seen since start).
     last_seen_at: Optional[str] = None
+    #: Machine view: true when the endpoint is defined only in ANOTHER profile's config and this row was probed on
+    #: that owner's base_url (DESIGN.md §13 item 3b). False for the selected profile's own endpoints and for the
+    #: profile view; never says anything about credentials.
+    profile_owned: bool = False
 
     def __post_init__(self) -> None:
+        _bool("profile_owned", self.profile_owned)
         _ts("last_seen_at", self.last_seen_at)
         _str("endpoint_id", self.endpoint_id)
         _str("provider_id", self.provider_id)

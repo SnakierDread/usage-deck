@@ -154,14 +154,15 @@ class SiblingConfigAndEnvOnDisk(unittest.TestCase):
         self.assertEqual((entry["status"], entry["confidence"], entry["metrics_available"], entry["reason"]),
                          ("healthy", "self_hosted", True, None))
         self.assertEqual((entry["cpu_percent"], entry["memory_bytes"]), (12.5, 1000))
-        # read-only ceiling: exactly one GET, to /metrics of the configured origin, nothing else (no models probe)
-        self.assertEqual(box.sent(), [(GPU + "/metrics", "Bearer " + GPU_VALUE)])
+        # read-only ceiling (DESIGN.md §13 item 3b, card t_793f0ed6): GETs of /metrics and the /v1/models listing on the
+        # configured origin, both carrying only the owner home's own key_env secret, nothing else
+        self.assertEqual(box.sent(), [(GPU + "/metrics", "Bearer " + GPU_VALUE), (GPU + "/v1/models", "Bearer " + GPU_VALUE)])
         self.assertEqual(scan_for(envelopes, ALL_VALUES + ["sntl-unrelated-77aa"]), [])
 
     def test_open_box_is_scraped_the_same_way(self):
         box = GpuTransport()
         _cards, health, _ = self.machine(box)
-        self.assertEqual([u for u, _a in box.sent()], [GPU + "/metrics"])
+        self.assertEqual([u for u, _a in box.sent()], [GPU + "/metrics", GPU + "/v1/models"])
         self.assertEqual(health[0]["status"], "healthy")
 
     def test_missing_variable_sends_nothing_and_is_honest(self):
@@ -179,7 +180,7 @@ class SiblingConfigAndEnvOnDisk(unittest.TestCase):
             gpu_config(extra="    api_key: " + INLINE_VALUE + "\n"))
         box = GpuTransport()
         cards, _health, envelopes = self.machine(box)
-        self.assertEqual(box.sent(), [(GPU + "/metrics", None)])     # anonymous: neither the inline key nor key_env
+        self.assertEqual(box.sent(), [(GPU + "/metrics", None), (GPU + "/v1/models", None)])  # anonymous: neither the inline key nor key_env
         self.assertEqual(cards[0]["auth_status"], "available")        # presence only
         self.assertEqual(scan_for(envelopes, ALL_VALUES), [])
 
@@ -210,7 +211,7 @@ class SiblingConfigAndEnvOnDisk(unittest.TestCase):
         cards, _health, _ = self.machine(box)
         (card,) = cards
         self.assertEqual([(h["profile"], h["is_global"]) for h in card["holders"]], [("global", True)])
-        self.assertEqual(box.sent(), [(GPU + "/metrics", "Bearer " + ROOT_VALUE)])
+        self.assertEqual(box.sent(), [(GPU + "/metrics", "Bearer " + ROOT_VALUE), (GPU + "/v1/models", "Bearer " + ROOT_VALUE)])
 
     def test_a_viewed_homes_own_endpoint_keeps_the_profile_path_and_merges_holders(self):
         (self.s.home / "config.yaml").write_text(gpu_config())

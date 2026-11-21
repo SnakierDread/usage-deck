@@ -138,7 +138,7 @@ class DtoTests(unittest.TestCase):
         self.assertEqual(set(dto.to_plain(entry)), {
             "endpoint_id", "provider_id", "display_name", "status", "confidence", "metrics_available",
             "latency_ms", "cpu_percent", "memory_bytes", "checked_at", "stale", "reason", "error",
-            "last_seen_at"})
+            "last_seen_at", "profile_owned"})
 
     def test_series_points_must_ascend(self):
         a = dto.UsagePoint("2026-01-02", 1, 1, 0.0, 1, 1, "estimated")

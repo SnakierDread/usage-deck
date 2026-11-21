@@ -91,7 +91,11 @@ const OPAQUE_NOTES = {
 const ANTHROPIC_LIVE_EMPTY_NOTE =
   "No Anthropic session/weekly meter: Anthropic's usage endpoint was read live for this credential and reported no current session or weekly window (or did not permit the read). Nothing is estimated and no older captured reading is shown in its place."
 const MACHINE_ONLY_NOTE =
-  "No live source for this account: the machine view reads meters with any local profile's credential only through the documented read-only usage probes (Codex spend control, Anthropic OAuth usage, endpoint /metrics), and none exists for this account, so it is local inventory. Nothing is estimated."
+  "No live source for this account: the machine view reads meters with any local profile's credential only through the documented read-only usage probes (Codex spend control, Anthropic OAuth usage, endpoint /metrics and models listing), and none exists for this account, so it is local inventory. Nothing is estimated."
+// Machine view, self-hosted health row of an endpoint defined only in ANOTHER profile's config (DESIGN.md §13 item 3b).
+const PROFILE_OWNED_BADGE = 'Profile endpoint'
+const PROFILE_OWNED_NOTE =
+  "This endpoint is defined only in another profile's config. It was probed read-only (/metrics and the models listing) on that profile's own address, anonymously unless that profile's own key_env supplies a key. No other profile's or the process's credential is sent."
 
 // Fixed local copy for Reason codes: upstream text never reaches the UI.
 const REASON_TEXT = {
@@ -3092,7 +3096,10 @@ function HealthRow(props) {
     !metricsOk && !errCode ? h('span', { style: MUTED }, 'Metrics unavailable') : null,
     reason && !errCode ? h('span', { style: MUTED }, reason) : null,
     e.reason === 'box_offline' ? h('span', { 'data-field': 'last-seen', style: MUTED }, lastSeenText(e)) : null,
-    props.machine && statusKey === 'unknown' && e.reason === 'source_unavailable' && !errCode
+    props.machine && e.profile_owned === true
+      ? h('span', { style: MUTED, 'data-profile-owned': 'true', title: PROFILE_OWNED_NOTE }, PROFILE_OWNED_BADGE)
+      : null,
+    props.machine && statusKey === 'unknown' && e.reason === 'source_unavailable' && !errCode && e.profile_owned !== true
       ? h('span', { style: MUTED, 'data-machine-only-note': 'true', title: MACHINE_ONLY_NOTE }, 'Not probed')
       : null,
     errCode ? h('span', { role: 'note', style: { ...SMALL, fontWeight: 500 } }, '⚠ ' + deckErrorText(errCode)) : null

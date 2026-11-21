@@ -158,18 +158,22 @@ class MachineViewReadsAnyProfilesMeter(ServiceBase, SchemaAsserts):
 
     # ------------------------------------------------------------------ read-only allowlist, in code
 
-    def test_the_allowlist_is_exactly_the_three_documented_read_only_probes(self):
+    def test_the_allowlist_is_exactly_the_documented_read_only_probes(self):
         self.assertEqual(
             [(p.method, p.scheme, p.host, p.port, p.path) for p in CROSS_PROFILE_PROBES],
             [("GET", "https", "chatgpt.com", 443, "/backend-api/wham/usage"),
              ("GET", "https", "api.anthropic.com", 443, "/api/oauth/usage"),
-             ("GET", None, None, None, "/metrics")])
+             ("GET", None, None, None, "/metrics"),
+             ("GET", None, None, None, "/v1/models"),
+             ("GET", None, None, None, "/api/tags")])
 
     def test_method_origin_and_path_are_all_enforced(self):
         good = [("GET", "https://chatgpt.com/backend-api/wham/usage"),
                 ("GET", "https://chatgpt.com:443/backend-api/wham/usage"),
                 ("GET", "https://api.anthropic.com/api/oauth/usage"),
-                ("GET", "http://gpu.lan:8000/metrics")]
+                ("GET", "http://gpu.lan:8000/metrics"),
+                ("GET", "http://gpu.lan:8000/v1/models"),
+                ("GET", "http://gpu.lan:8000/api/tags")]
         bad = [("POST", "https://chatgpt.com/backend-api/wham/usage"),
                ("PUT", "https://api.anthropic.com/api/oauth/usage"),
                ("DELETE", "http://gpu.lan:8000/metrics"),
@@ -185,7 +189,10 @@ class MachineViewReadsAnyProfilesMeter(ServiceBase, SchemaAsserts):
                ("GET", "https://api.openai.com/v1/usage"),
                ("GET", "https://api.anthropic.com/v1/messages"),
                ("GET", "https://openrouter.ai/api/v1/key"),
-               ("GET", "http://gpu.lan:8000/v1/models"),
+               ("GET", "http://gpu.lan:8000/v1/chat/completions"),
+               ("POST", "http://gpu.lan:8000/v1/models"),
+               ("GET", "http://gpu.lan:8000/v1/models?x=1"),
+               ("GET", "http://gpu.lan:8000/v1/models/"),
                ("GET", "http://gpu.lan:8000/metrics?name=x"),
                ("GET", "ftp://gpu.lan/metrics")]
         for method, url in good:
@@ -229,15 +236,18 @@ class MachineViewReadsAnyProfilesMeter(ServiceBase, SchemaAsserts):
         self.assertTrue(all(c["state"] == "opaque" and c["reason"] in ("source_unavailable", "unsupported") for c in cards))
         self.assertEqual(self.transport.requests, [])
 
-    def test_self_hosted_cross_profile_endpoint_gets_one_anonymous_metrics_get_only(self):
+    def test_self_hosted_cross_profile_endpoint_gets_anonymous_read_only_gets_only(self):
         self.s.write_profile("verifier", {"credential_pool": {"custom:gpu": [
             {"id": "g1", "base_url": GPU + "/v1", "access_token": "sk-gpu-verifier-0004"}]}})
         self.transport.routes.update({GPU + "/metrics": raw_response(METRICS),
                                       GPU + "/v1/models": json_response({"data": []})})
         status, body = self.make().handle("health", [("view", "machine")])
         self.assertEqual(status, 200)
-        self.assertEqual(self.transport.urls(), [GPU + "/metrics"])
-        self.assertNotIn("Authorization", self.transport.requests[0][1])
+        # §13 item 3b (amended, card t_793f0ed6): the metrics scrape plus the read-only models listing, never the
+        # pool row's inline token
+        self.assertEqual(self.transport.urls(), [GPU + "/metrics", GPU + "/v1/models"])
+        for _url, headers, _t in self.transport.requests:
+            self.assertNotIn("Authorization", headers)
         self.assertEqual([e["status"] for e in body["data"]["entries"]], ["healthy"])
 
     # ------------------------------------------------------------------ (3) ephemeral credentials
