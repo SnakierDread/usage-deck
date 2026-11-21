@@ -33,8 +33,8 @@ FRONTEND_FILES = (
 )
 
 # Backend-owned canonical entries, copied only when present (backend merges separately).
-BACKEND_FILES = ("__init__.py", "plugin_api.py", "captures.py", "observer.py", "discovery.py", "service.py")
-BACKEND_DIRS = ("adapters", "models")
+BACKEND_FILES = ("__init__.py", "plugin_api.py", "captures.py", "observer.py", "discovery.py", "service.py", "pricing.py")
+BACKEND_DIRS = ("adapters", "models", "pricing_data")
 
 _SKIP_DIRS = {"__pycache__", "tests", ".pytest_cache", ".mypy_cache"}
 _SKIP_SUFFIXES = (".pyc", ".pyo")

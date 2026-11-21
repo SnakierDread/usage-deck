@@ -28,6 +28,10 @@ def _make_plugin(root: Path, backend: bool) -> Path:
         (p / "captures.py").write_text("c")
         (p / "observer.py").write_text("o")
         (p / "service.py").write_text("s")
+        (p / "pricing.py").write_text("pr")
+        (p / "pricing_data").mkdir()
+        (p / "pricing_data" / "aliases.json").write_text('{"schema_version":1,"aliases":{}}')
+        (p / "pricing_data" / "seed-v1.json").write_text('{"schema_version":1}')
         for d in ("adapters", "models"):
             (p / d).mkdir()
             (p / d / "__init__.py").write_text("")
@@ -59,6 +63,10 @@ class StageTests(unittest.TestCase):
         self.assertIn("captures.py", staged)
         self.assertIn("observer.py", staged)  # the opt-in agent observer ships with the plugin (DESIGN.md §12.1)
         self.assertIn("adapters/mod.py", staged)
+        # API-equivalent pricing (design §8.6): the module and its data assets ship, bytes unchanged.
+        for rel in ("pricing.py", "pricing_data/aliases.json", "pricing_data/seed-v1.json"):
+            self.assertIn(rel, staged)
+            self.assertEqual((p / "dashboard" / rel).read_bytes(), (p / rel).read_bytes())
         self.assertIn("models/__init__.py", staged)
         self.assertFalse(any("tests" in s or "__pycache__" in s or s.endswith(".pyc") for s in staged))
         self.assertEqual(sd.check(p, require_backend=True), [])
