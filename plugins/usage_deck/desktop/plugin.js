@@ -946,6 +946,8 @@ const DEPTH_FIELDS = ["durations", "duration_samples", "heatmap", "cache_metrics
 const DEPTH_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const DURATION_LABEL = "Completed session duration";
 const CACHE_LABEL = "Effective recorded $/Mtok (weighted diagnostic)";
+const VARIANT_LABEL = "spelling variant";
+const VARIANT_TIP = "Another row has this model id spelled with different punctuation. They are distinct exact ids and are not merged; open Details to compare them.";
 const CACHE_TIP = "Recorded cost divided by base-cache-weighted recorded counters. Reasoning may overlap output; not a tariff, invoice, or measured savings.";
 const CACHE_NOTE = "Recorded-cost basis: base-cache weighting of recorded counters. No prices are fetched and nothing here is a bill.";
 const HEAT_NOTE = "Each session is counted once, in the hour it started (never split across midnight or hours).";
@@ -1131,6 +1133,50 @@ function fmtCacheMoney(v) {
 function providerList(value) {
   const text = depthText(value);
   return text === null ? [] : text.split(",").filter(function (t) { return t.length > 0; });
+}
+
+/**
+ * Spelling variants (display only). Two model ids are variants of each other when they differ only in punctuation or
+ * spacing (letters and digits, case kept, are identical in the same order) yet are distinct verbatim ids. Nothing is
+ * merged, renamed or re-keyed: this only labels rows that would otherwise read as duplicates (`-5-5` vs `-5.5`).
+ */
+function idShape(id) {
+  const skeleton = [], gaps = [""];
+  Array.from(id).forEach(function (ch) {
+    if (/[\p{L}\p{N}]/u.test(ch)) { skeleton.push(ch); gaps.push(""); } else gaps[gaps.length - 1] += ch;
+  });
+  return { key: skeleton.join(""), gaps: gaps };
+}
+
+/** Parallel to `rows`: null for a plain row, else { siblings: [the other exact ids spelled the same apart from punctuation] }. */
+function spellingVariants(rows) {
+  const groups = Object.create(null);
+  const keys = rows.map(function (r) {
+    const id = r && typeof r === "object" ? depthText(r.model) : null;
+    const key = id === null ? "" : idShape(id).key;
+    if (key === "") return null;
+    if (!groups[key]) groups[key] = [];
+    if (groups[key].indexOf(id) < 0) groups[key].push(id);
+    return { key: key, id: id };
+  });
+  return keys.map(function (k) {
+    if (k === null || groups[k.key].length < 2) return null;
+    return { siblings: groups[k.key].filter(function (x) { return x !== k.id; }) };
+  });
+}
+
+/** `id` as [{text, diff}] runs; diff marks punctuation/spacing that is spelled differently in at least one of `others`. */
+function variantSegments(id, others) {
+  const mine = idShape(id), theirs = others.map(idShape), out = [];
+  let g = 0;
+  Array.from(id).forEach(function (ch) {
+    const word = /[\p{L}\p{N}]/u.test(ch);
+    const diff = !word && theirs.some(function (o) { return o.gaps[g] !== mine.gaps[g]; });
+    if (word) g += 1;
+    const last = out[out.length - 1];
+    if (last && last.diff === diff) last.text += ch; else out.push({ text: ch, diff: diff });
+  });
+  return out;
 }
 
 /** One cache-economics row for display. Reuses the backend numbers verbatim: no money is recomputed here. */
@@ -2382,6 +2428,30 @@ function HeatmapCard(props) {
   )
 }
 
+const VARIANT_TAG_STYLE = {
+  display: 'inline-block',
+  fontSize: '0.65rem',
+  lineHeight: 1,
+  fontWeight: 600,
+  padding: '0.15rem 0.4rem',
+  borderRadius: '999px',
+  border: '1px dashed currentColor',
+  color: TEXT_2,
+  whiteSpace: 'nowrap',
+  cursor: 'help'
+}
+const MODEL_ID_STYLE = { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace' }
+const MODEL_ID_DIFF_STYLE = { background: 'transparent', color: ACCENT, fontWeight: 700, outline: '1px solid currentColor', borderRadius: '2px' }
+
+// The exact id in monospace; a differing punctuation/spacing character is highlighted (and stays plain text).
+function idCode(id, others) {
+  return h(
+    'code',
+    { style: MODEL_ID_STYLE },
+    variantSegments(id, others).map((seg, k) => (seg.diff ? h('mark', { key: k, 'data-variant-diff': 'true', style: MODEL_ID_DIFF_STYLE }, seg.text) : seg.text))
+  )
+}
+
 // Cache economics per exact model id (recorded-cost basis); provider is a displayed attribute (resolved wins over Unknown): no top-N, no price fetch, no JS money.
 function CacheCard(props) {
   const dp = props.depth
@@ -2391,6 +2461,7 @@ function CacheCard(props) {
   }
 
   const cols = ['Model', 'Provider', 'Hit %', 'Cached input', 'Uncached input', 'Cache writes', 'Reasoning', 'Reasoning share', CACHE_LABEL, 'Details']
+  const variants = dp.cache === null ? [] : spellingVariants(dp.cache)
   let body
 
   if (dp.cache === null) {
@@ -2410,11 +2481,14 @@ function CacheCard(props) {
           null,
           dp.cache.map((r, i) => {
             const v = cacheRowView(r)
+            const sv = variants[i]
 
             return h(
               'tr',
               { key: i, 'data-cache-row': v.model + '|' + (v.provider || ''), 'data-cache-reason': v.reason || undefined },
-              h('td', { style: TD }, v.model),
+              sv === null
+                ? h('td', { style: TD }, v.model)
+                : h('td', { style: TD }, v.model, ' ', h('span', { 'data-variant-tag': 'true', title: VARIANT_TIP, style: VARIANT_TAG_STYLE }, VARIANT_LABEL)),
               h('td', { style: TD, 'data-field': 'provider_id' }, v.provider === null ? 'Unknown' : providerList(v.provider).map(function (id) { return providerLabelOf(props.providers, id); }).join(', ')),
               h('td', { 'data-field': 'hit_rate_pct', style: TD }, v.hit),
               h('td', { 'data-field': 'cached_input_tokens', style: TD }, v.cached),
@@ -2440,7 +2514,17 @@ function CacheCard(props) {
                     h('dt', { style: MUTED }, 'Rate snapshot'),
                     h('dd', { 'data-field': 'rate_source', style: { margin: 0 } }, v.rateSource),
                     v.reasonText ? h('dt', { style: MUTED }, 'Why a value is missing') : null,
-                    v.reasonText ? h('dd', { 'data-field': 'reason', style: { margin: 0 } }, v.reasonText) : null
+                    v.reasonText ? h('dd', { 'data-field': 'reason', style: { margin: 0 } }, v.reasonText) : null,
+                    sv === null ? null : h('dt', { 'data-variant-detail': 'true', style: MUTED }, 'Exact model id'),
+                    sv === null ? null : h('dd', { 'data-field': 'model_id_exact', 'data-variant-detail': 'true', style: { margin: 0 } }, idCode(v.model, sv.siblings)),
+                    sv === null ? null : h('dt', { 'data-variant-detail': 'true', style: MUTED }, 'Also recorded as'),
+                    sv === null
+                      ? null
+                      : h(
+                          'dd',
+                          { 'data-field': 'model_id_variants', 'data-variant-detail': 'true', style: { margin: 0 } },
+                          sv.siblings.map((sib, j) => h('div', { key: j }, idCode(sib, [v.model].concat(sv.siblings.filter(x => x !== sib)))))
+                        )
                   )
                 )
               )

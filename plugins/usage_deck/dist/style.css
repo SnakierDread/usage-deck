@@ -107,6 +107,7 @@
 .usage-deck .ud-badge-estimated { color: var(--ud-warn); border-style: dashed; }
 .usage-deck .ud-badge-opaque { color: var(--ud-muted); border-style: dotted; }
 .usage-deck .ud-badge-self_hosted { color: var(--ud-accent); border-style: double; border-width: 3px; padding: 0.1rem 0.4rem; }
+.usage-deck .ud-variant-tag { color: var(--ud-muted); border-style: dashed; font-size: 0.65rem; margin-left: 0.25rem; }
 .usage-deck .ud-kind { font-size: 0.7rem; color: var(--ud-muted); }
 .usage-deck .ud-stale {
   font-size: 0.7rem; font-weight: 600; padding: 0.1rem 0.4rem;
@@ -284,3 +285,5 @@
 .usage-deck .ud-cache-detail dl { margin: 0.3rem 0 0; text-align: left; }
 .usage-deck .ud-cache-detail dt { color: var(--ud-muted); }
 .usage-deck .ud-cache-detail dd { margin: 0 0 0.25rem; }
+.usage-deck .ud-model-id { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.usage-deck .ud-model-id-diff { background: transparent; color: var(--ud-accent); font-weight: 700; outline: 1px solid currentColor; border-radius: 2px; }

@@ -26,7 +26,7 @@ function helperBlock(file) {
 }
 
 const NAMES = "decodeDepth, fmtDuration, durationItems, localHeat, localCellOf, heatLevel, heatMax, heatCellLabel, heatDetail, " +
-  "localOffset, providerList, cacheRowView, depthStatusLine, repoRowFor, repoPathSummary, repoCoverage, DEPTH_DAYS, DEPTH_FIELDS";
+  "localOffset, providerList, idShape, spellingVariants, variantSegments, cacheRowView, depthStatusLine, repoRowFor, repoPathSummary, repoCoverage, DEPTH_DAYS, DEPTH_FIELDS";
 
 function load(source) {
   // Date is shared with this process on purpose: the helpers must honour the process (browser) zone.
@@ -410,4 +410,121 @@ test("By repo shows the Unscoped row as its own row and a '% of tokens attribute
   assert.equal(cap.dataset.repoCoverage, "75");
   assert.equal(txt(cap), "75.0% of tokens attributed to a repository (750 of 1,000 known tokens; 250 Unscoped)");
   await m.unmount();
+});
+
+// ------------------------------------------------------------------ spelling-variant tag (display only)
+
+const cacheRow = (model, provider_id, over) => Object.assign({ model, provider_id, cached_input_tokens: 10, uncached_input_tokens: 90,
+  cache_write_tokens: 0, reasoning_tokens: 0, output_tokens: 5, hit_rate_pct: 10, reasoning_share_pct: 0, effective_cost_per_mtok: 1.5,
+  discount_multiplier: 0.1, rate_source: null, reason: null }, over || {});
+
+async function cacheCard(cache) {
+  const m = await mount({ routes: routes((dim) => depthPayload(dim, { cache_metrics: cache })) });
+  await m.flush(0);
+  return { m, card: m.$("[data-depth-card=cache]") };
+}
+
+test("spellingVariants: punctuation/spacing-only differences pair up; everything else stays plain", () => {
+  const H = load(helperBlock("dist/index.js"));
+  const v = (...ids) => plain(H.spellingVariants(ids.map((model) => ({ model }))));
+  assert.deepEqual(v("claude-sonnet-5-5", "claude-sonnet-5.5"),
+    [{ siblings: ["claude-sonnet-5.5"] }, { siblings: ["claude-sonnet-5-5"] }]);
+  assert.deepEqual(v("gpt-6-luna", "claude-sonnet-5-5"), [null, null]);                    // plain pair
+  assert.deepEqual(v("alpha", "Alpha"), [null, null]);                                      // case is visible: not a spelling variant
+  assert.deepEqual(v("gpt-5", "gpt-50"), [null, null]);                                     // different letters/digits
+  assert.deepEqual(v("a b", "a-b", "a.b", "other"), [{ siblings: ["a-b", "a.b"] }, { siblings: ["a b", "a.b"] }, { siblings: ["a b", "a-b"] }, null]);
+  assert.deepEqual(v("---", "..."), [null, null]);                                          // no letters/digits: nothing to compare
+  assert.deepEqual(plain(H.spellingVariants([{ model: null }, { model: 7 }, null, {}])), [null, null, null, null]);
+  assert.deepEqual(v("constructor", "__proto__"), [null, null]);                            // keys are data, never object members
+  assert.deepEqual(v("x-1", "x-1"), [null, null]);                                          // the same exact id twice is not a variant
+});
+
+test("variantSegments highlights only the differing punctuation, and the runs rebuild the exact id", () => {
+  const H = load(helperBlock("dist/index.js"));
+  const seg = (id, others) => plain(H.variantSegments(id, others));
+  assert.deepEqual(seg("claude-sonnet-5.5", ["claude-sonnet-5-5"]), [
+    { text: "claude-sonnet-5", diff: false }, { text: ".", diff: true }, { text: "5", diff: false }]);
+  assert.deepEqual(seg("claude-sonnet-5-5", ["claude-sonnet-5.5"]).filter((s) => s.diff).map((s) => s.text), ["-"]);
+  // an inserted separator is the only thing highlighted; the id that lacks it has nothing to mark
+  assert.deepEqual(seg("a-b", ["ab"]), [{ text: "a", diff: false }, { text: "-", diff: true }, { text: "b", diff: false }]);
+  assert.deepEqual(seg("ab", ["a-b"]), [{ text: "ab", diff: false }]);
+  // the shared hyphens are not marked when only one gap differs
+  assert.deepEqual(seg("a-b-c", ["a-b.c"]).filter((s) => s.diff).map((s) => s.text), ["-"]);
+  for (const [id, others] of [["claude-sonnet-5.5", ["claude-sonnet-5-5"]], ["a b", ["a-b", "a.b"]], ["ünï-1", ["ünï.1"]]]) {
+    assert.equal(seg(id, others).map((s) => s.text).join(""), id);
+  }
+});
+
+test("cache table: normalized-equal ids are both tagged, with the exact id and the differing character in Details", async () => {
+  const { m, card } = await cacheCard([
+    cacheRow("claude-sonnet-5-5", "anthropic", { cached_input_tokens: 500 }),
+    cacheRow("claude-sonnet-5.5", null, { cached_input_tokens: 0 }),
+    cacheRow("gpt-6-luna", "openai"),
+  ]);
+  const rows = Array.from(card.querySelectorAll("[data-cache-row]"));
+  assert.deepEqual(rows.map((r) => r.dataset.cacheRow), ["claude-sonnet-5-5|anthropic", "claude-sonnet-5.5|", "gpt-6-luna|openai"]);  // keys verbatim
+  const tagged = rows.map((r) => r.querySelector("[data-variant-tag]") !== null);
+  assert.deepEqual(tagged, [true, true, false]);
+  assert.equal(txt(rows[0].querySelector("[data-variant-tag]")), "spelling variant");
+  assert.equal(txt(rows[0].cells[0]), "claude-sonnet-5-5 spelling variant");
+  assert.equal(txt(rows[2].cells[0]), "gpt-6-luna");
+  assert.ok(rows[2].querySelector("[data-variant-detail]") === null);
+  // Details: the exact id in <code>, only the differing character in <mark>; the other spelling is listed too
+  const exact = rows[1].querySelector("[data-field=model_id_exact]");
+  assert.equal(exact.querySelector("code").textContent, "claude-sonnet-5.5");
+  assert.deepEqual(Array.from(exact.querySelectorAll("mark")).map((x) => x.textContent), ["."]);
+  const other = rows[1].querySelector("[data-field=model_id_variants]");
+  assert.equal(other.querySelector("code").textContent, "claude-sonnet-5-5");
+  assert.deepEqual(Array.from(other.querySelectorAll("mark")).map((x) => x.textContent), ["-"]);
+  assert.deepEqual(Array.from(rows[0].querySelectorAll("[data-field=model_id_exact] mark")).map((x) => x.textContent), ["-"]);
+  await m.unmount();
+});
+
+test("cache table: a plain pair carries no tag and no variant Details", async () => {
+  const { m, card } = await cacheCard([cacheRow("alpha", "openai"), cacheRow("beta", "openai")]);
+  assert.ok(card.querySelector("[data-variant-tag]") === null);
+  assert.ok(card.querySelector("[data-variant-detail]") === null);
+  assert.ok(card.querySelector("code") === null && card.querySelector("mark") === null);
+  assert.doesNotMatch(txt(card), /spelling variant/);
+  await m.unmount();
+});
+
+test("cache table parity: the tag is display-only; keys, cells and data are what the plain path renders", async () => {
+  // Same numbers, spelling-variant ids vs unrelated ids: stripping the additions must leave identical markup.
+  // The only markup difference allowed is the tag/details and the separating space before the tag.
+  const strip = (tr) => {
+    const c = tr.cloneNode(true);
+    c.querySelectorAll("[data-variant-tag], [data-variant-detail]").forEach((n) => n.remove());
+    const id = tr.dataset.cacheRow.split("|")[0];
+    return c.outerHTML.split(id + " </td>").join(id + "</td>").split(id).join("ID");
+  };
+  const mk = (a, b) => [cacheRow(a, "anthropic", { cached_input_tokens: 500 }), cacheRow(b, null, { cached_input_tokens: 0, reason: "missing_usage" })];
+  const variant = await cacheCard(mk("claude-sonnet-5-5", "claude-sonnet-5.5"));
+  const plainPair = await cacheCard(mk("one", "two"));
+  const vRows = Array.from(variant.card.querySelectorAll("[data-cache-row]")), pRows = Array.from(plainPair.card.querySelectorAll("[data-cache-row]"));
+  assert.equal(vRows.length, 2);
+  for (let i = 0; i < 2; i++) assert.equal(strip(vRows[i]), strip(pRows[i]), "row " + i);
+  // the verbatim ids are untouched in keys and in the model cell's own text
+  assert.deepEqual(vRows.map((r) => r.dataset.cacheRow), ["claude-sonnet-5-5|anthropic", "claude-sonnet-5.5|"]);
+  assert.deepEqual(vRows.map((r) => r.cells[0].firstChild.textContent), ["claude-sonnet-5-5", "claude-sonnet-5.5"]);
+  // a pure row view is unchanged: no variant field leaks into cacheRowView
+  const H = load(helperBlock("dist/index.js"));
+  assert.deepEqual(Object.keys(plain(H.cacheRowView(cacheRow("claude-sonnet-5.5", null)))).sort(),
+    ["cached", "effective", "effectiveTitle", "hit", "model", "multiplier", "output", "provider", "rateSource", "reason", "reasonText", "reasoning", "share", "uncached", "writes"]);
+  assert.equal(H.cacheRowView(cacheRow("claude-sonnet-5.5", null)).model, "claude-sonnet-5.5");
+  await variant.m.unmount(); await plainPair.m.unmount();
+});
+
+test("both halves implement the spelling-variant tag over the one shared helper block", () => {
+  const dist = fs.readFileSync(path.join(ROOT, "dist/index.js"), "utf8"), desktop = fs.readFileSync(path.join(ROOT, "desktop/plugin.js"), "utf8");
+  for (const src of [dist, desktop]) {
+    assert.match(src, /spellingVariants\(dp\.cache\)/);
+    assert.match(src, /data-variant-tag/);
+    assert.match(src, /model_id_exact/);
+    assert.match(src, /data-variant-diff/);
+  }
+  assert.match(desktop, /monospace/);
+  assert.match(fs.readFileSync(path.join(ROOT, "dist/style.css"), "utf8"), /\.ud-model-id-diff/);
+  // the heading still keys rows by the verbatim id only
+  for (const src of [dist, desktop]) assert.match(src, /['"]data-cache-row['"]: v\.model \+ ['"]\|['"] \+ \(v\.provider \|\| ['"]['"]\)/);
 });
