@@ -477,5 +477,54 @@ class DtoAndSanitizerTests(unittest.TestCase):
             dto.usage_from_wire(bad)
 
 
+class RealResolverIntegrationTests(PricedBase):
+    """The service's DEFAULT wiring (``PricingCatalogManager`` + packaged seed + curated aliases): no injected double.
+
+    Expected amounts are recomputed here from the packaged seed's per-token rates with Decimal arithmetic.
+    """
+
+    CLOCK = lambda self: datetime(2026, 11, 21, 12, 0, 0, tzinfo=timezone.utc)  # noqa: E731 - seed is fresh then
+
+    def seed_expected(self, model, tokens_in, tokens_out):
+        from plugins.usage_deck import pricing
+
+        entry = pricing.load_seed().entries[pricing.load_aliases()[model].catalog_key]
+        total = Decimal(tokens_in) * entry.input_usd_per_token + Decimal(tokens_out) * entry.output_usd_per_token
+        return int((total * 10 ** 12).quantize(Decimal(1), rounding=ROUND_HALF_EVEN))
+
+    def write(self, sessions):
+        path = self.machine.home(None) / "state.db"
+        if path.exists():
+            path.unlink()
+        self.machine.write_db(None, sessions)
+
+    def test_default_wiring_prices_all_seven_inventory_models_and_conserves(self):
+        self.write(seven_sessions())
+        data = self.usage(self.service(pricing=False, clock=self.CLOCK), mode="machine", dimension="model", window=30)
+        rows = {r["model_id"]: r for r in data["rows"]}
+        self.assertEqual(sorted(rows), sorted(SEVEN))
+        total = 0
+        for i, model in enumerate(SEVEN):
+            want = self.seed_expected(model, 1_000_000 + i, 200_000 + 3 * i)
+            total += want
+            self.assertEqual(rows[model]["metrics"]["api_equivalent"]["amount_pico_usd"], str(want), model)
+            self.assertEqual(rows[model]["pricing"]["method"], "alias", model)
+            self.assertIsNone(rows[model]["pricing"]["reason"], model)
+        self.assertEqual(data["pricing"]["unknown_row_ids"], [])
+        self.assertEqual(data["totals"]["api_equivalent"]["amount_pico_usd"], str(total))
+        self.assertEqual(sum(int(g["totals"]["api_equivalent"]["amount_pico_usd"]) for g in data["groups"]), total)
+        self.assertEqual(data["totals"]["api_equivalent"]["proxy_rows"], 4)
+        self.assertIn(data["pricing"]["origin"], ("seed", "cache"))
+
+    def test_default_wiring_unknown_model_is_null_and_listed(self):
+        self.write(seven_sessions() + [S("sx", 9, "no-such-model-xyz", "custom:lane", None, 5000, 100, 0.0, 1, "custom:lane")])
+        data = self.usage(self.service(pricing=False, clock=self.CLOCK), mode="machine", dimension="all", window=30)
+        bad = [r for r in data["rows"] if r["model_id"] == "no-such-model-xyz"][0]
+        self.assertIsNone(bad["metrics"]["api_equivalent"]["amount_pico_usd"])
+        self.assertIsNone(bad["metrics"]["api_equivalent_usd"])
+        self.assertEqual(data["pricing"]["unknown_row_ids"], [bad["id"]])
+        self.assertTrue(data["totals"]["api_equivalent"]["partial"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -207,9 +207,9 @@ def _default_pricing(service: "UsageDeckService", source: Any) -> PricingInputs:
         manager = service._pricing_managers.get(str(data_dir))
         if manager is None:
             manager = pricing.PricingCatalogManager(
-                data_dir, clock=service._clock, random_uniform=random.uniform, fetch=pricing.fetch_bytes)
+                data_dir, clock=service._clock, random_uniform=random.uniform, fetch=pricing.default_fetch)
             service._pricing_managers[str(data_dir)] = manager
-    return PricingInputs(manager.snapshot(), pricing.load_aliases(), pricing.resolve_api_equivalent)
+    return PricingInputs(manager.snapshot(), manager.aliases(), pricing.resolve_api_equivalent)
 
 
 def _default_captures(source: Any) -> CaptureStore:
