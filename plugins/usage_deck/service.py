@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import contextvars
 import copy
+import hashlib
+import json
 import logging
+import random
 import re
 import threading
 import time
@@ -18,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .adapters import create_adapter
 from .adapters.analytics import HostAnalyticsReader, MemoAnalyticsReader
@@ -61,6 +64,8 @@ from .models.dto import (
     DebugInfo,
     DeckError,
     HealthStripEntry,
+    PricingInfo,
+    PRICING_WARNINGS,
     SubscriptionCard,
     build_meta,
     check_envelope,
@@ -169,6 +174,44 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 
 
+@dataclass(frozen=True)
+class PricingInputs:
+    """One frozen view of the pricing resolver for a single analytics response (design §7): the immutable
+    catalog snapshot, the alias map and the pure ``resolve_api_equivalent`` callable (or a test double)."""
+
+    catalog: Any  # pricing.CatalogSnapshot: revision / origin / warnings
+    aliases: Mapping[str, Any]
+    resolve: Callable[..., Any]
+
+
+def alias_digest(aliases: Mapping[str, Any]) -> str:
+    """Digest of the alias map contents (response-cache identity: an alias edit never serves an old total)."""
+    items = sorted((str(k), getattr(a, "catalog_key", None), getattr(a, "kind", None), getattr(a, "note", None))
+                   for k, a in aliases.items())
+    return hashlib.sha256(json.dumps(items, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+_UNAVAILABLE_REVISION = hashlib.sha256(b"usage-deck:pricing-unavailable").hexdigest()
+
+
+def _default_pricing(service: "UsageDeckService", source: Any) -> PricingInputs:
+    """Resolver backend bound to the inventory's validated root: seed + overlay cache under
+    ``<root>/plugin-data/usage-deck``; never a request-supplied path, never another root."""
+    from . import pricing  # resolver module (design §6); imported lazily so a broken module degrades to unpriced
+
+    root_of = getattr(source, "root_dir", None)
+    if not callable(root_of):
+        return PricingInputs(pricing.load_seed(), pricing.load_aliases(), pricing.resolve_api_equivalent)
+    data_dir = Path(root_of()) / "plugin-data" / "usage-deck"
+    with service._guard:
+        manager = service._pricing_managers.get(str(data_dir))
+        if manager is None:
+            manager = pricing.PricingCatalogManager(
+                data_dir, clock=service._clock, random_uniform=random.uniform, fetch=pricing.fetch_bytes)
+            service._pricing_managers[str(data_dir)] = manager
+    return PricingInputs(manager.snapshot(), pricing.load_aliases(), pricing.resolve_api_equivalent)
+
+
 def _default_captures(source: Any) -> CaptureStore:
     """Read-only header captures next to the Hermes root; absent file = no captures."""
     path_of = getattr(source, "captures_path", None)
@@ -196,10 +239,14 @@ class UsageDeckService:
         deadline: float = REFRESH_DEADLINE_S,
         token_resolver: Any = None,
         session_reader_factory: Optional[Callable[[], SessionDbReader]] = None,
+        pricing_factory: Optional[Callable[[Any], PricingInputs]] = None,
     ):
         self._inventory_factory = inventory_factory or host_inventory_source
         # Read-only state.db reader for the dimensions payload (tests inject one with a SQL trace).
         self._session_reader_factory = session_reader_factory or SessionDbReader
+        # API-equivalent resolver inputs (catalog snapshot + aliases + resolve); tests inject a double.
+        self._pricing_factory = pricing_factory or (lambda source: _default_pricing(self, source))
+        self._pricing_managers: Dict[str, Any] = {}
         # §9.1.1: the Anthropic bearer is resolved through core's credential pool (refreshing an expiring row);
         # one resolver per service so its failure backoff outlives a single snapshot.
         self._token_resolver = token_resolver if token_resolver is not None else default_resolver()
@@ -334,10 +381,21 @@ class UsageDeckService:
         dimension = query.dimension if (mode == "machine" or query.dimension != "profile") else "all"
         homes, truncated, rejected = self._scope_homes(source, query, mode)
         catalog = tuple((name, is_global, catalog_identity(directory)) for name, is_global, directory in homes)
+        priced = self._pricing(source)  # frozen once: this request prices every leaf against one snapshot
+        price_id = (priced.catalog.revision, alias_digest(priced.aliases)) if priced else (_UNAVAILABLE_REVISION, "")
         key = (self._source_key(source), query.profile or "", "usage", mode, dimension, query.window, query.provider,
-               catalog, truncated, tuple(rejected[0]), rejected[1])
-        data, errors = self._cached(key, lambda: self._compute_usage(query, mode, dimension, homes, truncated, rejected))
+               catalog, truncated, tuple(rejected[0]), rejected[1], price_id)
+        data, errors = self._cached(
+            key, lambda: self._compute_usage(query, mode, dimension, homes, truncated, rejected, priced))
         return self._ok(data, errors, USAGE_SCHEMA_VERSION)
+
+    def _pricing(self, source: Any) -> Optional[PricingInputs]:
+        """The resolver inputs, or None when the resolver cannot load (every row then reads honestly as unpriced)."""
+        try:
+            return self._pricing_factory(source)
+        except Exception as exc:  # noqa: BLE001 - pricing is an annotation; it must never take usage down
+            log.warning("usage_deck pricing unavailable: %s", type(exc).__name__)
+            return None
 
     @staticmethod
     def _scope_homes(source: Any, query: Query, mode: str):
@@ -365,7 +423,7 @@ class UsageDeckService:
         return [(query.profile, False, root / "profiles" / query.profile)], False, ([], False)
 
     def _compute_usage(self, query: Query, mode: str, dimension: str, homes: list, truncated: bool,
-                       rejected: tuple) -> Tuple[dict, List[dict]]:
+                       rejected: tuple, priced: Optional[PricingInputs] = None) -> Tuple[dict, List[dict]]:
         now = self._clock()  # one frozen clock for every DB, group and timestamp of this response
         cutoff = now.timestamp() - query.window * 86400
         reads = self._session_reader_factory().read_homes(homes, cutoff)
@@ -400,6 +458,9 @@ class UsageDeckService:
             if bad or wanted is None or wanted not in dims.known_provider_ids(rows_all, reads):
                 raise ApiError(404, "provider_not_found")
         rows = dims.filter_rows(rows_all, wanted)
+        if priced is not None:  # price each authorized, filtered leaf once; groups/series/totals only sum these
+            rows = dims.annotate_rows(rows, lambda model, tokens_in, tokens_out: priced.resolve(
+                model, tokens_in, tokens_out, catalog=priced.catalog, aliases=priced.aliases, now=now))
         row_metrics = sum_metrics(r.metrics for r in rows)
         override_all = None
         if override is not None:
@@ -417,6 +478,14 @@ class UsageDeckService:
         part = dims.partition(rows, dimension, mode, query.window, now, wanted, label_of, override_all)
         has_data = bool(override.points) if override is not None else bool(rows)
         reason = "source_unavailable" if incomplete else (None if has_data else "no_observations")
+        totals_dto = dims.metrics_dto(totals, rows)
+        warnings = {w for w in (getattr(priced.catalog, "warnings", ()) if priced else ("pricing_seed_invalid",))
+                    if w in PRICING_WARNINGS}
+        if totals_dto.api_equivalent.stale:
+            warnings.add("pricing_stale")
+        pricing_info = PricingInfo(
+            priced.catalog.revision if priced else _UNAVAILABLE_REVISION,
+            priced.catalog.origin if priced else "seed", tuple(sorted(warnings)), dims.unknown_row_ids(rows))
         data = {
             "window_days": query.window,
             "mode": mode,
@@ -425,13 +494,14 @@ class UsageDeckService:
             "series": [to_plain(s) for s in part.series],
             "groups": [to_plain(g) for g in part.groups],
             "rows": [to_plain(dims.row_dto(r)) for r in rows],
-            "totals": to_plain(dims.metrics_dto(totals)),
+            "totals": to_plain(totals_dto),
             "providers": [{"id": pid, "label": label} for pid, label
                           in dims.provider_options(rows_all, reads, wanted, label_of)],
             "sources": [{"profile": n, "is_global": g, "state": s} for n, g, s in sources],
             "complete": not incomplete,
             "top_n": TOP_N_MODELS if dimension == "model" else None,
             "reason": reason,
+            "pricing": to_plain(pricing_info),
         }
         errors = [to_plain(make_error("analytics_unavailable"))] if incomplete else []
         return data, errors

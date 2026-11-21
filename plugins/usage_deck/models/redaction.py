@@ -24,7 +24,7 @@ import math
 import re
 from typing import AbstractSet, Any, Iterable, Optional
 
-from .dto import WIRE_KEYS, preserves_wire_value
+from .dto import NON_SECRET_WIRE_NAMES, WIRE_KEYS, preserves_wire_value
 
 REDACTED = "[REDACTED]"
 
@@ -54,6 +54,8 @@ class RedactionError(TypeError):
 
 
 def is_sensitive_name(name: Any) -> bool:
+    if name in NON_SECRET_WIRE_NAMES:
+        return False  # public wire vocabulary that merely contains a fragment (``catalog_key``)
     lowered = str(name).lower()
     return any(fragment in lowered for fragment in SENSITIVE_FRAGMENTS)
 

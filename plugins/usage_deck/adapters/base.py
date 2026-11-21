@@ -11,6 +11,8 @@ from typing import Any, Callable, Dict, FrozenSet, Optional, Protocol, Tuple
 
 from ..captures import CaptureStore, CredentialRef
 from ..models.dto import (
+    EMPTY_API_EQUIVALENT,
+    ApiEquivalent,
     DeckError,
     HealthStripEntry,
     ProbeResult,
@@ -58,6 +60,9 @@ class AnalyticsDay:
     estimated_usd: Optional[float]
     sessions: Optional[int]
     api_calls: Optional[int]
+    #: Pricing annotation of this day (session-provenance leaves only; the host reader never sets it).
+    api_equivalent_usd: Optional[float] = None
+    api_equivalent: ApiEquivalent = EMPTY_API_EQUIVALENT
 
 
 class AnalyticsUnavailable(Exception):

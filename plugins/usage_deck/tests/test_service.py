@@ -329,7 +329,7 @@ class UsageTests(ServiceBase):
         self.assertEqual([p["day"] for p in s["points"]], ["2026-11-05", "2026-11-06"])
         self.assertEqual(s["points"][1]["input_count"], 0)
         self.assertEqual(set(s["points"][0]), {"day", "input_count", "output_count", "estimated_usd", "sessions",
-                                               "api_calls", "confidence"})
+                                               "api_calls", "confidence", "api_equivalent_usd", "api_equivalent"})
         self.assertEqual(self.analytics.calls, [7])
 
     def test_default_window_is_30(self):

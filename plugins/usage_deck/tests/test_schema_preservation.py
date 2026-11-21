@@ -28,14 +28,21 @@ METER_KEYS = {"id", "label", "value", "limit", "remaining", "unit", "scope", "pe
 PERIOD_KEYS = {"start", "end", "label"}
 ERROR_KEYS = {"code", "message", "retryable", "provider_id", "account_id"}
 DEBUG_KEYS = {"adapter", "capabilities", "source", "sanitized"}
-POINT_KEYS = {"day", "input_count", "output_count", "estimated_usd", "sessions", "api_calls", "confidence"}
+POINT_KEYS = {"day", "input_count", "output_count", "estimated_usd", "sessions", "api_calls", "confidence",
+              "api_equivalent_usd", "api_equivalent"}
 SERIES_KEYS = {"id", "provider_id", "account_id", "scope", "confidence", "source", "period", "window_days",
                "bucket", "timezone", "coverage", "points", "checked_at", "stale", "error"}
 # Usage v2 (analytics-dimensions-breakdown §4): exact key sets, deliberately independent of dto.py.
 USAGE_KEYS = {"window_days", "mode", "dimension", "provider_id", "series", "groups", "rows", "totals", "providers",
-              "sources", "complete", "top_n", "reason"}
-METRICS_KEYS = {"input_count", "output_count", "estimated_usd", "sessions", "api_calls", "missing_fields"}
-ROW_KEYS = {"id", "day", "profile", "is_global", "source", "model_id", "provider_id", "attribution_source", "metrics"}
+              "sources", "complete", "top_n", "reason", "pricing"}
+METRICS_KEYS = {"input_count", "output_count", "estimated_usd", "sessions", "api_calls", "missing_fields",
+                "api_equivalent_usd", "api_equivalent"}
+# API-equivalent pricing annotation (docs/design/api-equivalent-pricing.md §7), independent of dto.py.
+API_EQUIVALENT_KEYS = {"amount_pico_usd", "priced_rows", "unpriced_rows", "proxy_rows", "partial", "stale"}
+ROW_PRICING_KEYS = {"catalog_key", "method", "alias_kind", "note", "reason", "source", "fetched_at", "stale"}
+DATA_PRICING_KEYS = {"catalog_revision", "origin", "warnings", "unknown_row_ids"}
+ROW_KEYS = {"id", "day", "profile", "is_global", "source", "model_id", "provider_id", "attribution_source", "metrics",
+            "pricing"}
 GROUP_KEYS = {"id", "label", "series_id", "model_id", "provider_ids", "profiles", "row_ids", "totals", "is_other"}
 SOURCE_KEYS = {"profile", "is_global", "state"}
 PROVIDER_KEYS = {"id", "label"}
@@ -126,10 +133,23 @@ class SchemaAsserts(unittest.TestCase):
             self.assertEqual(set(p), POINT_KEYS)
             self.assertRegex(p["day"], r"^\d{4}-\d{2}-\d{2}$")
             self.assertIn(p["confidence"], ENUMS["confidence"])
+            self.assert_exact_api_equivalent(p)
         for k in ("scope", "confidence", "source", "bucket", "timezone", "coverage"):
             self.assertIn(s[k], ENUMS[k], k)
         self.assertRegex(s["period"]["label"], r"^rolling_(7|30|90)d$")
         check_wire("series", s)
+
+    def assert_exact_api_equivalent(self, m):
+        """``api_equivalent_usd`` is a finite nonnegative number or null; the summary is exactly six fields."""
+        usd, api = m["api_equivalent_usd"], m["api_equivalent"]
+        self.assertTrue(usd is None or (isinstance(usd, (int, float)) and not isinstance(usd, bool) and usd >= 0))
+        self.assertEqual(set(api), API_EQUIVALENT_KEYS)
+        self.assertTrue(api["amount_pico_usd"] is None or re.match(r"^(0|[1-9][0-9]*)$", api["amount_pico_usd"]))
+        self.assertEqual(usd is None, api["amount_pico_usd"] is None)
+        for k in ("priced_rows", "unpriced_rows", "proxy_rows"):
+            self.assertTrue(type(api[k]) is int and api[k] >= 0, k)
+        self.assertIs(api["partial"], api["unpriced_rows"] > 0)
+        self.assertIsInstance(api["stale"], bool)
 
     def assert_exact_metrics(self, m):
         self.assertEqual(set(m), METRICS_KEYS)
@@ -138,11 +158,19 @@ class SchemaAsserts(unittest.TestCase):
         self.assertTrue(m["estimated_usd"] is None or (isinstance(m["estimated_usd"], (int, float)) and m["estimated_usd"] >= 0))
         self.assertEqual(m["missing_fields"], sorted(set(m["missing_fields"])))
         self.assertTrue(set(m["missing_fields"]) <= {"input_count", "output_count", "estimated_usd", "sessions", "api_calls"})
+        self.assert_exact_api_equivalent(m)
 
     def assert_exact_usage_objects(self, data):
         self.assert_exact_metrics(data["totals"])
+        self.assertEqual(set(data["pricing"]), DATA_PRICING_KEYS)
+        self.assertRegex(data["pricing"]["catalog_revision"], r"^[0-9a-f]{64}$")
+        self.assertIn(data["pricing"]["origin"], ("seed", "cache", "network"))
+        self.assertEqual(data["pricing"]["unknown_row_ids"],
+                         sorted(r["id"] for r in data["rows"] if r["metrics"]["api_equivalent"]["amount_pico_usd"] is None))
         for r in data["rows"]:
             self.assertEqual(set(r), ROW_KEYS)
+            self.assertEqual(set(r["pricing"]), ROW_PRICING_KEYS)
+            self.assertIn(r["pricing"]["method"], ("alias", "heuristic", "none"))
             self.assertRegex(r["id"], r"^row_[0-9a-f]{64}$")
             self.assertEqual(r["source"], "state.db")
             self.assertIn(r["attribution_source"], ("session_provider", "billing_provider", "models_json", "unknown"))
@@ -225,7 +253,7 @@ class SanitizeSchemaTests(unittest.TestCase):
     def test_wire_keys_cover_contract_and_none_are_sensitive(self):
         contract = (CARD_KEYS | METER_KEYS | PERIOD_KEYS | ERROR_KEYS | DEBUG_KEYS | POINT_KEYS | SERIES_KEYS
                     | HEALTH_KEYS | META_KEYS | HOLDER_KEYS | METRICS_KEYS | ROW_KEYS | GROUP_KEYS | SOURCE_KEYS
-                    | PROVIDER_KEYS | USAGE_KEYS
+                    | PROVIDER_KEYS | USAGE_KEYS | API_EQUIVALENT_KEYS | ROW_PRICING_KEYS | DATA_PRICING_KEYS
                     | {"ok", "data", "error", "meta", "cards", "inventory_state", "view",
                        "entries", "window_days", "series", "reason", "provider_id"})
         self.assertEqual(set(dto.WIRE_KEYS), contract)
