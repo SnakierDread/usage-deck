@@ -235,12 +235,28 @@ class HeatmapServiceTests(DepthServiceBase):
         self.assertEqual(data["heatmap"]["starts"], [{"started_at": utc(2026, 11, 5, 23, 59), "sessions": 1, "total_tokens": 42}])
 
 
+def luna_table(cache_read=None):
+    """The packaged table where openrouter prices ``gpt-6-luna`` exactly like openai does (the fixture routes
+    this model through both, and a merged per-model row needs every resolved provider priced to weight it)."""
+    doc = json.loads((depth.PACKAGE_DATA / depth.RATE_FILE).read_bytes())
+    clone = None
+    for entry in doc["entries"]:
+        if (entry["provider_id"], entry["model"]) == ("openai", "gpt-6-luna"):
+            if cache_read is not None:
+                entry["cache_read_cost_per_million"] = cache_read
+            clone = dict(entry, provider_id="openrouter")
+    doc["entries"].append(clone)
+    return depth.parse_rate_table(json.dumps(doc).encode())
+
+
 class PartialSourceTests(DepthServiceBase):
     def test_unreadable_home_is_disclosed_and_the_rest_is_conserved(self):
         broken = self.m.home("c")
         broken.mkdir(parents=True)
         (broken / "state.db").write_bytes(b"this is not a sqlite database at all" * 20)
-        data = self.get([("mode", "machine"), ("dimension", "all")])
+        svc = self.m.service()
+        svc._depth_rates_factory = luna_table  # one model fully priced, so incomplete_source is the first reason
+        data = self.get([("mode", "machine"), ("dimension", "all")], svc=svc)
         self.assertIs(data["complete"], False)
         self.assertIn("unavailable", {s["state"] for s in data["sources"]})
         self.assertIs(data["depth_status"]["partial"], True)
@@ -256,6 +272,7 @@ class PartialSourceTests(DepthServiceBase):
             self.assertIsNotNone(row["reason"])
         self.assertTrue(any(r["reason"] == "incomplete_source" for r in data["cache_metrics"]))
         self.assertEqual([c["uncached_input_tokens"] for c in data["cache_metrics"] if c["model"] == "m-01"], [100])
+        self.assertEqual(len({r["model"] for r in data["cache_metrics"]}), len(data["cache_metrics"]))  # one row per model
 
     def test_only_unreadable_homes_make_every_depth_member_null(self):
         m = Machine(self)
@@ -496,22 +513,23 @@ class ParityRegressionTests(DepthServiceBase):
 
 class CacheIdentityTests(DepthServiceBase):
     def table(self, cache_read):
-        doc = json.loads((depth.PACKAGE_DATA / depth.RATE_FILE).read_bytes())
-        for entry in doc["entries"]:
-            if (entry["provider_id"], entry["model"]) == ("openai", "gpt-6-luna"):
-                entry["cache_read_cost_per_million"] = cache_read
-        return depth.parse_rate_table(json.dumps(doc).encode())
+        return luna_table(cache_read)
+
+    @staticmethod
+    def luna(data):
+        rows = [r for r in data["cache_metrics"] if r["model"] == "gpt-6-luna"]
+        assert len(rows) == 1, "one row per model id"
+        return rows[0]
 
     def test_a_changed_rate_snapshot_never_serves_a_cached_answer(self):
         current = [self.table("0.01")]
         svc = self.m.service()
         svc._depth_rates_factory = lambda: current[0]
-        def luna(data):
-            return [r for r in data["cache_metrics"] if (r["model"], r["provider_id"]) == ("gpt-6-luna", "openai")][0]
-        first = luna(self.get([("mode", "machine"), ("dimension", "all")], svc=svc))
+        first = self.luna(self.get([("mode", "machine"), ("dimension", "all")], svc=svc))
         current[0] = self.table("0.05")
-        second = luna(self.get([("mode", "machine"), ("dimension", "all")], svc=svc))  # inside the response TTL
+        second = self.luna(self.get([("mode", "machine"), ("dimension", "all")], svc=svc))  # inside the response TTL
         self.assertEqual((first["discount_multiplier"], second["discount_multiplier"]), (0.1, 0.5))
+        self.assertEqual(first["provider_id"], "openai,openrouter")  # one row; both resolved providers listed
 
     def test_unavailable_rate_file_degrades_to_unknown_discounts_not_errors(self):
         svc = self.m.service()
@@ -519,16 +537,21 @@ class CacheIdentityTests(DepthServiceBase):
             raise depth.RateTableError("gone")
         svc._depth_rates_factory = boom
         data = self.get([("mode", "machine"), ("dimension", "all")], svc=svc)
-        rows = {(r["model"], r["provider_id"]): r for r in data["cache_metrics"]}
-        luna = rows[("gpt-6-luna", "openai")]
+        luna = self.luna(data)
         self.assertEqual((luna["discount_multiplier"], luna["rate_source"]), (None, None))
         self.assertEqual(data["depth_totals"]["sessions"], len(spec_window(self.all_specs(), 30)))
 
     def test_default_service_loads_the_packaged_table(self):
         data = self.get([("mode", "machine"), ("dimension", "all")])
-        luna = [r for r in data["cache_metrics"] if (r["model"], r["provider_id"]) == ("gpt-6-luna", "openai")][0]
-        self.assertEqual((luna["discount_multiplier"], luna["rate_source"]), (0.1, "openai-gpt-6-tiers-2026-09"))
+        luna = self.luna(data)
+        # packaged table: openai prices gpt-6-luna, openrouter does not -> the merged row has no single tariff
+        self.assertEqual((luna["provider_id"], luna["discount_multiplier"], luna["rate_source"], luna["reason"]),
+                         ("openai,openrouter", None, None, "unknown_discount"))
         self.assertTrue(any(r["rate_source"] is None for r in data["cache_metrics"]))  # unknown routes stay unknown
+        svc = self.m.service()
+        svc._depth_rates_factory = luna_table
+        priced = self.luna(self.get([("mode", "machine"), ("dimension", "all")], svc=svc))
+        self.assertEqual((priced["discount_multiplier"], priced["rate_source"]), (0.1, "openai-gpt-6-tiers-2026-09"))
 
 
 class DecoderTests(DepthServiceBase):

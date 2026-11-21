@@ -42,7 +42,7 @@ from ..models.dto import (
 )
 from ..models.redaction import contains_secret, scrub_string
 from .analytics import _count
-from .session_db import STATE_ABSENT, STATE_OK, HomeRead, RawFact, attribute, safe_model_id
+from .session_db import STATE_ABSENT, STATE_OK, UNKNOWN, HomeRead, RawFact, attribute, safe_model_id
 
 RATE_FILE = "cache-discounts-v1.json"
 PACKAGE_DATA = Path(__file__).resolve().parent.parent / "pricing_data"
@@ -449,25 +449,51 @@ def build_repo_rollup(facts: Sequence[SessionFact]) -> Tuple[RepoRow, ...]:
 # ------------------------------------------------------------------ model rollup and cache economics
 
 
-def _pair_order(pair: Tuple[Optional[str], Optional[str]]) -> tuple:
-    model, provider = pair
-    return (model is not None, model or "", provider is not None, provider or "")
+MAX_PROVIDER_LABEL = 128  # wire bound of ``provider_id`` on the per-model rows
 
 
-def _by_pair(facts: Sequence[SessionFact]) -> Dict[Tuple[Optional[str], Optional[str]], List[SessionFact]]:
-    out: Dict[Tuple[Optional[str], Optional[str]], List[SessionFact]] = {}
+def _model_order(model: Optional[str]) -> tuple:
+    return (model is not None, model or "")
+
+
+def _by_model(facts: Sequence[SessionFact]) -> Dict[Optional[str], List[SessionFact]]:
+    """Per-model grouping key: the exact model id ONLY. Provider attribution is sparse at the source, so it is a
+    displayed attribute of the group (``provider_label``), never part of the key."""
+    out: Dict[Optional[str], List[SessionFact]] = {}
     for fact in facts:
-        out.setdefault((fact.model, fact.provider), []).append(fact)
+        out.setdefault(fact.model, []).append(fact)
     return out
+
+
+def resolved_providers(members: Iterable[SessionFact]) -> Tuple[str, ...]:
+    """Sorted distinct providers that some session of the group resolved (``unknown`` is not a resolution)."""
+    return tuple(sorted({f.provider for f in members if f.provider != UNKNOWN}))
+
+
+def provider_label(members: Iterable[SessionFact]) -> str:
+    """Provider shown on a per-model row. Precedence: every resolved provider wins over Unknown, and differing
+    resolved providers are all listed (comma, sorted) in the ONE row; ``unknown`` only when no session resolves.
+    A list that would overflow the wire bound is cut at a provider boundary and ends with ``+N more``."""
+    resolved = resolved_providers(members)
+    if not resolved:
+        return UNKNOWN
+    label = ",".join(resolved)
+    if len(label) <= MAX_PROVIDER_LABEL:
+        return label
+    for keep in range(len(resolved) - 1, 0, -1):
+        label = ",".join(resolved[:keep]) + f",+{len(resolved) - keep} more"
+        if len(label) <= MAX_PROVIDER_LABEL:
+            return label
+    return resolved[0][:MAX_PROVIDER_LABEL]
 
 
 def build_model_rollup(facts: Sequence[SessionFact]) -> Tuple[ModelRow, ...]:
     rows = []
-    for pair, members in sorted(_by_pair(facts).items(), key=lambda kv: _pair_order(kv[0])):
+    for model, members in sorted(_by_model(facts).items(), key=lambda kv: _model_order(kv[0])):
         acc = _Acc()
         for fact in members:
             acc.add(fact)
-        rows.append(ModelRow(pair[0], pair[1], acc.sessions, acc.tokens, _float(acc.cost)))
+        rows.append(ModelRow(model, provider_label(members), acc.sessions, acc.tokens, _float(acc.cost)))
     return tuple(rows)
 
 
@@ -475,16 +501,52 @@ def _share(numerator: int, denominator: int) -> float:
     return float(Fraction(100 * numerator, denominator))
 
 
-def cache_row(model: Optional[str], provider: Optional[str], members: Sequence[SessionFact],
+def _tariffs(members: Sequence[SessionFact], model: Optional[str], rates: RateTable
+             ) -> Tuple[Dict[str, Optional[Decimal]], Optional[Decimal], Optional[str]]:
+    """``(discount per resolved provider, shared discount, shared rate source)`` of one per-model group.
+
+    The tariff is looked up for each RESOLVED provider of the group (exact provider/model row, no guessing).
+    The shared discount exists only when every resolved provider has a row and they all agree; it is then the
+    displayed multiplier and also covers the group's unresolved sessions (same exact model id: the resolved
+    attribution wins over Unknown). The shared source is the one pinned snapshot version when every resolved
+    provider has a row and they agree on it."""
+    found = {p: rates.lookup(p, model) for p in resolved_providers(members)}
+    per_provider = {p: (r.discount if r is not None else None) for p, r in found.items()}
+    versions = {r.pricing_version for r in found.values() if r is not None}
+    source = next(iter(versions)) if len(versions) == 1 and all(r is not None for r in found.values()) else None
+    distinct = set(per_provider.values())
+    shared = next(iter(distinct)) if len(distinct) == 1 and None not in distinct else None
+    return per_provider, shared, source
+
+
+def _cache_weight(members: Sequence[SessionFact], per_provider: Dict[str, Optional[Decimal]],
+                  shared: Optional[Decimal]) -> Optional[Decimal]:
+    """Sum of cache reads x discount, or None when a session that read from cache has no defensible tariff
+    (a missing tariff is irrelevant for sessions that provably read nothing). With no shared discount each
+    resolved session uses its own provider's; an unresolved one has none. Reads must all be recorded."""
+    if shared is not None:
+        return Decimal(sum(f.cache_read_tokens or 0 for f in members)) * shared
+    weight = Decimal(0)
+    for f in members:
+        read = f.cache_read_tokens or 0
+        if read == 0:
+            continue
+        d = per_provider.get(f.provider)
+        if d is None:
+            return None
+        weight += Decimal(read) * d
+    return weight
+
+
+def cache_row(model: Optional[str], members: Sequence[SessionFact],
               rates: RateTable, source_incomplete: bool) -> CacheRow:
-    """Cache economics of one exact model/provider pair (design §5). Every ratio is computed from raw sums."""
+    """Cache economics of one exact model id over all its sessions (design §5). Every ratio is computed from raw
+    sums of the merged group, never an average of per-provider ratios."""
     inp = known_sum(f.input_tokens for f in members)
     out = known_sum(f.output_tokens for f in members)
     reasoning = known_sum(f.reasoning_tokens for f in members)
     write = known_sum(f.cache_write_tokens for f in members)
     read = known_sum(f.cache_read_tokens for f in members)
-    rate = rates.lookup(provider, model)
-    d = rate.discount if rate is not None else None
 
     def complete(*names: str) -> bool:
         return all(getattr(f, n) is not None for f in members for n in names)
@@ -505,16 +567,12 @@ def cache_row(model: Optional[str], provider: Optional[str], members: Sequence[S
             and all(f.reasoning_tokens <= f.output_tokens for f in members):  # type: ignore[operator]
         share = _share(reasoning or 0, out or 0)
 
+    per_provider, d, rate_source = _tariffs(members, model, rates)  # the multiplier needs no usage
+    cached_weight = _cache_weight(members, per_provider, d) if usage_known else None
     effective: Optional[float] = None
     weighted: Optional[Decimal] = None
     unknown_discount = False
     if usage_known:
-        if d is not None:
-            cached_weight: Optional[Decimal] = Decimal(read or 0) * d
-        elif (read or 0) == 0:
-            cached_weight = Decimal(0)  # provably no cache contribution: the missing tariff is irrelevant
-        else:
-            cached_weight, unknown_discount = None, True
         if cached_weight is not None:
             weighted = Decimal((inp or 0) + (out or 0) + (reasoning or 0) + (write or 0)) + cached_weight
             if cost_known and weighted > 0 and not source_incomplete:
@@ -522,6 +580,8 @@ def cache_row(model: Optional[str], provider: Optional[str], members: Sequence[S
                 with localcontext() as ctx:
                     ctx.prec = 60
                     effective = float(_MILLION * total_cost / weighted)
+        else:
+            unknown_discount = True
 
     reason = None
     zero_denominator = (hit_denominator == 0) or (weighted is not None and weighted == 0)
@@ -532,16 +592,15 @@ def cache_row(model: Optional[str], provider: Optional[str], members: Sequence[S
             reason = code
             break
     return CacheRow(
-        model=model, provider_id=provider, hit_rate_pct=hit_rate, cached_input_tokens=read,
+        model=model, provider_id=provider_label(members), hit_rate_pct=hit_rate, cached_input_tokens=read,
         uncached_input_tokens=inp, reasoning_tokens=reasoning, effective_cost_per_mtok=effective,
         cache_write_tokens=write, output_tokens=out, reasoning_share_pct=share,
-        discount_multiplier=_float(d), rate_source=rate.pricing_version if rate is not None else None,
-        reason=reason)
+        discount_multiplier=_float(d), rate_source=rate_source, reason=reason)
 
 
 def build_cache_metrics(facts: Sequence[SessionFact], rates: RateTable, source_incomplete: bool) -> Tuple[CacheRow, ...]:
-    return tuple(cache_row(m, p, members, rates, source_incomplete)
-                 for (m, p), members in sorted(_by_pair(facts).items(), key=lambda kv: _pair_order(kv[0])))
+    return tuple(cache_row(m, members, rates, source_incomplete)
+                 for m, members in sorted(_by_model(facts).items(), key=lambda kv: _model_order(kv[0])))
 
 
 # ------------------------------------------------------------------ the whole thing
@@ -583,7 +642,7 @@ def assert_conserved(totals: DepthTotals, repos: Sequence[RepoRow], models: Sequ
     want_cost = known_sum(f.cost for f in facts)
     if totals.sessions != len(facts):
         raise DepthInvariantError("depth_totals.sessions != fact count")
-    for name, keyed in (("repo_rollup", _by_repo(facts)), ("model_rollup", _by_pair(facts))):
+    for name, keyed in (("repo_rollup", _by_repo(facts)), ("model_rollup", _by_model(facts))):
         grouped = known_sum(known_sum(f.cost for f in members) for members in keyed.values())
         if grouped != want_cost or sum(len(m) for m in keyed.values()) != len(facts):
             raise DepthInvariantError(f"{name}: facts are not partitioned exactly once")

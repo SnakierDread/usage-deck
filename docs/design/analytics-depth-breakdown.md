@@ -35,9 +35,9 @@ Extend the v2 DTO encoder, decoder, sanitizer and strict key allowlists **togeth
 | `durations` | `DurationStats | null`, all filtered authorized sessions |
 | `duration_samples` | nonnegative integer or null, number of valid finished durations |
 | `heatmap` | `Heatmap | null`, same filtered session set |
-| `cache_metrics` | `CacheRow[] | null`, every exact model/provider pair, no top-N |
+| `cache_metrics` | `CacheRow[] | null`, one row per exact model id (provider is a displayed attribute, §5.1), no top-N |
 | `repo_rollup` | `RepoRow[] | null`, every basename plus Unscoped |
-| `model_rollup` | `ModelRow[] | null`, every exact model/provider pair, no top-N; conservation reference |
+| `model_rollup` | `ModelRow[] | null`, one row per exact model id (provider label as §5.1), no top-N; conservation reference |
 | `depth_totals` | `DepthTotals | null`, conservation grand total |
 | `depth_status` | `DepthStatus | null`, source and missing-observation disclosure |
 
@@ -99,12 +99,12 @@ Test fixed epochs using `zoneinfo`/browser TZ overrides; do not approximate DST 
 
 `CacheRow` has exactly these keys:
 
-- `model`, `provider_id`: exact attributed pair, nullable; sorted deterministically null-first then lexical model/provider.
+- `model`, `provider_id`: exact model id (nullable) and its displayed provider label (§5.1); sorted deterministically null-first then lexical model.
 - `hit_rate_pct`, `cached_input_tokens`, `uncached_input_tokens`, `reasoning_tokens`, `effective_cost_per_mtok`: the required nullable numerical fields.
 - `cache_write_tokens`, `output_tokens`, `reasoning_share_pct`, `discount_multiplier`: nullable diagnostics.
 - `rate_source`: snapshot pricing_version string or null; `reason`: null or `missing_usage`, `missing_cost`, `unknown_discount`, `zero_denominator`, `incomplete_source` (first applicable in that order).
 
-No Other: list all model/provider pairs in a scrollable table. Raw aggregate token fields are known-only sums with missing counters disclosed. Ratios are computed from raw records, never average session percentages or average model rates. For a pair with any missing required operand in its included population, the affected ratio is null. For a partially unreadable authorized population, display known raw subtotals but ratios are null with `incomplete_source` unless an earlier field-level reason applies.
+No Other: list every model in a scrollable table. Raw aggregate token fields are known-only sums with missing counters disclosed. Ratios are computed from raw records, never average session percentages or average model rates. For a model with any missing required operand in its included population, the affected ratio is null. For a partially unreadable authorized population, display known raw subtotals but ratios are null with `incomplete_source` unless an earlier field-level reason applies.
 
 Core normalizes uncached input separately: `normalize_usage` subtracts cache read/write from OpenAI prompt totals but uses Anthropic uncached input directly (`usage_pricing.py:667–674`). Session counters are already recorded canonical values: **do not subtract cache reads a second time**. Naming: I=input_tokens (uncached), O=output_tokens, R=reasoning_tokens, W=cache_write_tokens, C=cache_read_tokens, K=recorded estimated_cost_usd.
 
@@ -115,7 +115,7 @@ Core normalizes uncached input separately: `normalize_usage` subtracts cache rea
 
 Package `pricing_data/cache-discounts-v1.json` as `{core_commit, entries}` with entries `{provider_id, model, pricing_version, input_cost_per_million, cache_read_cost_per_million}`; rates are decimal strings or null. Expand core tuple aliases into **explicit exact model entries** at build time from `_SNAPSHOTS`, including both missing and zero cache-rate cases. Preserve the source snapshot provider string as provider_id; use the same normalized attribution identifier as the existing provider resolver. No fuzzy matching, stripping provider prefixes, inference from API-equivalent alias proxies, current catalog lookups, or independent JS rates. If attribution yields a provider absent from the snapshot, discount is unknown, not a guessed cross-provider tariff. Include the core pin and snapshot digest in documentation/fixture tests; update deliberately when semantics change. Tier/request fees and provider overrides are not reconstructible from aggregate session rows; this diagnostic is explicitly **base-snapshot cache weighting**, not a reconstructed invoice.
 
-For a model/provider pair:
+For a model (all its sessions, §5.1):
 
 ```
 D_tokens = sum(I + O + R + W + C*d)
@@ -125,6 +125,16 @@ effective_cost_per_mtok = 1_000_000 * sum(K) / D_tokens
 Use Decimal for rates, money sums and denominator, no intermediate cent rounding. Require complete I/O/R/W/C and recorded K for every included session; otherwise effective rate=null (do not divide known costs by a larger incomplete population). If d is unknown but **all C are explicitly zero**, the cache contribution is provably zero: compute D without it while exposing discount_multiplier=null. If any C>0 and d unknown, effective rate=null/unknown_discount. Denominator zero -> null even with K=0. Nonzero denominator and fully recorded zero cost -> numeric 0; label “recorded-cost basis”, not “free public API”. Discount multiplier itself remains available even when usage is missing.
 
 Core's cost loop bills I/O/C/W and **does not bill R separately** (`usage_pricing.py:741–755`, R:31–38). D4 explicitly includes R anyway; follow that denominator but label the value **Effective recorded $/Mtok (weighted diagnostic)** with tooltip: “Recorded cost divided by base-cache-weighted recorded counters. Reasoning may overlap output; not a tariff, invoice, or measured savings.” Do not modify core pricing or add a reasoning charge. Cache-write tokens have weight 1 in D4 despite a 1.25x write tariff; no secret adjustment.
+
+### 5.1 Grouping key and provider precedence (t_e364e654)
+
+Provider attribution is sparse at the source (`sessions.provider` is null almost everywhere; `billing_provider` fills only part), so keying on (model, attributed provider) listed one model twice: its real provider and `unknown`. Per-model tables (`cache_metrics`, `model_rollup`) therefore group by the **exact model id only**; `provider_id` is a displayed attribute of the one row:
+
+- Every session whose attribution resolved (`session_provider`, `billing_provider`, `models_json`) contributes its provider; the label is the sorted distinct resolved providers joined by `,` (provider ids never contain a comma). Resolved wins over Unknown: `unknown` is shown only when **no** session of the model resolved, never beside a resolved label.
+- A label that would exceed the 128-character wire bound is cut at a provider boundary and ends with `+N more`.
+- Attribution inputs are unchanged (exact model ids, same `attribute()` precedence, read-only). The legacy `all/profile/model` row ids and counters are untouched.
+- Conservation: raw sums (cache read/write, uncached input, output, reasoning, cost) of the merged row equal the sums of the former per-provider rows; hit rate, reasoning share and effective $/Mtok are recomputed from the merged numerators/denominators, never averaged.
+- Tariff of a merged row: each RESOLVED provider is looked up exactly as before. If every resolved provider has a row and they agree on one discount, that discount is the row's `discount_multiplier` and also weights the model's unresolved sessions (same exact model id). If they disagree, no single multiplier is shown (`null`); each resolved session keeps its own provider's discount, and any session that read from cache without a defensible tariff (unresolved, or a resolved provider with no row) makes the effective rate null with `unknown_discount`. A resolved provider absent from the snapshot is still unknown, never a cross-provider guess. Merging can therefore turn a previously numeric per-provider effective rate into `unknown_discount` when a sibling provider of the same model has no tariff; the raw sums stay exact.
 
 ### Worked example — normative test vector
 

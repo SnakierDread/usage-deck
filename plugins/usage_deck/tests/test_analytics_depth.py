@@ -413,12 +413,13 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(row.reasoning_tokens, 150_000)  # raw counter retained, never clamped to 100
         self.assertIsNotNone(row.effective_cost_per_mtok)
 
-    def test_pairs_are_exact_ids_sorted_null_first_no_other(self):
+    def test_rows_are_exact_model_ids_sorted_null_first_no_other(self):
         raws = [rf(model=m, provider=p) for m, p in (("zz", "openai"), (None, "openai"), ("aa", "openai"),
                                                     ("aa", "anthropic"), (None, "unknown"))]
         rows = depth.build_cache_metrics(facts_of(*raws)[0], depth.load_rate_table(), False)
+        # grouped by model id only (t_e364e654): provider is an attribute, so a model is one row
         self.assertEqual([(r.model, r.provider_id) for r in rows],
-                         [(None, "openai"), (None, "unknown"), ("aa", "anthropic"), ("aa", "openai"), ("zz", "openai")])
+                         [(None, "openai"), ("aa", "anthropic,openai"), ("zz", "openai")])
 
     def test_no_network_and_no_core_import(self):
         before = set(os.sys.modules)
@@ -656,12 +657,12 @@ class ConservationTests(DepthServiceBase):
     def test_exact_recorded_model_ids_and_multiple_providers_per_model(self):
         data = self.get([("mode", "machine"), ("dimension", "all")])
         pairs = {(r["model"], r["provider_id"]) for r in data["model_rollup"]}
-        self.assertIn(("claude-sonnet-5.5", "anthropic"), pairs)
+        # per-model rows (t_e364e654): the exact id is the only key; resolved providers are listed in the one row
+        self.assertIn(("claude-sonnet-5.5", "anthropic,nous"), pairs)  # anthropic + billing_provider nous
         self.assertIn(("Claude-Sonnet-5.5", "anthropic"), pairs)       # case is part of the exact id
-        self.assertIn(("gpt-6-luna", "openai"), pairs)
-        self.assertIn(("gpt-6-luna", "openrouter"), pairs)             # one model, two providers: two rows
-        self.assertIn(("claude-sonnet-5.5", "nous"), pairs)            # attributed through billing_provider
+        self.assertIn(("gpt-6-luna", "openai,openrouter"), pairs)      # one model, two providers: ONE row
         self.assertIn((None, "unknown"), pairs)                        # honest unknown group
+        self.assertEqual(len({m for m, _ in pairs}), len(pairs))       # no model id appears twice
         cache_pairs = {(r["model"], r["provider_id"]) for r in data["cache_metrics"]}
         self.assertEqual(cache_pairs, pairs)                           # every pair, no top-N
         self.assertEqual([(r["model"], r["provider_id"]) for r in data["cache_metrics"]],
@@ -673,15 +674,19 @@ class ConservationTests(DepthServiceBase):
         # same observation set: nothing mutates the fixture between the reads
         self.assertEqual(machine["depth_totals"]["sessions"], sum(d["depth_totals"]["sessions"] for d in per_home.values()))
         self.assertEqual(machine["depth_totals"]["total_tokens"], known(d["depth_totals"]["total_tokens"] for d in per_home.values()))
-        merged = {}
+        merged, providers = {}, {}
         for d in per_home.values():
             for r in d["model_rollup"]:
-                acc = merged.setdefault((r["model"], r["provider_id"]), [0, None])
+                acc = merged.setdefault(r["model"], [0, None])
                 acc[0] += r["sessions"]
                 if r["total_tokens"] is not None:
                     acc[1] = (acc[1] or 0) + r["total_tokens"]
-        self.assertEqual({(r["model"], r["provider_id"]): [r["sessions"], r["total_tokens"]] for r in machine["model_rollup"]},
-                         merged)
+                found = providers.setdefault(r["model"], set())
+                found.update(p for p in r["provider_id"].split(",") if p != "unknown")
+        self.assertEqual({r["model"]: [r["sessions"], r["total_tokens"]] for r in machine["model_rollup"]}, merged)
+        # the machine row's provider is the sorted union of what each home resolved (Unknown only if none did)
+        self.assertEqual({r["model"]: r["provider_id"] for r in machine["model_rollup"]},
+                         {m: ",".join(sorted(p)) or "unknown" for m, p in providers.items()})
         starts = {}
         for d in per_home.values():
             for s in d["heatmap"]["starts"]:
