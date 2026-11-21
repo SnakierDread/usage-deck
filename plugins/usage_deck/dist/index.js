@@ -840,6 +840,31 @@ function repoPathSummary(r) {
   if (paths.length === 0) return { count: 0, text: null, paths: [] };
   return { count: paths.length, text: paths.length === 1 ? paths[0] : paths.length + " paths", paths: paths };
 }
+
+/**
+ * Attribution coverage of the repository rollup: the share of KNOWN tokens that belong to a real repository (every
+ * row except the missing/Unscoped one, which is the empty-path row labelled "Unscoped"). Null when no token count
+ * is known. The percentage is floored to one decimal, so only a fully attributed rollup reads 100.0%.
+ */
+function repoCoverage(rollup) {
+  if (!Array.isArray(rollup)) return null;
+  let attributed = 0, unscoped = 0, known = false;
+  rollup.forEach(function (r) {
+    const n = r && typeof r === "object" ? depthCount(r.total_tokens) : null;
+    if (n === null) return;
+    known = true;
+    const missing = r.repo_basename === "Unscoped" && r.full_path === null && Array.isArray(r.full_paths) && r.full_paths.length === 0;
+    if (missing) unscoped += n; else attributed += n;
+  });
+  const total = attributed + unscoped;
+  if (!known || total <= 0) return null;
+  const pct = Math.floor(attributed * 1000 / total) / 10;
+  return {
+    attributed: attributed, unscoped: unscoped, total: total, pct: pct,
+    text: pct.toFixed(1) + "% of tokens attributed to a repository (" + depthGroup(attributed) + " of " + depthGroup(total) +
+      " known tokens; " + depthGroup(unscoped) + " Unscoped)",
+  };
+}
 // </depth-helpers>
 
   function scopeCopy(mode) {
@@ -1804,6 +1829,7 @@ function repoPathSummary(r) {
       const noun = byRepo ? "repository" : byProfile ? "profile" : "model";
       const depthInfo = d.depth || null;
       const repoOf = function (v) { return byRepo && depthInfo && depthInfo.repos ? repoPathSummary(repoRowFor(v.group, depthInfo.repos)) : null; };
+      const coverage = byRepo && depthInfo && depthInfo.repos ? repoCoverage(depthInfo.repos) : null;
       const tokenLines = [], spendLines = [];
       visible.forEach(function (v) {
         const pts = sortedByDay(v.series.points);
@@ -1850,6 +1876,7 @@ function repoPathSummary(r) {
                 h(MetricCell, { metrics: t, field: "sessions" }),
                 h(MetricCell, { metrics: t, field: "api_calls" }));
             })))),
+        byRepo && coverage ? h("p", { className: "ud-muted ud-small", "data-repo-coverage": String(coverage.pct) }, coverage.text) : null,
         h(GroupDurations, { views: views, depth: depthInfo }),
         byRepo ? h(RepoPaths, { views: views, depth: depthInfo }) : null,
         h("details", { className: "ud-table-wrap", "data-grouped-rows": "true", open: undefined },

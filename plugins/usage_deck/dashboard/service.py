@@ -31,6 +31,7 @@ from .adapters.credentials import default_resolver
 from .adapters import dimensions as dims
 from .adapters import analytics_depth as depth
 from .adapters.fallback import SessionAnalyticsAdapter
+from .adapters.repo_attribution import RepoResolver
 from .adapters.session_db import (
     STATE_ABSENT,
     STATE_EXCLUDED,
@@ -389,10 +390,14 @@ class UsageDeckService:
         priced = self._pricing(source)  # frozen once: this request prices every leaf against one snapshot
         price_id = (priced.catalog.revision, alias_digest(priced.aliases)) if priced else (_UNAVAILABLE_REVISION, "")
         rates = self._depth_rates()  # frozen once per request, like the pricing snapshot
+        root_of = getattr(source, "root_dir", None)
+        # Rule 2 of the repo attribution reads ONLY the request-scoped root's boards (never another home's).
+        kanban_dir = Path(root_of()) / "kanban" if callable(root_of) else None
         key = (self._source_key(source), query.profile or "", "usage", mode, dimension, query.window, query.provider,
                catalog, truncated, tuple(rejected[0]), rejected[1], price_id, rates.digest)
         data, errors = self._cached(
-            key, lambda: self._compute_usage(query, mode, dimension, homes, truncated, rejected, priced, rates))
+            key, lambda: self._compute_usage(query, mode, dimension, homes, truncated, rejected, priced, rates,
+                                             kanban_dir))
         return self._ok(data, errors, USAGE_SCHEMA_VERSION)
 
     def _pricing(self, source: Any) -> Optional[PricingInputs]:
@@ -430,7 +435,8 @@ class UsageDeckService:
 
     def _compute_usage(self, query: Query, mode: str, dimension: str, homes: list, truncated: bool,
                        rejected: tuple, priced: Optional[PricingInputs] = None,
-                       rates: Optional["depth.RateTable"] = None) -> Tuple[dict, List[dict]]:
+                       rates: Optional["depth.RateTable"] = None,
+                       kanban_dir: Optional[Path] = None) -> Tuple[dict, List[dict]]:
         rates = rates if rates is not None else self._depth_rates()
         now = self._clock()  # one frozen clock for every DB, group and timestamp of this response
         cutoff = now.timestamp() - query.window * 86400
@@ -467,7 +473,7 @@ class UsageDeckService:
                 raise ApiError(404, "provider_not_found")
         # The depth projection is scoped with the SAME home set, window predicate, attribution and provider
         # predicate as the counters above: every dimension sees one identical authorized session set.
-        all_facts, scan = depth.facts_from_reads(reads)
+        all_facts, scan = depth.facts_from_reads(reads, RepoResolver(kanban_dir))
         facts = depth.filter_facts(all_facts, (lambda p: provider_matches(p, wanted)) if wanted else (lambda p: True))
         if dimension == "repo":
             # The repository view is built from the facts: a home whose projection failed cannot be shown.

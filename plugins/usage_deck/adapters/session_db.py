@@ -246,6 +246,8 @@ class RawFact:
     cache_write_tokens: Any
     reasoning_tokens: Any
     api_calls: Any
+    #: Session working directory (input of the by-repo fallback attribution, ``repo_attribution``); NULL when absent.
+    cwd: Any = None
 
 
 @dataclass(frozen=True)
@@ -375,7 +377,7 @@ class SessionDbReader:
     #: Projected session columns besides ``started_at``; one that the database lacks projects SQL NULL.
     FACT_COLUMNS = ("ended_at", "last_activity_at", "model", "provider", "billing_provider", "git_repo_root",
                     "input_tokens", "output_tokens", "estimated_cost_usd", "cache_read_tokens",
-                    "cache_write_tokens", "reasoning_tokens", "api_call_count")
+                    "cache_write_tokens", "reasoning_tokens", "api_call_count", "cwd")
 
     @classmethod
     def _query_facts(cls, conn: sqlite3.Connection, columns: set, cutoff: float) -> HomeFacts:

@@ -172,6 +172,27 @@ known_sum(repo_rollup.total_cost) == known_sum(model_rollup.total_cost) == depth
 
 `known_sum` returns null on an all-null/empty known population; zero sessions in successful empty scope is the explicit structural exception. Empty synthetic Unscoped contributes no token/cost observations. Assert integer equality, null equivalence, and Decimal money equality before JSON float conversion (wire tolerance <=1e-12 USD). With a failed home, the invariant holds on the same observed subset and `partial=true`; never imply completeness. Hidden chart legend entries are presentation only and do not alter API totals. Compare existing input/output/sessions against old model totals on complete fixtures as an extra guard. Do not sum cost labels, group percentiles, percentages, or top-N without Other.
 
+### 6.1 Deriving the repository root when the core records none (t_ff59364f)
+
+The core never populates `sessions.git_repo_root` (NULL on 1,537 of 1,539 sessions machine-wide), so a by-repo view that trusts only that column is one `Unscoped` row. The plugin therefore derives a repository **root path** per session, at aggregation time, in `adapters/repo_attribution.py`. The lexical basename rules above are unchanged and apply to whatever root a rule returns; only the *source* of the root widens (so the "no stat" sentence above now covers key derivation, not the lookup below, which is stat-only). First rule that yields a root wins:
+
+| # | Rule | Input | Result |
+|---|------|-------|--------|
+| P1 | recorded | `sessions.git_repo_root`, non-blank text | that value (future-proof: wins as soon as the core records it) |
+| P2 | kanban | `cwd` = `<root>/kanban/boards/<slug>/workspaces/<task>[/..]` of an enumerated board | the board's repository: `board.json` `default_workdir`, else the most common root among the board's `dir`/`worktree` tasks in its `kanban.db` |
+| P2 | kanban worktree | `cwd` below `<repo>/.worktrees/` for the repository of ANY enumerated board | `<repo>` |
+| P3 | cwd | nearest ancestor of `cwd` (itself included) holding a `.git` entry | that ancestor |
+| - | none | anything else (no/relative/odd cwd, no `.git` above) | `Unscoped` (`repo:null`) |
+
+Constraints (each pinned by `tests/test_repo_attribution.py`):
+
+- **Per session, no persistence.** Resolution runs in `make_fact` for every session of every request; nothing is stored, no derived column exists, results are memoized only inside one request (one stat per directory).
+- **Read-only (C3).** Only `<request-scoped root>/kanban/boards/*` is enumerated; a session can never point the reader at another path or another home's boards. Each `kanban.db` opens through `open_uri` (`mode=ro`, or `immutable=1` for an idle WAL store with no sidecars) plus `PRAGMA query_only`; only `PRAGMA`/`BEGIN`/`SELECT` run. `board.json` is read with `O_NOFOLLOW`, size-capped; board names must match a slug pattern and may not be symlinks. A board that cannot be read is skipped, never fatal.
+- **P3 is `lstat(<dir>/.git)` only.** No git binary, no file read, no directory listing, at most 64 ancestors.
+- **Unscoped stays explicit.** It is always its own row/group, last, never folded into an Other (D2). The UI states `X% of tokens attributed to a repository` beneath the by-repo table: attributed = known tokens of every row except the empty-path Unscoped row (a literal repository named "Unscoped" counts as attributed), floored to one decimal, no caption when no token count is known.
+- **Conservation (C1).** Attribution only re-labels sessions; every dimension still sums over the same session set, so the §6 identities hold unchanged.
+- **Known limits.** A worktree of a repository no board lists resolves by P3 to the worktree directory's own name; sessions with `cwd=/` or a home directory without `.git` are `Unscoped` (honestly: that is most of the interactive volume today).
+
 ## 7. UI placement and half parity (D5)
 
 Preserve current analytics controls, totals, charts and daily tables in order and appearance. Dimension control order: All / By profile / By model / **By repo** for machine mode; All / By model / **By repo** for bound profile mode (do not expose other profiles). Reuse current provider/window selectors; changing either refreshes all additions. Repo names appear in the existing grouped chart/table machinery, with nullable full-path detail below the label and expandable collision paths. Adapt labels to “Repositories”; do not fork/rewrite chart plotting algorithms.

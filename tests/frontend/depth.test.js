@@ -26,7 +26,7 @@ function helperBlock(file) {
 }
 
 const NAMES = "decodeDepth, fmtDuration, durationItems, localHeat, localCellOf, heatLevel, heatMax, heatCellLabel, heatDetail, " +
-  "localOffset, providerList, cacheRowView, depthStatusLine, repoRowFor, repoPathSummary, DEPTH_DAYS, DEPTH_FIELDS";
+  "localOffset, providerList, cacheRowView, depthStatusLine, repoRowFor, repoPathSummary, repoCoverage, DEPTH_DAYS, DEPTH_FIELDS";
 
 function load(source) {
   // Date is shared with this process on purpose: the helpers must honour the process (browser) zone.
@@ -371,5 +371,43 @@ test("read-only: viewing the depth cards and toggling issues only GETs", async (
   await m.click(m.$("[data-dimension=repo]"));
   await m.flush(0);
   assert.ok(m.calls.every((u) => typeof u === "string" && u.startsWith(B + "/")));
+  await m.unmount();
+});
+
+// ------------------------------------------------------------------ attribution coverage (t_ff59364f, C4)
+
+test("repoCoverage: attributed share of known tokens, Unscoped is the empty-path row only, floored to one decimal", () => {
+  const H = load(helperBlock("dist/index.js"));
+  const row = (name, paths, tokens) => ({ repo_basename: name, full_path: paths.length === 1 ? paths[0] : null, full_paths: paths,
+    sessions: 1, total_tokens: tokens, total_cost: null });
+  const roll = [row("deck", ["/w/deck"], 7500), row("Unscoped", ["/srv/Unscoped"], 500), row("Unscoped", [], 2000)];
+  const c = plain(H.repoCoverage(roll));
+  assert.deepEqual([c.attributed, c.unscoped, c.total, c.pct], [8000, 2000, 10000, 80]);  // the literal repo counts as attributed
+  assert.equal(c.text, "80.0% of tokens attributed to a repository (8,000 of 10,000 known tokens; 2,000 Unscoped)");
+  assert.equal(H.repoCoverage([row("deck", ["/w/deck"], 3), row("Unscoped", [], 997)]).pct, 0.3);
+  assert.equal(H.repoCoverage([row("deck", ["/w/deck"], 2999), row("Unscoped", [], 1)]).pct, 99.9);  // floored: 100.0 only when complete
+  assert.equal(H.repoCoverage([row("deck", ["/w/deck"], 5)]).pct, 100);
+  assert.equal(H.repoCoverage([row("Unscoped", [], 5)]).pct, 0);
+  // unknown token counts are skipped, never zero-filled; nothing known -> no caption
+  assert.equal(H.repoCoverage([row("deck", ["/w/deck"], null), row("Unscoped", [], null)]), null);
+  assert.equal(H.repoCoverage([row("Unscoped", [], 0)]), null);
+  assert.equal(H.repoCoverage(null), null);
+  assert.equal(H.repoCoverage([null, "x", row("deck", ["/w/deck"], null), row("Unscoped", [], 10)]).pct, 0);
+});
+
+test("By repo shows the Unscoped row as its own row and a '% of tokens attributed' caption; other dimensions show none", async () => {
+  const roll = [
+    { repo_basename: "deck", full_path: "/w/deck", full_paths: ["/w/deck"], sessions: 3, total_tokens: 750, total_cost: null },
+    { repo_basename: "Unscoped", full_path: null, full_paths: [], sessions: 1, total_tokens: 250, total_cost: null },
+  ];
+  const m = await mount({ routes: routes((dim) => depthPayload(dim, dim === "repo" ? { repo_rollup: roll } : {})) });
+  await m.flush(0);
+  assert.ok(m.$("[data-repo-coverage]") === null);  // dimension all
+  await m.click(m.$("[data-dimension=repo]"));
+  await m.flush(0);
+  const cap = m.$("[data-repo-coverage]");
+  assert.ok(cap !== null);
+  assert.equal(cap.dataset.repoCoverage, "75");
+  assert.equal(txt(cap), "75.0% of tokens attributed to a repository (750 of 1,000 known tokens; 250 Unscoped)");
   await m.unmount();
 });

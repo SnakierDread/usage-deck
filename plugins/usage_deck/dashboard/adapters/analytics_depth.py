@@ -42,6 +42,7 @@ from ..models.dto import (
 )
 from ..models.redaction import contains_secret, scrub_string
 from .analytics import _count
+from .repo_attribution import SOURCE_NONE, SOURCE_RECORDED, RepoResolver
 from .session_db import STATE_ABSENT, STATE_OK, UNKNOWN, HomeRead, RawFact, attribute, safe_model_id
 
 RATE_FILE = "cache-discounts-v1.json"
@@ -187,6 +188,7 @@ class SessionFact:
     cost: Optional[Decimal]
     api_calls: Optional[int]
     absent: FrozenSet[str] = frozenset()  # projected columns the owning database lacks
+    repo_source: str = "unscoped"  # which attribution rule produced ``repo_root`` (repo_attribution.SOURCES)
 
     @property
     def total_tokens(self) -> Optional[int]:
@@ -245,25 +247,35 @@ def _cost(value: Any) -> Optional[Decimal]:
     return Decimal(value) if value >= 0 else None
 
 
-def make_fact(raw: RawFact, read: HomeRead, absent: FrozenSet[str]) -> Optional[SessionFact]:
-    """Validate and attribute one raw row; None when its start cannot bucket (counted by the caller)."""
+def make_fact(raw: RawFact, read: HomeRead, absent: FrozenSet[str],
+              repo_resolver: Optional[RepoResolver] = None) -> Optional[SessionFact]:
+    """Validate and attribute one raw row; None when its start cannot bucket (counted by the caller).
+
+    The repository is resolved HERE, per session, by ``repo_resolver`` (precedence recorded > kanban > cwd >
+    Unscoped, see ``repo_attribution``). Without a resolver only the recorded root counts (no filesystem access)."""
     started = valid_epoch(raw.started_at)
     if started is None or not isinstance(raw.day, str):
         return None
     model = safe_model_id(raw.model)
     provider, source = attribute(model, raw.provider, raw.billing, read.models)
     ended = valid_epoch(raw.ended_at)
+    if repo_resolver is not None:
+        repo_root, repo_source = repo_resolver.resolve(raw.repo_root, getattr(raw, "cwd", None))
+    else:
+        repo_root = raw.repo_root if isinstance(raw.repo_root, str) else None
+        repo_source = SOURCE_RECORDED if repo_key(repo_root) is not None else SOURCE_NONE
     return SessionFact(
         holder=(read.is_global, read.profile), day=raw.day, started_at=started, ended_at=ended,
         model=model, provider=provider, attribution=source,
-        repo_root=raw.repo_root if isinstance(raw.repo_root, str) else None,
+        repo_root=repo_root,
         input_tokens=_count(raw.input_tokens), output_tokens=_count(raw.output_tokens),
         cache_read_tokens=_count(raw.cache_read_tokens), cache_write_tokens=_count(raw.cache_write_tokens),
         reasoning_tokens=_count(raw.reasoning_tokens), cost=_cost(raw.cost), api_calls=_count(raw.api_calls),
-        absent=absent)
+        absent=absent, repo_source=repo_source)
 
 
-def facts_from_reads(reads: Iterable[HomeRead]) -> Tuple[Tuple[SessionFact, ...], FactScan]:
+def facts_from_reads(reads: Iterable[HomeRead],
+                     repo_resolver: Optional[RepoResolver] = None) -> Tuple[Tuple[SessionFact, ...], FactScan]:
     """Every authorized home's facts (unfiltered) plus what the scan covered."""
     facts: List[SessionFact] = []
     scanned = unavailable = excluded = 0
@@ -276,7 +288,7 @@ def facts_from_reads(reads: Iterable[HomeRead]) -> Tuple[Tuple[SessionFact, ...]
             continue
         scanned += 1
         for raw in read.facts.rows:
-            fact = make_fact(raw, read, read.facts.absent)
+            fact = make_fact(raw, read, read.facts.absent, repo_resolver)
             if fact is None:
                 excluded += 1
             else:
