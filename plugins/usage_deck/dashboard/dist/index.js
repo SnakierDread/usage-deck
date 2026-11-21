@@ -782,6 +782,12 @@ function fmtCacheMoney(v) {
   return n === null ? "\u2014" : "$" + n.toFixed(4);
 }
 
+/** Provider labels of one per-model row: the backend lists every resolved provider comma-separated (ids never contain a comma). */
+function providerList(value) {
+  const text = depthText(value);
+  return text === null ? [] : text.split(",").filter(function (t) { return t.length > 0; });
+}
+
 /** One cache-economics row for display. Reuses the backend numbers verbatim: no money is recomputed here. */
 function cacheRowView(r) {
   const eff = depthNum(r.effective_cost_per_mtok);
@@ -1567,7 +1573,7 @@ function repoPathSummary(r) {
         depthStatusLine(dp.status) ? h("p", { className: "ud-muted ud-small", "data-depth-status": "true" }, depthStatusLine(dp.status)) : null);
     }
 
-    /** Cache economics per exact model/provider pair (recorded-cost basis): no top-N, no price fetch, no JS money. */
+    /** Cache economics per exact model id (recorded-cost basis); provider is a displayed attribute (resolved wins over Unknown): no top-N, no price fetch, no JS money. */
     function CacheCard(props) {
       const dp = props.depth;
       if (!dp || !dp.supported) return null;
@@ -1587,7 +1593,7 @@ function repoPathSummary(r) {
               const v = cacheRowView(r);
               return h("tr", { key: i, "data-cache-row": v.model + "|" + (v.provider || ""), "data-cache-reason": v.reason || undefined },
                 h("td", null, v.model),
-                h("td", null, v.provider === null ? "Unknown" : providerLabelOf(props.providers, v.provider)),
+                h("td", { "data-field": "provider_id" }, v.provider === null ? "Unknown" : providerList(v.provider).map(function (id) { return providerLabelOf(props.providers, id); }).join(", ")),
                 h("td", { "data-field": "hit_rate_pct" }, v.hit),
                 h("td", { "data-field": "cached_input_tokens" }, v.cached),
                 h("td", { "data-field": "uncached_input_tokens" }, v.uncached),

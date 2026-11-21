@@ -26,7 +26,7 @@ function helperBlock(file) {
 }
 
 const NAMES = "decodeDepth, fmtDuration, durationItems, localHeat, localCellOf, heatLevel, heatMax, heatCellLabel, heatDetail, " +
-  "localOffset, cacheRowView, depthStatusLine, repoRowFor, repoPathSummary, DEPTH_DAYS, DEPTH_FIELDS";
+  "localOffset, providerList, cacheRowView, depthStatusLine, repoRowFor, repoPathSummary, DEPTH_DAYS, DEPTH_FIELDS";
 
 function load(source) {
   // Date is shared with this process on purpose: the helpers must honour the process (browser) zone.
@@ -268,6 +268,31 @@ test("By repo is offered in machine mode; the cards, duration line and repo path
   assert.match(txt(cache), /Recorded-cost basis/);
   assert.match(txt(cache), /Not a tariff|not a tariff/);
   await m.unmount();
+});
+
+test("cache table: one row per model; resolved providers are listed in that row, Unknown only when nothing resolved", async () => {
+  const row = (model, provider_id) => ({ model, provider_id, cached_input_tokens: 10, uncached_input_tokens: 90, cache_write_tokens: 0,
+    reasoning_tokens: 0, output_tokens: 5, hit_rate_pct: 10, reasoning_share_pct: 0, effective_cost_per_mtok: 1.5,
+    discount_multiplier: 0.1, rate_source: null, reason: null });
+  const cache = [row("alpha", "anthropic,openai"), row("beta", "openai"), row("gamma", "unknown"), row("delta", null)];
+  const m = await mount({ routes: routes((dim) => depthPayload(dim, { cache_metrics: cache })) });
+  await m.flush(0);
+  const card = m.$("[data-depth-card=cache]");
+  const rows = Array.from(card.querySelectorAll("[data-cache-row]"));
+  assert.deepEqual(rows.map((r) => r.dataset.cacheRow.split("|")[0]), ["alpha", "beta", "gamma", "delta"]);  // no model repeated
+  const cell = (r) => txt(r.querySelector("[data-field=provider_id]"));
+  assert.equal(cell(rows[0]), "anthropic, openai");
+  assert.equal(cell(rows[1]), "openai");
+  assert.equal(cell(rows[3]), "Unknown");
+  assert.ok(!/unknown/i.test(cell(rows[0])), "never alongside a resolved label");
+  await m.unmount();
+});
+
+test("providerList splits the backend's comma list and ignores blanks", () => {
+  const H = load(helperBlock("dist/index.js"));
+  assert.deepEqual(plain(H.providerList("anthropic,custom:pgx,openai")), ["anthropic", "custom:pgx", "openai"]);
+  assert.deepEqual(plain(H.providerList(null)), []);
+  assert.deepEqual(plain(H.providerList("openai,")), ["openai"]);
 });
 
 test("heatmap card: browser-local grid from exact epochs, tokens toggle, null tokens are '?', detail by offset", async () => {

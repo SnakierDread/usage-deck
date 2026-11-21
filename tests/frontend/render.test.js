@@ -485,24 +485,56 @@ function setVisibility(state) {
   document.dispatchEvent(new dom.window.Event("visibilitychange"));
 }
 
+// Manual interval clock: the poll cadence is driven by tick(), never by wall time, so the
+// test cannot race the (load-dependent) mount/render duration. Only setInterval/clearInterval
+// are replaced; React's own scheduling and the test's setTimeout flushes are untouched.
+function installManualIntervals() {
+  const real = { set: globalThis.setInterval, clear: globalThis.clearInterval };
+  const timers = new Map();
+  let next = 1;
+  globalThis.setInterval = (fn) => { const id = next++; timers.set(id, fn); return id; };
+  globalThis.clearInterval = (id) => { timers.delete(id); };
+  return {
+    active: () => timers.size,
+    tick: async () => { await act(async () => { for (const fn of Array.from(timers.values())) fn(); }); },
+    restore: () => { globalThis.setInterval = real.set; globalThis.clearInterval = real.clear; },
+  };
+}
+
 test("polls while visible and stops while hidden", async () => {
-  const m = await mount({ routes: routesFor(), pollMs: 30 });
-  const subsCalls = () => m.calls.filter((u) => u === B + "/subscriptions?view=machine").length;
-  assert.equal(subsCalls(), 1);
-  await m.flush(80);
-  const visibleCount = subsCalls();
-  assert.ok(visibleCount >= 2, "polled while visible, got " + visibleCount);
-  await act(async () => { setVisibility("hidden"); });
-  const atHide = subsCalls();
-  await m.flush(120);
-  assert.equal(subsCalls(), atHide, "no polling while hidden");
-  await act(async () => { setVisibility("visible"); });
-  await m.flush(80);
-  assert.ok(subsCalls() > atHide, "polling resumed on visible");
-  await m.unmount();
-  const afterUnmount = subsCalls();
-  await new Promise((r) => setTimeout(r, 90));
-  assert.equal(subsCalls(), afterUnmount, "timers cleared on unmount");
+  const clock = installManualIntervals();
+  let m = null;
+  try {
+    m = await mount({ routes: routesFor(), pollMs: 30 });
+    const subsCalls = () => m.calls.filter((u) => u === B + "/subscriptions?view=machine").length;
+    assert.equal(subsCalls(), 1, "one initial fetch");
+    assert.equal(clock.active(), 3, "one poll timer per zone while visible");
+    await clock.tick();
+    await m.flush(0);
+    const visibleCount = subsCalls();
+    assert.equal(visibleCount, 2, "polled while visible, got " + visibleCount);
+    await act(async () => { setVisibility("hidden"); });
+    assert.equal(clock.active(), 0, "poll timers cleared while hidden");
+    const atHide = subsCalls();
+    await clock.tick();
+    await m.flush(0);
+    assert.equal(subsCalls(), atHide, "no polling while hidden");
+    await act(async () => { setVisibility("visible"); });
+    await m.flush(0);
+    assert.equal(clock.active(), 3, "poll timers restarted on visible");
+    const atResume = subsCalls(); // (an immediate catch-up fetch on visible is time-gated; not asserted)
+    await clock.tick();
+    await m.flush(0);
+    assert.ok(subsCalls() > atResume, "polling resumed on visible");
+    await m.unmount();
+    m = null;
+    assert.equal(clock.active(), 0, "timers cleared on unmount");
+  } finally {
+    // Always tear down: a failed assertion must not leave a mounted tree polling (act-warning flood).
+    if (m) await m.unmount();
+    setVisibility("visible");
+    clock.restore();
+  }
 });
 
 test("manual Refresh re-requests all three zones and explains the cache", async () => {
