@@ -66,6 +66,9 @@ class RawInventory:
     #: A profile that falls back to the global pool reports the GLOBAL store as holder (§12.3).
     pool_holders: Dict[str, Tuple[bool, str]] = field(default_factory=dict)
     legacy_holders: Dict[str, Tuple[bool, str]] = field(default_factory=dict)
+    #: Providers whose pool list in the store is empty (a credential-slot abstraction with no row). Never listed;
+    #: only counted in card debug (``DebugInfo.skipped_slots``).
+    empty_pools: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,9 @@ class InventoryItem:
     expires_at: float = field(default=0.0, repr=False)
     #: Public pool row id of the OAuth credential (the key core's pool finds the row by); None otherwise.
     credential_row_id: Optional[str] = field(default=None, repr=False)
+    #: False when no credential resolves for the item (no token, refresh token, key or env value) and it is not a
+    #: self-hosted box: a credential-slot abstraction. Such items are never listed (C1); private, never serialized.
+    resolvable: bool = field(default=True, repr=False)
 
     def __repr__(self) -> str:
         return f"InventoryItem({self.provider_id!r}, {self.account_id!r})"
@@ -357,17 +363,21 @@ class FileInventorySource:
             if data is None and not custom and primary is None:
                 continue
             pool: Dict[str, List[Dict[str, Any]]] = {}
+            empty: List[str] = []
             for provider, entries in _dict_section(data, "credential_pool").items():
                 if isinstance(entries, list):
                     rows = [e for e in entries if isinstance(e, dict)]
                     if rows:
                         pool[str(provider)] = rows
+                    else:
+                        empty.append(str(provider))
             legacy = {str(provider): entry for provider, entry in _dict_section(data, "providers").items()
                       if isinstance(entry, dict) and str(provider) not in pool}
             holder = (is_global, name)
             stores.append(StoreRead(name, is_global, RawInventory(
                 str(directory.resolve()), pool, legacy, custom, primary,
-                {provider: holder for provider in pool}, {provider: holder for provider in legacy}), env_lookup))
+                {provider: holder for provider in pool}, {provider: holder for provider in legacy},
+                tuple(empty)), env_lookup))
         return stores
 
     def read(self) -> RawInventory:
@@ -384,12 +394,15 @@ class FileInventorySource:
         own_holder = global_holder if own[1] else (False, own[0])
         pool: Dict[str, List[Dict[str, Any]]] = {}
         pool_holders: Dict[str, Tuple[bool, str]] = {}
+        empty: List[str] = []
         for provider, entries in _dict_section(profile, "credential_pool").items():
             if isinstance(entries, list):
                 rows = [e for e in entries if isinstance(e, dict)]
                 if rows:
                     pool[str(provider)] = rows
                     pool_holders[str(provider)] = own_holder
+                else:
+                    empty.append(str(provider))
         for provider, entries in _dict_section(global_store, "credential_pool").items():
             if str(provider) in pool or not isinstance(entries, list):
                 continue
@@ -397,6 +410,9 @@ class FileInventorySource:
             if rows:
                 pool[str(provider)] = rows  # profile has zero entries: global fallback
                 pool_holders[str(provider)] = global_holder  # ...and the GLOBAL store owns those rows
+            else:
+                empty.append(str(provider))
+        empty_pools = tuple(dict.fromkeys(p for p in empty if p not in pool))
 
         legacy: Dict[str, Dict[str, Any]] = {}
         legacy_holders: Dict[str, Tuple[bool, str]] = {}
@@ -429,7 +445,8 @@ class FileInventorySource:
                 provider = model.get("provider")
                 if isinstance(provider, str) and provider.strip():
                     primary = {"provider": provider.strip(), "base_url": model.get("base_url")}
-        return RawInventory(str(self._home.resolve()), pool, legacy, custom, primary, pool_holders, legacy_holders)
+        return RawInventory(str(self._home.resolve()), pool, legacy, custom, primary, pool_holders, legacy_holders,
+                            empty_pools)
 
 
 def host_inventory_source() -> FileInventorySource:
@@ -552,14 +569,83 @@ def identity_json(parts: list) -> str:
     return json.dumps(parts, separators=(",", ":"), ensure_ascii=True)
 
 
-def provider_label_for(provider_id: str, secrets: FrozenSet[str]) -> str:
+def endpoint_names(*groups: Any) -> Dict[str, str]:
+    """``{normalized base_url: configured name}`` over ``custom_providers`` entry lists (first name wins).
+
+    A name is only indexed for a SAFE endpoint (no userinfo/credential-looking query). Pass the viewed
+    home's entries first, then the other homes' in store order, so the resolution is deterministic.
+    """
+    out: Dict[str, str] = {}
+    for entries in groups:
+        for entry in entries or ():
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name") or entry.get("provider_key")
+            endpoint = parse_endpoint(entry.get("base_url"))
+            if not isinstance(name, str) or not name.strip() or endpoint is None or not endpoint.safe:
+                continue
+            text = name.strip()
+            text = text[len("custom:"):] if text.lower().startswith("custom:") else text
+            if text:
+                out.setdefault(endpoint.normalized, text)
+    return out
+
+
+def _endpoint_authority(endpoint: Endpoint) -> str:
+    """``host:port`` (or ``host``) of an endpoint, never its scheme, path, userinfo or query."""
+    return endpoint.origin.split("://", 1)[1]
+
+
+def provider_label_for(provider_id: str, secrets: FrozenSet[str], endpoint: Optional[Endpoint] = None,
+                       names: Optional[Dict[str, str]] = None) -> str:
+    """Display label of a provider id.
+
+    The bare ``custom`` provider (C3) resolves through the configured ``custom_providers`` entries: the
+    named entry whose ``base_url`` equals the item's endpoint gives the label; an endpoint no entry names
+    keeps its ``host:port`` as a suffix (``Custom endpoint · host:port``); without an endpoint it stays
+    ``Custom endpoint``. ``custom:<name>`` and every other provider keep their existing labels.
+    """
     lowered = provider_id.lower()
+    if endpoint is not None and endpoint.safe and (lowered == "custom" or lowered.startswith("custom:")):
+        # The configured name of the endpoint wins over the session/pool spelling (``custom:pgx``), which wins
+        # over the url suffix, which wins over the raw bare ``custom`` (C3, C3b).
+        named = (names or {}).get(endpoint.normalized)
+        if named and _LABEL_RE.match(named) and not contains_secret(named, secrets):
+            return named
+        if lowered == "custom":
+            return f"{PROVIDER_LABELS['custom']} · {_endpoint_authority(endpoint)}"
     if lowered in PROVIDER_LABELS:
         return PROVIDER_LABELS[lowered]
     name = provider_id.split(":", 1)[1] if lowered.startswith("custom:") else provider_id
     if _LABEL_RE.match(name) and not contains_secret(name, secrets):
         return name
     return "Provider"
+
+
+def configured_names(source: Any, machine: bool = False) -> Dict[str, str]:
+    """``{normalized base_url: name}`` of the viewed home's ``custom_providers``; in the machine view also of
+    every other home (viewed config first). Never raises: an unreadable inventory just names nothing."""
+    try:
+        raw = source.read()
+        groups: List[Any] = [raw.custom_endpoints]
+        if machine:
+            groups += [store.raw.custom_endpoints for store in source.read_stores()]
+        return endpoint_names(*groups)
+    except Exception:  # noqa: BLE001 - labels are cosmetic, never a reason to fail a usage request
+        return {}
+
+
+def configured_label(provider_id: str, names: Dict[str, str]) -> Optional[str]:
+    """The configured spelling of a ``custom:<name>`` provider id (case-insensitive match against the named
+    ``custom_providers`` entries), or None. Lets the usage view and the inventory call one endpoint one name."""
+    lowered = provider_id.lower()
+    if not lowered.startswith("custom:"):
+        return None
+    wanted = lowered[len("custom:"):]
+    for name in names.values():
+        if name.lower() == wanted and _LABEL_RE.match(name):
+            return name
+    return None
 
 
 def _public_row_id(entry: Dict[str, Any], secrets: FrozenSet[str]) -> Optional[str]:
@@ -586,6 +672,20 @@ class _Draft:
     key_env: Optional[str] = None
     oauth_token: Optional[str] = None  # the row's own OAuth access_token (never a generic api/agent key)
     expires_at: float = 0.0
+    #: The entry carries credential material even without a usable access token (a refresh token).
+    has_material: bool = False
+
+
+def _has_material(entry: Dict[str, Any]) -> bool:
+    """True when a pool/legacy entry carries a usable token, key or refresh token (it can resolve a credential)."""
+    if _credential_of(entry):
+        return True
+    for container in (entry, entry.get("tokens")):
+        if isinstance(container, dict):
+            value = container.get("refresh_token")
+            if isinstance(value, str) and value.strip():
+                return True
+    return False
 
 
 def _row_expiry(entry: Dict[str, Any]) -> float:
@@ -613,9 +713,87 @@ def _endpoint_from_entry(entry: Dict[str, Any]) -> Optional[Endpoint]:
     return None
 
 
-def discover(source: Any) -> List[InventoryItem]:
-    """Return one InventoryItem per effective pool account / configured endpoint."""
+def _is_custom_family(provider_id: str) -> bool:
+    lowered = provider_id.strip().lower()
+    return lowered == "custom" or lowered.startswith("custom:")
+
+
+def _provenance_rank(provenance: str, provider_id: str) -> int:
+    """Which spelling of one endpoint survives (C3b): a pooled account, then a legacy entry, then a configured
+    named entry, then the raw bare ``custom``."""
+    if provenance == "pool":
+        return 0
+    if provenance == "legacy":
+        return 1
+    return 2 if provider_id.strip().lower().startswith("custom:") else 3
+
+
+def _collapse_endpoints(drafts: List[_Draft]) -> None:
+    """C3b: the custom provenance spellings (``custom``, ``custom:<name>``, a ``custom_providers`` entry) of one
+    endpoint base_url are ONE box: keep a single listing per distinct endpoint, in place.
+
+    The best-ranked spelling leads. Its own pooled/legacy rows (several keys for one box) stay separate
+    accounts; every other spelling or configured entry is absorbed into the first of them (or, with no pooled
+    account, into the best configured entry), contributing a credential, ``key_env`` and secrets it lacks.
+    """
+    by_endpoint: Dict[str, List[_Draft]] = {}
+    for draft in drafts:
+        if draft.endpoint is not None and _is_custom_family(draft.provider_id):
+            by_endpoint.setdefault(draft.endpoint.normalized, []).append(draft)
+    for group in by_endpoint.values():
+        if len(group) < 2:
+            continue
+        ordered = sorted(group, key=lambda d: _provenance_rank(d.origin, d.provider_id))  # stable
+        lead = ordered[0].provider_id.lower()
+        accounts = [d for d in ordered if d.origin in ("pool", "legacy") and d.provider_id.lower() == lead]
+        survivor = accounts[0] if accounts else ordered[0]
+        for other in ordered:
+            if other is survivor or other in accounts:
+                continue
+            if survivor.credential is None and other.credential is not None:
+                survivor.credential = other.credential
+            if survivor.health_credential is None:
+                survivor.health_credential = other.health_credential
+            if survivor.key_env is None:
+                survivor.key_env = other.key_env
+            survivor.secrets = survivor.secrets | other.secrets
+            survivor.has_material = survivor.has_material or other.has_material
+            drafts.remove(other)
+
+
+def discover(source: Any, names: Optional[Dict[str, str]] = None) -> List[InventoryItem]:
+    """Return one InventoryItem per effective pool account / configured endpoint that RESOLVES (C1)."""
+    return discover_detailed(source, names)[0]
+
+
+def discover_detailed(source: Any, names: Optional[Dict[str, str]] = None
+                      ) -> Tuple[List[InventoryItem], Dict[str, int]]:
+    """``(items, skipped)``: listed accounts plus the per-provider count of skipped credential slots.
+
+    A cloud account row is listed ONLY when a credential resolves for it; an empty pool list or an orphan
+    provider-level entry with no token is skipped silently and only counted (``DebugInfo.skipped_slots``).
+    A self-hosted endpoint is a box, not a credential: it stays listed with or without a key.
+    """
     raw: RawInventory = source.read()
+    items = _discover_all(source, names, raw)
+    skipped: Dict[str, int] = {}
+    for provider_id in raw.empty_pools:
+        skipped[provider_id] = skipped.get(provider_id, 0) + 1
+    kept: List[InventoryItem] = []
+    for item in items:
+        if item.resolvable:
+            kept.append(item)
+        else:
+            skipped[item.provider_id] = skipped.get(item.provider_id, 0) + 1
+    return kept, skipped
+
+
+def _discover_all(source: Any, names: Optional[Dict[str, str]], loaded: Optional[RawInventory] = None
+                  ) -> List[InventoryItem]:
+    """Every inventory item INCLUDING credential-less cloud slots (``resolvable`` False); callers filter."""
+    raw: RawInventory = loaded if loaded is not None else source.read()
+    if names is None:
+        names = endpoint_names(raw.custom_endpoints)
     drafts: List[_Draft] = []
     seen_rows: set = set()
 
@@ -631,7 +809,8 @@ def discover(source: Any) -> List[InventoryItem]:
             endpoint = _endpoint_from_entry(entry) if is_self_hosted_provider(provider_id) else None
             drafts.append(_Draft(provider_id, endpoint, row_id, ordinal, _credential_of(entry), secrets, None, True,
                                  holder=raw.pool_holders.get(provider_id),
-                                 oauth_token=_oauth_access_token_of(entry), expires_at=_row_expiry(entry)))
+                                 oauth_token=_oauth_access_token_of(entry), expires_at=_row_expiry(entry),
+                                 has_material=_has_material(entry)))
 
     pooled_ids = {d.provider_id for d in drafts}
     for provider_id, entry in raw.legacy.items():
@@ -639,7 +818,8 @@ def discover(source: Any) -> List[InventoryItem]:
             continue
         secrets = collect_secret_values(entry)
         endpoint = _endpoint_from_entry(entry) if is_self_hosted_provider(provider_id) else None
-        drafts.append(_Draft(provider_id, endpoint, None, 1, _credential_of(entry), secrets, origin="legacy"))
+        drafts.append(_Draft(provider_id, endpoint, None, 1, _credential_of(entry), secrets, origin="legacy",
+                             has_material=_has_material(entry)))
 
     def drafts_matching(provider_id: str) -> List[_Draft]:
         exact = [d for d in drafts if d.provider_id == provider_id]
@@ -688,6 +868,8 @@ def discover(source: Any) -> List[InventoryItem]:
             else:
                 drafts.append(_Draft(provider_id, endpoint, None, 1, None, frozenset(), origin="config"))
 
+    _collapse_endpoints(drafts)
+
     # Ollama-style pool entries with no endpoint of their own use the primary's endpoint.
     items: List[InventoryItem] = []
     per_provider: Dict[str, int] = {}
@@ -729,7 +911,7 @@ def discover(source: Any) -> List[InventoryItem]:
             refs = ((draft.holder[0], draft.holder[1], draft.row_id),)  # scoped to the owning store
         items.append(InventoryItem(
             provider_id=provider_id,
-            provider_label=provider_label_for(provider_id, frozen),
+            provider_label=provider_label_for(provider_id, frozen, endpoint, names),
             account_id=account_id,
             account_label=f"Account {per_provider[provider_id]}",
             kind=kind,
@@ -749,6 +931,7 @@ def discover(source: Any) -> List[InventoryItem]:
             oauth_credential=bool(draft.oauth_token and credential and draft.oauth_token == credential),
             expires_at=draft.expires_at,
             credential_row_id=draft.row_id if (draft.oauth_token and credential == draft.oauth_token) else None,
+            resolvable=kind == "self_hosted" or bool(credential) or draft.has_material,
         ))
     items.sort(key=lambda i: (i.provider_id, i.account_id))
     return items
@@ -832,6 +1015,11 @@ def _metrics_scrapable(item: InventoryItem) -> bool:
 
 
 def discover_machine(source: Any) -> List[InventoryItem]:
+    """The machine-wide inventory of ``discover_machine_detailed`` (skipped-slot counts dropped)."""
+    return discover_machine_detailed(source)[0]
+
+
+def discover_machine_detailed(source: Any) -> Tuple[List[InventoryItem], Dict[str, int]]:
     """Machine-wide inventory: global + every profile credential pool, deduped for display only.
 
     Each store is discovered on its own (a profile that merely falls back to the global pool does not
@@ -852,15 +1040,23 @@ def discover_machine(source: Any) -> List[InventoryItem]:
     env = getattr(source, "env_secret", None)
     raw = source.read()
     groups: Dict[str, List[Tuple[Holder, InventoryItem, bool]]] = {}
+    skipped: Dict[str, int] = {}
 
     def add(holder: Holder, item: InventoryItem, selected: bool) -> None:
         groups.setdefault(_machine_identity(holder, item), []).append((holder, item, selected))
 
-    for store in source.read_stores():
+    stores = source.read_stores()
+    # C3: a bare ``custom`` provider resolves its name through the ``custom_providers`` of EVERY home (the
+    # viewed config first, then the global root, then profiles in sorted order). Machine view only: the
+    # profile view never reads another home's config.
+    names = endpoint_names(raw.custom_endpoints, *(store.raw.custom_endpoints for store in stores))
+    for store in stores:
         holder = Holder(store.profile, store.is_global)
+        for provider_id in store.raw.empty_pools:
+            skipped[provider_id] = skipped.get(provider_id, 0) + 1
         # ``store.env`` is the home's OWN ``.env`` (None for the viewed home, whose env is ``env`` below): a
         # sibling's ``key_env`` is resolved in its owning home alone, never against another home or process.
-        for item in discover(_StaticSource(store.raw, store.env)):
+        for item in _discover_all(_StaticSource(store.raw, store.env), names):
             selected = _is_selected_source(holder, item, raw)
             if not selected and item.origin == "config" and item.endpoint is None:
                 continue  # another home's cloud provider without an account is not a subscription (§13)
@@ -868,20 +1064,60 @@ def discover_machine(source: Any) -> List[InventoryItem]:
                 secret = env("OPENROUTER_API_KEY")
                 if isinstance(secret, str) and secret:
                     item = replace(item, credential=SecretValue(secret), auth_status="available",
-                                   secrets=item.secrets | {secret})
+                                   secrets=item.secrets | {secret}, resolvable=True)
             add(holder, item, selected)
 
     if raw.custom_endpoints or raw.primary:
         name, is_global = source.profile_name()
         config_only = RawInventory(raw.home_key, {}, {}, raw.custom_endpoints, raw.primary)
-        for item in discover(_StaticSource(config_only, env)):
+        for item in _discover_all(_StaticSource(config_only, env), names):
             add(Holder(name, is_global), item, True)  # the selected profile's own config
 
+    # C3b: the custom provenance spellings of one endpoint base_url (a pooled ``custom:pgx``, a configured
+    # ``custom_providers`` entry, the bare ``custom`` primary) are ONE box across every home. The best-ranked
+    # spelling leads; its own pooled groups (one per holder/row) stay separate accounts, every other spelling
+    # is absorbed behind the first of them. A configured entry of the SAME provider as a pooled account is
+    # dropped by the held-endpoint rule below instead (its home stays out of the holders).
+    def member_rank(member: Tuple[Holder, InventoryItem, bool]) -> int:
+        return _provenance_rank(member[1].origin, member[1].provider_id)
+
+    def group_rank(identity: str) -> int:
+        return min(member_rank(m) for m in groups[identity])
+
+    def group_is_config(identity: str) -> bool:
+        return all(m[1].origin == "config" for m in groups[identity])
+
+    identities_by_endpoint: Dict[str, List[str]] = {}
+    for identity, members in groups.items():
+        lead = members[0][1]
+        if lead.endpoint is not None and _is_custom_family(lead.provider_id):
+            identities_by_endpoint.setdefault(lead.endpoint.normalized, []).append(identity)
+    for identities in identities_by_endpoint.values():
+        if len(identities) < 2:
+            continue
+        ordered = sorted(identities, key=group_rank)  # stable
+        lead_spelling = groups[ordered[0]][0][1].provider_id.lower()
+        pooled = [i for i in ordered if not group_is_config(i) and groups[i][0][1].provider_id.lower() == lead_spelling]
+        if pooled:
+            absorber = pooled[0]
+            # a configured entry of the lead spelling is the pooled account itself (dropped below)
+            rest = [i for i in ordered if i not in pooled
+                    and not (group_is_config(i) and groups[i][0][1].provider_id.lower() == lead_spelling)]
+            if rest:
+                groups[absorber] = groups[absorber] + [m for i in rest for m in groups[i]]
+        else:
+            absorber = ordered[0]
+            rest = ordered[1:]
+            if rest:
+                groups[absorber] = sorted([m for i in ordered for m in groups[i]], key=member_rank)
+        for identity in rest:
+            del groups[identity]
+
     def is_config(members: List[Tuple[Holder, InventoryItem, bool]]) -> bool:
-        return members[0][1].origin == "config"
+        return all(item.origin == "config" for _holder, item, _selected in members)
 
     held_providers = {members[0][1].provider_id for members in groups.values() if not is_config(members)}
-    held_endpoints = {(members[0][1].provider_id, members[0][1].endpoint.normalized)
+    held_endpoints = {(members[0][1].provider_id.lower(), members[0][1].endpoint.normalized)
                       for members in groups.values()
                       if not is_config(members) and members[0][1].endpoint is not None}
     merged: List[InventoryItem] = []
@@ -889,10 +1125,14 @@ def discover_machine(source: Any) -> List[InventoryItem]:
     seen_ids: set = set()
     for identity, members in groups.items():
         first = members[0][1]
+        if not any(i.resolvable for _holder, i, _selected in members):
+            # C1: no member resolves a credential: a slot abstraction, skipped silently and only counted.
+            skipped[first.provider_id] = skipped.get(first.provider_id, 0) + len(members)
+            continue
         if is_config(members):
             if first.endpoint is None and first.provider_id in held_providers:
                 continue  # a configured cloud provider with no credential: some home already holds an account
-            if first.endpoint is not None and (first.provider_id, first.endpoint.normalized) in held_endpoints:
+            if first.endpoint is not None and (first.provider_id.lower(), first.endpoint.normalized) in held_endpoints:
                 continue  # the configured endpoint is already a pooled account
         holders: List[Holder] = []
         for holder, _item, _selected in members:
@@ -944,6 +1184,7 @@ def discover_machine(source: Any) -> List[InventoryItem]:
             holders=tuple(holders),
             live_source=selected_any or cross_live,
             cross_profile=cross_live,
+            resolvable=True,
         ))
     merged.sort(key=lambda i: (i.provider_id, i.account_id))
-    return merged
+    return merged, skipped

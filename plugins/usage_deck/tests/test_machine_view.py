@@ -187,13 +187,13 @@ class ConfigDerived(MachineBase):
         self.assertEqual(item.holders, (Holder("work", False),))
         self.assertEqual(item.kind, "self_hosted")
 
-    def test_credentialless_configured_cloud_provider_is_dropped_when_a_home_holds_it(self):
+    def test_credentialless_configured_cloud_provider_is_never_listed(self):
         self.config = {"model": {"provider": "openai-codex"}}
         self.s.write_profile("verifier", pool("openai-codex", {"id": "v1", "access_token": codex_token("A", "U", "go")}))
         self.assertEqual(len([i for i in self.machine() if i.provider_id == "openai-codex"]), 1)
         self.s.write_profile("verifier", {"credential_pool": {}})
-        (lonely,) = [i for i in self.machine() if i.provider_id == "openai-codex"]  # nobody holds it: keep the configured one
-        self.assertEqual((lonely.auth_status, lonely.holders), ("missing", (Holder("work", False),)))
+        # C1: nobody holds a credential: the configured primary alone is a slot abstraction, no card
+        self.assertEqual([i for i in self.machine() if i.provider_id == "openai-codex"], [])
 
 
 class StoreReading(MachineBase):

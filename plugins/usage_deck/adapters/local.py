@@ -166,8 +166,10 @@ class SelfHostedAdapter(BaseAdapter):
             status, confidence = "degraded", "self_hosted"
             reason = "credentials_missing" if anonymous_denied else "source_unavailable"
         elif all(a.failure in ("connection", "timeout") for a in all_attempts):
-            status, confidence, reason = "offline", "opaque", "source_unavailable"
-            error_code = "timeout" if all(a.failure == "timeout" for a in all_attempts) else "upstream_unavailable"
+            # An unreachable box (refused, no route, timed out) is a normal condition, e.g. an on-demand machine
+            # that is powered off: quiet opaque "box offline", never an error card (C2).
+            status, confidence, reason = "offline", "opaque", "box_offline"
+            error_code = None
         elif anonymous_denied:
             # The host answered but refuses an anonymous caller: reachable and degraded, credential missing.
             # No metrics, no estimation, no fabricated credential, and no auth_required error.
@@ -198,9 +200,8 @@ class SelfHostedAdapter(BaseAdapter):
             return _Snapshot(True, metrics_attempt, _NOT_RUN, values, "healthy", "self_hosted", None, None,
                              metrics_attempt.latency_ms)
         if metrics_attempt.failure in ("connection", "timeout"):
-            code = "timeout" if metrics_attempt.failure == "timeout" else "upstream_unavailable"
-            return _Snapshot(True, metrics_attempt, _NOT_RUN, None, "offline", "opaque", "source_unavailable",
-                             code, None)
+            return _Snapshot(True, metrics_attempt, _NOT_RUN, None, "offline", "opaque", "box_offline",
+                             None, None)
         return _Snapshot(True, metrics_attempt, _NOT_RUN, None, "unknown", "opaque", "source_unavailable",
                          None, None)
 
@@ -212,12 +213,10 @@ class SelfHostedAdapter(BaseAdapter):
         if snap.status == "unknown":
             reachable = None
         caps = self._capabilities(*(("metrics",) if snap.metrics.ok else ()))
-        error = make_error(snap.error_code, self.ctx.provider_id, self.ctx.account_id) \
-            if snap.status == "offline" else None
         reason = None if snap.metrics.ok else (
-            "source_unavailable" if snap.status == "offline"
+            "box_offline" if snap.status == "offline"
             else "credentials_missing" if snap.reason == "credentials_missing" else "metrics_unavailable")
-        return self._probe_result(snap.metrics.ok, reachable, caps, reason=reason, error=error)
+        return self._probe_result(snap.metrics.ok, reachable, caps, reason=reason)
 
     def credential_rejected(self) -> bool:
         snap = self._check()
@@ -228,8 +227,7 @@ class SelfHostedAdapter(BaseAdapter):
         if not snap.configured:
             return UsageResult(confidence="opaque", reason="source_unavailable")
         if snap.status == "offline":
-            return UsageResult(confidence="opaque", reason="source_unavailable",
-                               error=make_error(snap.error_code, self.ctx.provider_id, self.ctx.account_id))
+            return UsageResult(confidence="opaque", reason="box_offline")
         confidence = "self_hosted" if snap.metrics.ok else "opaque"
         reason = "unsupported" if snap.metrics.ok else (
             "credentials_missing" if snap.reason == "credentials_missing" else "metrics_unavailable")

@@ -131,8 +131,8 @@ class HarnessValidatorTests(unittest.TestCase):
                 "account_label": "Account 1", "kind": "cloud", "plan_name": None, "plan_source": "none",
                 "auth_status": "missing", "endpoint_id": None, "state": "opaque", "confidence": "opaque",
                 "reason": "unsupported", "meters": [], "checked_at": "2026-11-06T12:00:00Z", "stale": False,
-                "error": None, "debug": {"adapter": "a", "capabilities": [], "source": "s", "sanitized": True},
-                "holders": []}
+                "error": None, "debug": {"adapter": "a", "capabilities": [], "source": "s", "sanitized": True, "skipped_slots": 0},
+                "holders": [], "last_seen_at": None}
         errs = []
         harness.validate_card(errs, "card", card)
         self.assertEqual(errs, [])

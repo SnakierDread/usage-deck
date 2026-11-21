@@ -723,9 +723,9 @@ class CodexService(ServiceBase, SchemaAsserts):
                   {"id": "c3", "access_token": "udsyn-not-a-jwt"}, {"id": "c4", "access_token": codex_token(residency="bad\nvalue")})
         self.transport.routes[CODEX_USAGE_URL] = json_response(limit_body())
         cards = self.codex()
-        self.assertEqual(len(cards), 4)
+        self.assertEqual(len(cards), 3)  # c1 has no credential at all: a slot, not listed (C1)
         by_status = sorted((c["auth_status"], c["reason"]) for c in cards)
-        self.assertEqual(by_status, [("available", "source_unavailable")] * 3 + [("missing", "credentials_missing")])
+        self.assertEqual(by_status, [("available", "source_unavailable")] * 3)
         self.assertTrue(all(c["state"] == "opaque" and c["meters"] == [] for c in cards))
         self.assertEqual(self.transport.requests, [])
 

@@ -21,13 +21,13 @@ from .test_service import GPU, METRICS, ServiceBase
 # Independent copy of DESIGN.md §2 field lists (deliberately not derived from dto.py).
 CARD_KEYS = {"id", "provider_id", "account_id", "provider_label", "account_label", "kind", "plan_name",
              "plan_source", "auth_status", "endpoint_id", "state", "confidence", "reason", "meters",
-             "checked_at", "stale", "error", "debug", "holders"}
+             "checked_at", "stale", "error", "debug", "holders", "last_seen_at"}
 HOLDER_KEYS = {"profile", "is_global"}
 METER_KEYS = {"id", "label", "value", "limit", "remaining", "unit", "scope", "period", "confidence",
               "source", "observed_at", "resets_at"}
 PERIOD_KEYS = {"start", "end", "label"}
 ERROR_KEYS = {"code", "message", "retryable", "provider_id", "account_id"}
-DEBUG_KEYS = {"adapter", "capabilities", "source", "sanitized"}
+DEBUG_KEYS = {"adapter", "capabilities", "source", "sanitized", "skipped_slots"}
 POINT_KEYS = {"day", "input_count", "output_count", "estimated_usd", "sessions", "api_calls", "confidence",
               "api_equivalent_usd", "api_equivalent"}
 SERIES_KEYS = {"id", "provider_id", "account_id", "scope", "confidence", "source", "period", "window_days",
@@ -70,13 +70,13 @@ GROUP_KEYS = {"id", "label", "series_id", "model_id", "provider_ids", "profiles"
 SOURCE_KEYS = {"profile", "is_global", "state"}
 PROVIDER_KEYS = {"id", "label"}
 HEALTH_KEYS = {"endpoint_id", "provider_id", "display_name", "status", "confidence", "metrics_available",
-               "latency_ms", "cpu_percent", "memory_bytes", "checked_at", "stale", "reason", "error"}
+               "latency_ms", "cpu_percent", "memory_bytes", "checked_at", "stale", "reason", "error", "last_seen_at"}
 META_KEYS = {"schema_version", "request_id", "generated_at", "partial", "errors"}
 ENUMS = {
     "confidence": {"exact", "estimated", "opaque", "self_hosted"},
     "state": {"ready", "error", "opaque", "empty"},
     "reason": {"unsupported", "credentials_missing", "permission_denied", "attribution_unavailable",
-               "no_observations", "metrics_unavailable", "source_unavailable", None},
+               "no_observations", "metrics_unavailable", "source_unavailable", "box_offline", None},
     "kind": {"cloud", "self_hosted"},
     "plan_source": {"unverified_claim", "provider", "none"},
     "auth_status": {"available", "missing", "rejected"},
@@ -397,8 +397,8 @@ class SchemaGuardTests(unittest.TestCase):
                 "account_label": "Account 1", "kind": "cloud", "plan_name": None, "plan_source": "none",
                 "auth_status": "missing", "endpoint_id": None, "state": "opaque", "confidence": "opaque",
                 "reason": "unsupported", "meters": [], "checked_at": "2026-11-06T12:00:00Z", "stale": False,
-                "error": None, "debug": {"adapter": "a", "capabilities": [], "source": "s", "sanitized": True},
-                "holders": [{"profile": "work", "is_global": False}]}
+                "error": None, "debug": {"adapter": "a", "capabilities": [], "source": "s", "sanitized": True, "skipped_slots": 0},
+                "holders": [{"profile": "work", "is_global": False}], "last_seen_at": None}
         self.assertIs(check_wire("card", card), card)
         for mutate in (
             lambda c: c.pop("reason"),                        # omitted != null

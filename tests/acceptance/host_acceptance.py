@@ -81,25 +81,25 @@ ICP_CODEX_PATH = "/backend-api/wham/usage"
 
 CARD_KEYS = {"id", "provider_id", "account_id", "provider_label", "account_label", "kind", "plan_name", "plan_source",
              "auth_status", "endpoint_id", "state", "confidence", "reason", "meters", "checked_at", "stale", "error",
-             "debug", "holders"}
+             "debug", "holders", "last_seen_at"}
 HOLDER_KEYS = {"profile", "is_global"}
 METER_KEYS = {"id", "label", "value", "limit", "remaining", "unit", "scope", "period", "confidence", "source",
               "observed_at", "resets_at"}
 PERIOD_KEYS = {"start", "end", "label"}
 ERROR_KEYS = {"code", "message", "retryable", "provider_id", "account_id"}
-DEBUG_KEYS = {"adapter", "capabilities", "source", "sanitized"}
+DEBUG_KEYS = {"adapter", "capabilities", "source", "sanitized", "skipped_slots"}
 POINT_KEYS = {"day", "input_count", "output_count", "estimated_usd", "sessions", "api_calls", "confidence",
               "api_equivalent_usd", "api_equivalent"}  # last two: API-equivalent annotation (design §7)
 SERIES_KEYS = {"id", "provider_id", "account_id", "scope", "confidence", "source", "period", "window_days", "bucket",
                "timezone", "coverage", "points", "checked_at", "stale", "error"}
 HEALTH_KEYS = {"endpoint_id", "provider_id", "display_name", "status", "confidence", "metrics_available", "latency_ms",
-               "cpu_percent", "memory_bytes", "checked_at", "stale", "reason", "error"}
+               "cpu_percent", "memory_bytes", "checked_at", "stale", "reason", "error", "last_seen_at"}
 META_KEYS = {"schema_version", "request_id", "generated_at", "partial", "errors"}
 ENVELOPE_KEYS = {"ok", "data", "error", "meta"}
 DATA_KEYS = {"subscriptions": {"cards", "inventory_state", "view"}, "health": {"entries"},
              "usage": {"window_days", "provider_id", "series", "reason"}}
 REASONS = {"unsupported", "credentials_missing", "permission_denied", "attribution_unavailable", "no_observations",
-           "metrics_unavailable", "source_unavailable"}
+           "metrics_unavailable", "source_unavailable", "box_offline"}
 ENUMS = {
     "confidence": {"exact", "estimated", "opaque", "self_hosted"},
     "state": {"ready", "error", "opaque", "empty"},
@@ -199,6 +199,8 @@ def validate_card(errs, where, c):
         errs.append(f"{where}.endpoint_id")
     if not TS_RE.match(str(c["checked_at"])) or not isinstance(c["stale"], bool):
         errs.append(f"{where}: checked_at/stale")
+    if c["last_seen_at"] is not None and not TS_RE.match(str(c["last_seen_at"])):
+        errs.append(f"{where}.last_seen_at")
     for k in ("provider_id", "provider_label", "account_label"):
         if not isinstance(c[k], str):
             errs.append(f"{where}.{k}: not a string")
@@ -223,6 +225,9 @@ def validate_card(errs, where, c):
     if _keys(errs, where + ".debug", c["debug"], DEBUG_KEYS):
         if c["debug"]["sanitized"] is not True:
             errs.append(f"{where}.debug.sanitized")
+        if isinstance(c["debug"]["skipped_slots"], bool) or not isinstance(c["debug"]["skipped_slots"], int) \
+                or c["debug"]["skipped_slots"] < 0:
+            errs.append(f"{where}.debug.skipped_slots")
         for cap in c["debug"]["capabilities"]:
             _enum(errs, where + ".debug.capabilities", cap, ENUMS["capability"])
 
@@ -235,6 +240,8 @@ def validate_health(errs, where, h):
     _enum(errs, where + ".reason", h["reason"], REASONS, nullable=True)
     if not EP_RE.match(str(h["endpoint_id"])) or not TS_RE.match(str(h["checked_at"])):
         errs.append(f"{where}: endpoint_id/checked_at")
+    if h["last_seen_at"] is not None and not TS_RE.match(str(h["last_seen_at"])):
+        errs.append(f"{where}.last_seen_at")
     if not isinstance(h["metrics_available"], bool) or not isinstance(h["stale"], bool):
         errs.append(f"{where}: bools")
     for k in ("latency_ms", "cpu_percent"):
@@ -1621,7 +1628,8 @@ def self_check(R):
             "auth_status": "available", "endpoint_id": None, "state": "opaque", "confidence": "opaque",
             "reason": "unsupported", "meters": [], "checked_at": now, "stale": False, "error": None,
             "debug": {"adapter": "NousAdapter", "capabilities": ["session_analytics"], "source": "local_inventory",
-                      "sanitized": True}, "holders": [{"profile": "global", "is_global": True}]}
+                      "sanitized": True, "skipped_slots": 0}, "holders": [{"profile": "global", "is_global": True}],
+            "last_seen_at": None}
     env = {"ok": True, "data": {"cards": [card], "inventory_state": "detected", "view": "machine"}, "error": None,
            "meta": {"schema_version": 1, "request_id": "0a1b2c3d-0000-4000-8000-0123456789ab", "generated_at": now,
                     "partial": False, "errors": []}}
