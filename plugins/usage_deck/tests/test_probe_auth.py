@@ -233,8 +233,9 @@ class HonestTaxonomyWithoutAKey(Base):
             {"id": "o1", "base_url": BOX + "/v1", "access_token": SENTINEL_TOKEN}]}})
         box = StrictBoxTransport(good=SENTINEL_TOKEN)
         _cards, _health, envelopes = self.deck(box, view="machine")
-        self.assertEqual([u for u, _h in box.requests], [BOX + "/metrics"])
+        self.assertEqual([u for u, _h in box.requests], [BOX + "/metrics", BOX + "/v1/models", BOX + "/api/tags"])
         self.assertEqual(box.auth_for("/metrics"), [None])
+        self.assertEqual(box.auth_for("/v1/models"), [None])  # the pool row's inline token never goes anywhere
         self.assertEqual(scan_for(envelopes, [SENTINEL_TOKEN]), [])
 
     def test_machine_only_member_makes_no_request_in_the_profile_view(self):
@@ -382,7 +383,8 @@ class HostCredentialHelperDiskOnly(unittest.TestCase):
         own = [(u, h) for u, h in box.requests if u.startswith(BOX + "/")]
         other = [(u, h) for u, h in box.requests if u.startswith(OTHER_BOX + "/")]
         self.assertEqual({h.get("Authorization") for _u, h in own}, {"Bearer " + ENV_VALUE})
-        self.assertEqual([(u, h.get("Authorization")) for u, h in other], [(OTHER_BOX + "/metrics", None)])
+        self.assertEqual([(u, h.get("Authorization")) for u, h in other],
+                         [(OTHER_BOX + "/metrics", None), (OTHER_BOX + "/v1/models", None), (OTHER_BOX + "/api/tags", None)])
         self.assertEqual(len(own) + len(other), len(box.requests))
         self.assertEqual([e["status"] for e in health if e["endpoint_id"] and "desktop" in e["provider_id"]],
                          ["healthy"])

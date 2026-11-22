@@ -6,6 +6,11 @@ configured metrics credential, never an inline/pool inference key) and is otherw
 anonymous; models/tags endpoints send the inference credential and provide the health
 evidence. A successful metrics exposition yields ``self_hosted`` confidence for
 operational numbers; it never becomes a token quota.
+
+Machine-view card of an endpoint defined only in ANOTHER home's config (``ctx.cross_profile``, DESIGN.md §13
+item 3b): the same read-only ``/metrics`` + ``/v1/models`` (``/api/tags``) probes against the owner's base_url,
+but the only credential ever sent is the OWNER home's own ``key_env`` secret (``health_credential``), to both
+routes; the card carries no inference credential, so nothing else of any home can reach the wire.
 """
 
 from __future__ import annotations
@@ -49,6 +54,11 @@ class _Snapshot:
 
 _NOT_RUN = _Attempt(False, "")
 
+#: Fixed, secret-free identity on every self-hosted probe (the one UsageDeck sends everywhere, ``cloud.py``).
+#: Boxes published through a CDN/WAF tunnel refuse the stock ``Python-urllib`` agent outright (Cloudflare error
+#: 1010 -> 403 on /metrics AND /v1/models) while answering the same anonymous GET with 200 for any other agent.
+PROBE_USER_AGENT = "HermesAgent/usage-deck"
+
 
 def _denied(attempt: _Attempt) -> bool:
     """The endpoint answered 401/403 (an access refusal, as opposed to an outage or a bad payload)."""
@@ -73,7 +83,7 @@ class SelfHostedAdapter(BaseAdapter):
     # -- snapshot --------------------------------------------------------
     def _attempt(self, path: str, validator, credential) -> Tuple[_Attempt, Any]:
         ctx = self.ctx
-        headers = {"Accept": "application/json, text/plain"}
+        headers = {"Accept": "application/json, text/plain", "User-Agent": PROBE_USER_AGENT}
         if credential:
             headers["Authorization"] = "Bearer " + credential.reveal()
         try:
@@ -135,20 +145,21 @@ class SelfHostedAdapter(BaseAdapter):
             return _Snapshot(True, _NOT_RUN, _NOT_RUN, None, "unknown", "opaque",
                              "credentials_missing", None, None)
 
+        # The models/tags bearer: the selected profile's own credential, or (another home's endpoint) that OWNER
+        # home's own ``key_env`` secret alone: ``ctx.credential`` is never set on a cross-profile card.
+        models_credential = ctx.health_credential if ctx.cross_profile else ctx.credential
         metrics_attempt, metrics_values = self._attempt("/metrics", self._metrics_validator, ctx.health_credential)
-        if ctx.cross_profile:
-            return self._compute_metrics_only(metrics_attempt, metrics_values)
         health_attempt = _Attempt(False, "")
         tried: List[_Attempt] = []
         for path in _health_paths(endpoint, ctx.provider_id):
-            health_attempt, _ = self._attempt(path, self._health_validator(path), ctx.credential)
+            health_attempt, _ = self._attempt(path, self._health_validator(path), models_credential)
             tried.append(health_attempt)
             if health_attempt.ok or health_attempt.failure in ("connection", "timeout"):
                 break  # a down host will not answer the sibling path either
 
         all_attempts = [metrics_attempt] + tried
         m_ok, h_ok = metrics_attempt.ok, health_attempt.ok
-        credential_sent = bool(ctx.credential)
+        credential_sent = bool(models_credential)
         unauthorized = (not h_ok) and any(a.failure == "status" and a.status == 401 for a in tried)
         # A 401 means "credential rejected" only if one was sent; anonymously it means none was.
         # An anonymous 403 is the same gateway refusing an unidentified caller (llama-swap/nginx style),
@@ -190,21 +201,6 @@ class SelfHostedAdapter(BaseAdapter):
         return snap
 
     # -- protocol --------------------------------------------------------
-    def _compute_metrics_only(self, metrics_attempt: _Attempt, values: Optional[Metrics]) -> _Snapshot:
-        """Machine-view cross-profile card (DESIGN.md §13): the one ``/metrics`` scrape was the only request.
-
-        The models/tags probes carry an inference credential and are not a usage probe, so they are not
-        sent; a valid exposition proves the endpoint is up, anything else is honestly "unknown"/offline.
-        """
-        if metrics_attempt.ok:
-            return _Snapshot(True, metrics_attempt, _NOT_RUN, values, "healthy", "self_hosted", None, None,
-                             metrics_attempt.latency_ms)
-        if metrics_attempt.failure in ("connection", "timeout"):
-            return _Snapshot(True, metrics_attempt, _NOT_RUN, None, "offline", "opaque", "box_offline",
-                             None, None)
-        return _Snapshot(True, metrics_attempt, _NOT_RUN, None, "unknown", "opaque", "source_unavailable",
-                         None, None)
-
     def _do_probe(self) -> ProbeResult:
         snap = self._check()
         if not snap.configured:

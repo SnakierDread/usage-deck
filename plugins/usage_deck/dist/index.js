@@ -87,7 +87,10 @@
   const ANTHROPIC_LIVE_EMPTY_NOTE = "No Anthropic session/weekly meter: Anthropic's usage endpoint was read live for this credential and reported no current session or weekly window (or did not permit the read). Nothing is estimated and no older captured reading is shown in its place.";
   // Machine view only (DESIGN.md §12.5, amended by §13): the machine view reads meters with any local profile's
   // credential, but only through the documented read-only usage probes; other accounts stay local inventory.
-  const MACHINE_ONLY_NOTE = "No live source for this account: the machine view reads meters with any local profile's credential only through the documented read-only usage probes (Codex spend control, Anthropic OAuth usage, endpoint /metrics), and none exists for this account, so it is local inventory. Nothing is estimated.";
+  const MACHINE_ONLY_NOTE = "No live source for this account: the machine view reads meters with any local profile's credential only through the documented read-only usage probes (Codex spend control, Anthropic OAuth usage, endpoint /metrics and models listing), and none exists for this account, so it is local inventory. Nothing is estimated.";
+  // Machine view, self-hosted health row of an endpoint owned by ANOTHER profile's inventory (config or credential pool; ownership, not proof of a request) (DESIGN.md §13 item 3b).
+  const PROFILE_OWNED_BADGE = "Profile endpoint";
+  const PROFILE_OWNED_NOTE = "This endpoint belongs to another profile's inventory (its config or its credential pool), not to the selected profile. The machine view's read-only probe (/metrics and the models listing) uses that profile's own address, anonymously unless that profile's own key_env supplies a key; when that key is unset, no request is sent. No other profile's or the process's credential is sent. The row's status shows the outcome.";
   const SCOPE_LABEL = {
     api_credential: "API credential",
     provider_account: "Provider account",
@@ -2051,7 +2054,9 @@ function repoCoverage(rollup) {
         !metricsOk && !de ? h("span", { className: "ud-muted ud-small" }, "Metrics unavailable") : null,
         reason && !de ? h("span", { className: "ud-muted ud-small" }, reason) : null,
         e.reason === "box_offline" ? h("span", { className: "ud-muted ud-small", "data-field": "last-seen" }, lastSeenText(e)) : null,
-        props.machine && statusKey === "unknown" && e.reason === "source_unavailable" && !de
+        props.machine && e.profile_owned === true
+          ? h("span", { className: "ud-badge ud-muted ud-small", "data-profile-owned": "true", title: PROFILE_OWNED_NOTE }, PROFILE_OWNED_BADGE) : null,
+        props.machine && statusKey === "unknown" && e.reason === "source_unavailable" && !de && e.profile_owned !== true
           ? h("span", { className: "ud-muted ud-small", "data-machine-only-note": "true", title: MACHINE_ONLY_NOTE }, "Not probed") : null,
         de ? h("span", { className: "ud-small ud-health-err", role: "note" }, "⚠ " + de.message) : null);
     }

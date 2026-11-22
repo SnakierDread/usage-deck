@@ -168,6 +168,11 @@ CROSS_PROFILE_PROBES: Tuple[ProbeShape, ...] = (
     # Anthropic OAuth usage (DESIGN.md §9.1.2): issued by AnthropicAdapter with an OAuth pool-row bearer; GET only.
     ProbeShape("GET", "https", "api.anthropic.com", 443, "/api/oauth/usage"),
     ProbeShape("GET", None, None, None, "/metrics"),
+    # Self-hosted health (DESIGN.md §13 item 3b, card t_793f0ed6): an endpoint defined only in another home's config
+    # is probed on the owner's origin with the read-only models/tags listing as well; the origin stays pinned by the
+    # item's AllowedTarget and the only credential is that owner home's own ``key_env`` secret.
+    ProbeShape("GET", None, None, None, "/v1/models"),
+    ProbeShape("GET", None, None, None, "/api/tags"),
 )
 
 

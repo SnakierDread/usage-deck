@@ -254,8 +254,8 @@ class CredentialUseIsolation(MachineBase, SchemaAsserts):
             by_host.setdefault(url.split("/")[2], []).append((url.split("/", 3)[3], "Authorization" in headers))
         # the selected profile's endpoint is probed as before (metrics anonymous + credentialed models) ...
         self.assertEqual(sorted(by_host[GPU.split("/")[2]]), [("metrics", False), ("v1/models", True)])
-        # ... the other profile's endpoint: one /metrics GET, no credential, no models/tags request
-        self.assertEqual(by_host[other.split("/")[2]], [("metrics", False)])
+        # ... the other profile's endpoint: the read-only /metrics + /v1/models GETs, no credential at all
+        self.assertEqual(sorted(by_host[other.split("/")[2]]), [("metrics", False), ("v1/models", False)])
         by = {e["provider_id"]: e["status"] for e in health["data"]["entries"]}
         self.assertEqual(by, {"custom:gpu": "healthy", "custom:other": "healthy"})
         for _url, headers, _t in self.transport.requests:

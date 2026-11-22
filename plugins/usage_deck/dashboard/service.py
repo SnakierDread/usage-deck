@@ -230,6 +230,15 @@ def _effective_view(source: Any, query: "Query") -> str:
     return "profile"
 
 
+def _profile_owned(item: InventoryItem, machine_view: bool) -> bool:
+    """Machine view: a self-hosted endpoint owned by ANOTHER profile's inventory (not the selected one's).
+
+    Ownership only: the item may come from that profile's config or its credential pool, and the flag says nothing
+    about whether a request was sent (an unset owner ``key_env`` sends none) or what it returned; ``status`` /
+    ``reason`` carry that."""
+    return bool(machine_view and item.kind == "self_hosted" and item.cross_profile)
+
+
 class UsageDeckService:
     def __init__(
         self,
@@ -645,16 +654,16 @@ class UsageDeckService:
                     log.error("usage_deck adapter error: %s", type(exc).__name__)
                     card_dict = self._error_card(item, now, "internal_error")
                     if owns:
-                        health_dict = self._unknown_health(item, now, "internal_error")
+                        health_dict = self._unknown_health(item, now, "internal_error", view == "machine")
             elif item.kind == "self_hosted":
                 # A box that did not answer within the refresh deadline is unreachable, not a failure (C2).
                 card_dict = self._offline_card(item, now, skipped.get(item.provider_id, 0))
                 if owns:
-                    health_dict = self._offline_health(item, now)
+                    health_dict = self._offline_health(item, now, view == "machine")
             else:
                 card_dict = self._error_card(item, now, "timeout")
                 if owns:
-                    health_dict = self._unknown_health(item, now, "timeout")
+                    health_dict = self._unknown_health(item, now, "timeout", view == "machine")
             cards.append(card_dict)
             if health_dict is not None:
                 health.append(health_dict)
@@ -679,7 +688,8 @@ class UsageDeckService:
             elif item.provider_id.strip().lower() == ANTHROPIC_PROVIDER_ID:
                 targets.append(ANTHROPIC_TARGET)  # DESIGN.md §9.1.2: fixed, GET /api/oauth/usage only
             elif item.endpoint is not None and item.endpoint.safe:
-                targets.append(AllowedTarget(item.endpoint.scheme, item.endpoint.host, item.endpoint.port, ("/metrics",)))
+                targets.append(AllowedTarget(item.endpoint.scheme, item.endpoint.host, item.endpoint.port,
+                                             ("/metrics", "/v1/models", "/api/tags")))
             transport = CrossProfileProbeTransport(GuardedTransport(self._transport, targets))
         else:
             if item.live_source and not blocked:  # machine-only inventory never gets an outbound target (§12.5)
@@ -731,7 +741,7 @@ class UsageDeckService:
         usage = adapter.get_usage(DEFAULT_WINDOW)
         health: Optional[HealthStripEntry] = adapter.get_health() if owns_health else None
         if health is not None:
-            health = replace(health, last_seen_at=fmt_ts(seen))
+            health = replace(health, last_seen_at=fmt_ts(seen), profile_owned=_profile_owned(item, machine_view))
         confidence = adapter.get_confidence()
 
         error = probe.error
@@ -804,13 +814,13 @@ class UsageDeckService:
         )
         return check_wire("card", sanitize(to_plain(card), item.secrets))
 
-    def _offline_health(self, item: InventoryItem, now: datetime) -> dict:
+    def _offline_health(self, item: InventoryItem, now: datetime, machine_view: bool = False) -> dict:
         entry = HealthStripEntry(
             endpoint_id=item.endpoint_id or "", provider_id=item.provider_id,
             display_name=item.provider_label, status="offline", confidence="opaque",
             metrics_available=False, latency_ms=None, cpu_percent=None, memory_bytes=None,
             checked_at=fmt_ts(now), stale=False, reason="box_offline", error=None,
-            last_seen_at=self._seen_at(item),
+            last_seen_at=self._seen_at(item), profile_owned=_profile_owned(item, machine_view),
         )
         return check_wire("health", sanitize(to_plain(entry), item.secrets))
 
@@ -827,12 +837,13 @@ class UsageDeckService:
         )
         return check_wire("card", sanitize(to_plain(card), item.secrets))
 
-    def _unknown_health(self, item: InventoryItem, now: datetime, code: str) -> dict:
+    def _unknown_health(self, item: InventoryItem, now: datetime, code: str, machine_view: bool = False) -> dict:
         entry = HealthStripEntry(
             endpoint_id=item.endpoint_id or "", provider_id=item.provider_id,
             display_name=item.provider_label, status="unknown", confidence="opaque",
             metrics_available=False, latency_ms=None, cpu_percent=None, memory_bytes=None,
             checked_at=fmt_ts(now), stale=False, reason="source_unavailable",
             error=make_error(code, item.provider_id, item.account_id),
+            profile_owned=_profile_owned(item, machine_view),
         )
         return check_wire("health", sanitize(to_plain(entry), item.secrets))

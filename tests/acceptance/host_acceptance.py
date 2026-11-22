@@ -93,7 +93,7 @@ POINT_KEYS = {"day", "input_count", "output_count", "estimated_usd", "sessions",
 SERIES_KEYS = {"id", "provider_id", "account_id", "scope", "confidence", "source", "period", "window_days", "bucket",
                "timezone", "coverage", "points", "checked_at", "stale", "error"}
 HEALTH_KEYS = {"endpoint_id", "provider_id", "display_name", "status", "confidence", "metrics_available", "latency_ms",
-               "cpu_percent", "memory_bytes", "checked_at", "stale", "reason", "error", "last_seen_at"}
+               "cpu_percent", "memory_bytes", "checked_at", "stale", "reason", "error", "last_seen_at", "profile_owned"}
 META_KEYS = {"schema_version", "request_id", "generated_at", "partial", "errors"}
 ENVELOPE_KEYS = {"ok", "data", "error", "meta"}
 DATA_KEYS = {"subscriptions": {"cards", "inventory_state", "view"}, "health": {"entries"},
@@ -242,7 +242,7 @@ def validate_health(errs, where, h):
         errs.append(f"{where}: endpoint_id/checked_at")
     if h["last_seen_at"] is not None and not TS_RE.match(str(h["last_seen_at"])):
         errs.append(f"{where}.last_seen_at")
-    if not isinstance(h["metrics_available"], bool) or not isinstance(h["stale"], bool):
+    if not all(isinstance(h[k], bool) for k in ("metrics_available", "stale", "profile_owned")):
         errs.append(f"{where}: bools")
     for k in ("latency_ms", "cpu_percent"):
         if not _num(h[k]) or (h[k] is not None and h[k] < 0):
