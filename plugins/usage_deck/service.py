@@ -231,7 +231,11 @@ def _effective_view(source: Any, query: "Query") -> str:
 
 
 def _profile_owned(item: InventoryItem, machine_view: bool) -> bool:
-    """Machine view: a self-hosted endpoint defined only in ANOTHER profile's config (probed on its owner base_url)."""
+    """Machine view: a self-hosted endpoint owned by ANOTHER profile's inventory (not the selected one's).
+
+    Ownership only: the item may come from that profile's config or its credential pool, and the flag says nothing
+    about whether a request was sent (an unset owner ``key_env`` sends none) or what it returned; ``status`` /
+    ``reason`` carry that."""
     return bool(machine_view and item.kind == "self_hosted" and item.cross_profile)
 
 

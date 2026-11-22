@@ -252,6 +252,37 @@ class SecondaryHomeEndpoint(unittest.TestCase):
         self.assertIsNone(entry["error"])
         self.assertIs(entry["profile_owned"], True)
 
+    def test_an_owner_whose_key_env_is_unset_sends_nothing_yet_the_row_is_owned(self):
+        """Ownership is not execution: the missing-key safety gate stays (zero requests, even with a decoy process
+        value for the same variable name), and the row still reads as owned by the other profile."""
+        self.configs["laptop"] = {"custom_providers": [
+            {"name": "llama-mac", "base_url": BOX + "/v1", "key_env": "GPU_KEY"}]}
+        self.envs["laptop"] = {}  # the owner home does not supply GPU_KEY; the process env (PROC_KEY) must not
+        box = WafBox()
+        _cards, health, envelopes = self.machine(_Multi(box, WafBox(OTHER)))
+        entry = health["custom:llama-mac"]
+        self.assertEqual(box.requests, [])
+        self.assertEqual((entry["status"], entry["confidence"], entry["reason"]),
+                         ("unknown", "opaque", "credentials_missing"))
+        self.assertIs(entry["profile_owned"], True)
+        self.assertEqual(scan_for(envelopes, ALL_KEYS), [])
+
+    def test_a_pool_discovered_endpoint_with_no_config_is_owned_and_probed_anonymously(self):
+        """``cross_profile`` is ownership, not config provenance: a secondary home's credential-pool row alone (no
+        config definition anywhere) yields the same owned row, probed anonymously on the pool row's base_url."""
+        self.configs.clear()
+        self.s.write_profile("laptop", {"credential_pool": {"custom:llama-mac": [
+            {"id": "row1", "base_url": BOX + "/v1", "access_token": ROOT_KEY}]}})
+        box = WafBox()
+        _cards, health, envelopes = self.machine(_Multi(box, WafBox(OTHER)))
+        entry = health["custom:llama-mac"]
+        self.assertEqual((entry["status"], entry["confidence"]), ("healthy", "self_hosted"))
+        self.assertIs(entry["profile_owned"], True)
+        self.assertEqual(box.paths(), ["/metrics", "/v1/models"])
+        for _url, headers in box.requests:
+            self.assertNotIn("Authorization", headers)
+        self.assertEqual(scan_for(envelopes, ALL_KEYS), [])
+
     def test_the_health_row_of_a_secondary_only_endpoint_is_profile_owned_the_selected_ones_are_not(self):
         _cards, health, _env = self.machine(_Multi(WafBox(), WafBox(OTHER)))
         self.assertIs(health["custom:llama-mac"]["profile_owned"], True)
@@ -314,6 +345,17 @@ class SecondaryHomeEndpoint(unittest.TestCase):
         rows["secondary_only"] = self.machine(_Multi(WafBox(), WafBox(OTHER)))[1]["custom:llama-mac"]
         rows["models_only"] = self.machine(_Multi(WafBox(metrics=404), WafBox(OTHER)))[1]["custom:llama-mac"]
         rows["offline"] = self.machine(_Multi(WafBox("http://nowhere.invalid"), WafBox(OTHER)))[1]["custom:llama-mac"]
+        # owner key_env unset: the missing-key gate sends nothing; ownership is still reported
+        saved = self.configs["laptop"]
+        self.configs["laptop"] = {"custom_providers": [{"name": "llama-mac", "base_url": BOX + "/v1", "key_env": "GPU_KEY"}]}
+        rows["missing_key"] = self.machine(_Multi(WafBox(), WafBox(OTHER)))[1]["custom:llama-mac"]
+        # credential-pool row only, no config definition anywhere
+        self.configs.clear()
+        self.s.write_profile("laptop", {"credential_pool": {"custom:llama-mac": [
+            {"id": "row1", "base_url": BOX + "/v1", "access_token": ROOT_KEY}]}})
+        rows["pool_only"] = self.machine(_Multi(WafBox(), WafBox(OTHER)))[1]["custom:llama-mac"]
+        self.s.write_profile("laptop", {"credential_pool": {}})
+        self.configs["laptop"] = saved
         self.viewed = {"model": {}, "custom_providers": self.viewed["custom_providers"] + [
             {"name": "llama-mac", "base_url": BOX + "/v1/", "model": "m"}]}
         rows["selected_mirror"] = self.machine(_Multi(WafBox(), WafBox(OTHER)))[1]["custom:llama-mac"]
@@ -327,7 +369,8 @@ class SecondaryHomeEndpoint(unittest.TestCase):
             FRONTEND_FIXTURE.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", "utf-8")
         self.assertEqual(json.loads(FRONTEND_FIXTURE.read_text("utf-8")), rows)
         self.assertEqual({k: v["profile_owned"] for k, v in rows.items()},
-                         {"secondary_only": True, "models_only": True, "offline": True, "selected_mirror": False})
+                         {"secondary_only": True, "models_only": True, "offline": True, "missing_key": True,
+                          "pool_only": True, "selected_mirror": False})
 
 
 if __name__ == "__main__":

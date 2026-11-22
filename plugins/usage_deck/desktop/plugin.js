@@ -92,10 +92,10 @@ const ANTHROPIC_LIVE_EMPTY_NOTE =
   "No Anthropic session/weekly meter: Anthropic's usage endpoint was read live for this credential and reported no current session or weekly window (or did not permit the read). Nothing is estimated and no older captured reading is shown in its place."
 const MACHINE_ONLY_NOTE =
   "No live source for this account: the machine view reads meters with any local profile's credential only through the documented read-only usage probes (Codex spend control, Anthropic OAuth usage, endpoint /metrics and models listing), and none exists for this account, so it is local inventory. Nothing is estimated."
-// Machine view, self-hosted health row of an endpoint defined only in ANOTHER profile's config (DESIGN.md §13 item 3b).
+// Machine view, self-hosted health row of an endpoint owned by ANOTHER profile's inventory (config or credential pool; ownership, not proof of a request) (DESIGN.md §13 item 3b).
 const PROFILE_OWNED_BADGE = 'Profile endpoint'
 const PROFILE_OWNED_NOTE =
-  "This endpoint is defined only in another profile's config. It was probed read-only (/metrics and the models listing) on that profile's own address, anonymously unless that profile's own key_env supplies a key. No other profile's or the process's credential is sent."
+  "This endpoint belongs to another profile's inventory (its config or its credential pool), not to the selected profile. The machine view's read-only probe (/metrics and the models listing) uses that profile's own address, anonymously unless that profile's own key_env supplies a key; when that key is unset, no request is sent. No other profile's or the process's credential is sent. The row's status shows the outcome."
 
 // Fixed local copy for Reason codes: upstream text never reaches the UI.
 const REASON_TEXT = {

@@ -37,11 +37,24 @@ const dashboardRow = async (row, view) => {
 };
 const owned = (m) => m.$("[data-endpoint-id] [data-profile-owned]");
 
-test("the fixture holds the four real service scenarios", () => {
-  assert.deepEqual(Object.keys(ROWS).sort(), ["models_only", "offline", "secondary_only", "selected_mirror"]);
+test("the fixture holds the six real service scenarios", () => {
+  assert.deepEqual(Object.keys(ROWS).sort(), ["missing_key", "models_only", "offline", "pool_only", "secondary_only", "selected_mirror"]);
   assert.deepEqual(Object.entries(ROWS).map(([k, r]) => [k, r.profile_owned]).sort(),
-    [["models_only", true], ["offline", true], ["secondary_only", true], ["selected_mirror", false]]);
+    [["missing_key", true], ["models_only", true], ["offline", true], ["pool_only", true], ["secondary_only", true], ["selected_mirror", false]]);
+  // the service's own states behind the two provenance-sensitive rows
+  assert.deepEqual([ROWS.missing_key.status, ROWS.missing_key.reason], ["unknown", "credentials_missing"]);
+  assert.deepEqual([ROWS.pool_only.status, ROWS.pool_only.confidence], ["healthy", "self_hosted"]);
 });
+
+// The note is ownership/policy copy: it must not claim a completed probe or a config-file origin, because the same
+// flag is set for a zero-request missing-key row and for a credential-pool-only endpoint with no config at all.
+const assertOwnershipOnly = (title) => {
+  assert.match(title, /belongs to another profile's inventory \(its config or its credential pool\)/);
+  assert.match(title, /read-only/);
+  assert.match(title, /when that key is unset, no request is sent/);
+  assert.match(title, /No other profile's or the process's credential is sent/);
+  assert.ok(!/was probed|defined only in/.test(title), "no execution or config-origin claim: " + title);
+};
 
 // ------------------------------------------------------------------ dashboard variant
 
@@ -50,13 +63,27 @@ test("dashboard: a profile-owned endpoint shows the ownership badge and a truthf
   const badge = owned(m);
   assert.ok(badge !== null);
   assert.equal(badge.textContent, "Profile endpoint");
-  assert.match(badge.getAttribute("title"), /defined only in another profile's config/);
-  assert.match(badge.getAttribute("title"), /read-only/);
-  assert.match(badge.getAttribute("title"), /No other profile's or the process's credential is sent/);
+  assertOwnershipOnly(badge.getAttribute("title"));
   assert.ok(m.$("[data-machine-only-note]") === null);
   assert.ok(!/Not probed|No live source/.test(m.text()));
   assert.match(norm(m.$("[data-endpoint-id]")), /Healthy/);
   await m.unmount();
+});
+
+test("dashboard: a zero-request missing-key row and a pool-only row are owned, with copy that stays true for both", async () => {
+  const missing = await dashboardRow(ROWS.missing_key);
+  const badge = owned(missing);
+  assert.ok(badge !== null);
+  assertOwnershipOnly(badge.getAttribute("title"));
+  assert.ok(missing.$("[data-machine-only-note]") === null, "owned rows are never 'Not probed'");
+  assert.ok(!/was probed/.test(missing.text()));
+  await missing.unmount();
+
+  const pool = await dashboardRow(ROWS.pool_only);
+  assert.ok(owned(pool) !== null);
+  assertOwnershipOnly(owned(pool).getAttribute("title"));
+  assert.match(norm(pool.$("[data-endpoint-id]")), /Healthy/);
+  await pool.unmount();
 });
 
 test("dashboard: models up, metrics absent is a degraded probe result with the ownership badge", async () => {
@@ -110,11 +137,26 @@ test("desktop: a profile-owned endpoint shows the ownership badge and the same t
   const badge = r.container.querySelector("[data-profile-owned]");
   assert.ok(badge !== null);
   assert.equal(badge.textContent, "Profile endpoint");
-  assert.match(badge.getAttribute("title"), /defined only in another profile's config/);
-  assert.match(badge.getAttribute("title"), /No other profile's or the process's credential is sent/);
+  assertOwnershipOnly(badge.getAttribute("title"));
   assert.ok(r.container.querySelector("[data-machine-only-note]") === null);
   assert.ok(!/Not probed/.test(r.container.textContent));
   await r.unmount();
+});
+
+test("desktop: a zero-request missing-key row and a pool-only row are owned, with copy that stays true for both", async () => {
+  const missing = await desktopRow(ROWS.missing_key, true);
+  const badge = missing.container.querySelector("[data-profile-owned]");
+  assert.ok(badge !== null);
+  assertOwnershipOnly(badge.getAttribute("title"));
+  assert.ok(missing.container.querySelector("[data-machine-only-note]") === null);
+  assert.ok(!/was probed/.test(missing.container.textContent));
+  await missing.unmount();
+
+  const pool = await desktopRow(ROWS.pool_only, true);
+  const poolBadge = pool.container.querySelector("[data-profile-owned]");
+  assert.ok(poolBadge !== null);
+  assertOwnershipOnly(poolBadge.getAttribute("title"));
+  await pool.unmount();
 });
 
 test("desktop: models-only, offline and mirrored rows", async () => {
